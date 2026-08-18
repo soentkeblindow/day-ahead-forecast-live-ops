@@ -36,6 +36,9 @@ energy-price-forecast = "energy_price_forecast:main"
 requires = ["uv_build>=0.11.7,<0.12.0"]
 build-backend = "uv_build"
 
+[tool.uv.build-backend]
+module-name = "energy_price_forecast"
+
 [dependency-groups]
 dev = [
     "freezegun>=1.5.0",
