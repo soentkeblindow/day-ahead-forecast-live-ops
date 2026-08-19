@@ -1,0 +1,91 @@
+name: Daily availability audit
+
+on:
+  schedule:
+    # UTC-only, no DST awareness in GitHub's cron -- so four fixed UTC slots
+    # instead of trying to hit "11:30 Berlin" directly. In CEST these land at
+    # 11:00/11:45/12:00/12:45 local; in CET at 10:00/10:45/11:00/11:45. In
+    # both seasons two of the four sit right before the 12:00 gate closure;
+    # the other two are free extra observations. The union of both DST
+    # offsets is deliberate, not sloppiness -- see spec §5.3. There is
+    # deliberately no time-of-day guard: the scheduler is unpunctual by
+    # 5-30 minutes, and a guard would fake a precision it doesn't have.
+    # Every run logs its *actual* run_ts_utc/run_ts_local; that timestamp,
+    # not the schedule, is the measurement (spec §4, Leitprinzip 3).
+    - cron: "0 9"
+    - cron: "45 9"
+    - cron: "0 10"
+    - cron: "45 10"
+  workflow_dispatch: {}
+
+concurrency:
+  group: availability-audit
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --all-extras --dev
+
+      # ENTSOE_API_KEY only -- this step never touches the Arena API, so it
+      # cannot submit anything even with a bug (spec §4.5, §5.4).
+      - name: Run availability audit (ENTSO-E + Yahoo Finance)
+        env:
+          ENTSOE_API_KEY: ${{ secrets.ENTSOE_API_KEY }}
+        run: uv run python scripts/audit_availability.py --part availability
+
+      # ARENA_API_KEY only -- this step never sees ENTSOE_API_KEY (spec
+      # §4.5, §5.4). ARENA_API_BASE_URL is not secret but lives in the same
+      # place arena/catalog.py reads all three from.
+      - name: Fetch challenge catalog snapshot (Energy Arena)
+        env:
+          ARENA_API_KEY: ${{ secrets.ARENA_API_KEY }}
+          ARENA_API_BASE_URL: ${{ vars.ARENA_API_BASE_URL }}
+        run: uv run python scripts/audit_availability.py --part catalog
+
+      # An audit that measures and then discards its result is worse than
+      # none (spec §8) -- a push failure here must redden the job, not be
+      # swallowed. git pull --rebase + retry covers overlapping runs (the
+      # 09:45/10:00 slots can collide under scheduler delay); the empty-diff
+      # guard covers the (should-never-happen) case of no new rows.
+      - name: Commit and push audit logs
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add logs/
+
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "data: availability audit run $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          for attempt in 1 2 3; do
+            if git push; then
+              echo "Push succeeded on attempt $attempt."
+              exit 0
+            fi
+            echo "Push failed (attempt $attempt/3); pulling --rebase and retrying."
+            git pull --rebase
+          done
+
+          echo "::error::Push failed after 3 attempts -- audit results were computed but not saved."
+          exit 1
