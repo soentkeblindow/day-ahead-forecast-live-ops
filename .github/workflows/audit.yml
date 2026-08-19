@@ -12,10 +12,10 @@ on:
     # 5-30 minutes, and a guard would fake a precision it doesn't have.
     # Every run logs its *actual* run_ts_utc/run_ts_local; that timestamp,
     # not the schedule, is the measurement (spec §4, Leitprinzip 3).
-    - cron: "0 9"
-    - cron: "45 9"
-    - cron: "0 10"
-    - cron: "45 10"
+    - cron: "0 9 * * *"
+    - cron: "45 9 * * *"
+    - cron: "0 10 * * *"
+    - cron: "45 10 * * *"
   workflow_dispatch: {}
 
 concurrency:
