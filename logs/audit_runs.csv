@@ -1,0 +1,2 @@
+run_ts_utc,run_ts_local,local_date,target_date,windows_checked,n_series,n_client_calls,duration_s,n_ok,n_partial,n_missing,n_error,trigger
+2026-08-19T13:59:08.876604+00:00,2026-08-19T15:59:08.876604+02:00,2026-08-19,2026-08-20,critical+training,31,8,727.593,27,28,5,0,manual
