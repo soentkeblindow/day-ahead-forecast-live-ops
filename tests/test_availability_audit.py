@@ -278,7 +278,7 @@ def test_client_error_produces_an_error_row_without_raising() -> None:
     assert "RuntimeError" in row["error"]
 
 
-def test_run_audit_does_not_raise_when_a_fetch_group_errors() -> None:
+def test_run_availability_audit_does_not_raise_when_a_fetch_group_errors() -> None:
     def _boom(start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
         raise RuntimeError("ENTSO-E is down")
 
@@ -289,7 +289,7 @@ def test_run_audit_does_not_raise_when_a_fetch_group_errors() -> None:
     functions["day_ahead_price"] = _boom
 
     with patch.dict(audit._FETCH_FUNCTIONS, functions):
-        outcome = audit.run_audit(
+        outcome = audit.run_availability_audit(
             pd.Timestamp("2026-08-19T09:00:00+00:00"),
             "workflow_dispatch",
             is_first_run_of_day=False,
@@ -415,10 +415,10 @@ def _synthetic_fetch_functions() -> dict[str, Any]:
 
 def test_training_window_only_checked_on_first_run_of_day() -> None:
     with patch.dict(audit._FETCH_FUNCTIONS, _synthetic_fetch_functions()):
-        not_first = audit.run_audit(
+        not_first = audit.run_availability_audit(
             pd.Timestamp("2026-08-19T09:00:00+00:00"), "schedule", is_first_run_of_day=False
         )
-        first = audit.run_audit(
+        first = audit.run_availability_audit(
             pd.Timestamp("2026-08-19T09:00:00+00:00"), "schedule", is_first_run_of_day=True
         )
 
@@ -447,7 +447,7 @@ def test_n_client_calls_counts_actual_fetch_group_calls() -> None:
     wrapped_functions = {name: counting_wrapper(fn) for name, fn in functions.items()}
 
     with patch.dict(audit._FETCH_FUNCTIONS, wrapped_functions):
-        outcome = audit.run_audit(
+        outcome = audit.run_availability_audit(
             pd.Timestamp("2026-08-19T09:00:00+00:00"),
             "workflow_dispatch",
             is_first_run_of_day=False,
@@ -461,7 +461,7 @@ def test_n_client_calls_counts_actual_fetch_group_calls() -> None:
 
 def test_status_counts_sum_to_availability_row_count() -> None:
     with patch.dict(audit._FETCH_FUNCTIONS, _synthetic_fetch_functions()):
-        outcome = audit.run_audit(
+        outcome = audit.run_availability_audit(
             pd.Timestamp("2026-08-19T09:00:00+00:00"), "workflow_dispatch", is_first_run_of_day=True
         )
 
@@ -505,3 +505,44 @@ def test_append_csv_rows_keeps_stable_column_order_regardless_of_dict_order(tmp_
 
     header = path.read_text(encoding="utf-8").splitlines()[0]
     assert header == "a,b,c"
+
+
+# ---------------------------------------------------------------------------
+# Challenge catalog snapshot -- Arena-only, no ENTSO-E/Yahoo touched
+# ---------------------------------------------------------------------------
+
+
+def test_build_challenge_catalog_row_computes_deadline_and_target_from_d() -> None:
+    # now_utc such that D (tomorrow, Europe/Berlin) is 2026-08-20.
+    now_utc = pd.Timestamp("2026-08-19T09:00:00+00:00")
+
+    row = audit.build_challenge_catalog_row(now_utc)
+
+    assert row["challenge_id"] == "2"
+    assert row["resolution"] == 15
+    assert row["timezone"] == "Europe/Berlin"
+    assert row["target_start"] == "2026-08-20T00:00:00+02:00"
+    assert row["target_end"] == "2026-08-21T00:00:00+02:00"
+    assert row["deadline"] == "2026-08-19T12:00:00+02:00"  # 12:00 local on D-1
+    assert row["expected_values"] == 96
+    assert row["allow_multiple"] is True
+    assert row["selection_policy"] == "latest_before_deadline"
+    assert row["precision_decimals"] == 2
+    assert row["allow_negative"] is True
+    assert row["max_forecast_points"] is None
+    assert len(row["spec_sha256"]) == 64  # sha256 hex digest
+
+
+def test_build_challenge_catalog_row_deadline_is_dst_correct() -> None:
+    # D=2026-10-26 -> D-1=2026-10-25, the fall-back transition day itself:
+    # deadline must be 12:00 *wall-clock* local time (+01:00, post-transition
+    # -- the transition happens at 03:00->02:00 local, well before noon), not
+    # "12 hours after D-1's local midnight" (+02:00, pre-transition), which
+    # is what Timedelta(hours=12) on local midnight used to produce (11:00
+    # wall-clock -- the bug this test was written to catch).
+    now_utc = pd.Timestamp("2026-10-25T00:30:00+00:00")  # still CEST, D-2 side of midnight
+
+    row = audit.build_challenge_catalog_row(now_utc)
+
+    assert row["target_start"] == "2026-10-26T00:00:00+01:00"
+    assert row["deadline"] == "2026-10-25T12:00:00+01:00"

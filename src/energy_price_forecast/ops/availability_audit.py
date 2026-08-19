@@ -406,10 +406,19 @@ def _challenge_catalog_row(
     audit already knows D and the fixed 12:00-local-on-D-1 gate closure, so
     it derives them the same way any submission caller would, without
     importing market_time.py (Entscheidung 5).
+
+    deadline is built by localizing a naive "D-1, 12:00:00" datetime
+    directly, not by adding Timedelta(hours=12) to D-1's local midnight:
+    that addition is 12 hours of *elapsed* time, which on the fall-back
+    transition day lands on 11:00 local wall-clock, not 12:00 -- the same
+    class of bug as arena/payload.py's DateOffset-on-a-fixed-offset trap,
+    just with Timedelta standing in for the naive assumption this time.
     """
     target_start, target_end = local_day_bounds(target_date)
-    deadline_day_start, _ = local_day_bounds(target_date - dt.timedelta(days=1))
-    deadline = deadline_day_start + pd.Timedelta(hours=GATE_CLOSURE_LOCAL_HOUR)
+    deadline_date = target_date - dt.timedelta(days=1)
+    deadline = pd.Timestamp(
+        dt.datetime.combine(deadline_date, dt.time(hour=GATE_CLOSURE_LOCAL_HOUR)), tz=LOCAL_TZ
+    )
     expected_values = expected_timestamp_count(
         target_start, target_end, challenge.resolution_minutes
     )
@@ -436,18 +445,32 @@ def _challenge_catalog_row(
 
 # ---------------------------------------------------------------------------
 # Orchestration
+#
+# Split into two independently-callable parts, not one function that does
+# both: the workflow (spec §5.4, §4.5) gives ENTSOE_API_KEY only to the
+# availability step and ARENA_API_KEY only to the catalog step, so that a
+# bug in the ENTSO-E path can't submit and a bug in the Arena path can't
+# see ENTSO-E credentials. A single run_audit() covering both would put
+# both secrets in one process's environment, defeating that. See
+# scripts/audit_availability.py's --part flag for how the workflow invokes
+# these as separate steps/processes.
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
-class AuditOutcome:
+class AvailabilityAuditOutcome:
     availability_rows: list[dict[str, Any]]
-    challenge_catalog_row: dict[str, Any]
     audit_run_row: dict[str, Any]
 
 
-def run_audit(now_utc: pd.Timestamp, trigger: str, *, is_first_run_of_day: bool) -> AuditOutcome:
-    """Run one audit pass. now_utc is the measurement, not a schedule (spec §5.3)."""
+def run_availability_audit(
+    now_utc: pd.Timestamp, trigger: str, *, is_first_run_of_day: bool
+) -> AvailabilityAuditOutcome:
+    """Fetch and evaluate the raw-series checklist. Needs ENTSOE_API_KEY (and
+    the Yahoo Finance-backed commodities client, which needs no key) --
+    never touches the Arena API. now_utc is the measurement, not a schedule
+    (spec §5.3).
+    """
     if now_utc.tzinfo is None:
         raise ValueError("now_utc must be tz-aware")
 
@@ -500,9 +523,6 @@ def run_audit(now_utc: pd.Timestamp, trigger: str, *, is_first_run_of_day: bool)
 
     duration_s = time.monotonic() - start_time
 
-    challenge = get_challenge(ARENA_CHALLENGE_ID)
-    challenge_catalog_row = _challenge_catalog_row(challenge, target_date, now_utc)
-
     status_counts = {"ok": 0, "partial": 0, "missing": 0, "error": 0}
     for row in availability_rows:
         status_counts[row["status"]] += 1
@@ -523,7 +543,19 @@ def run_audit(now_utc: pd.Timestamp, trigger: str, *, is_first_run_of_day: bool)
         "trigger": trigger,
     }
 
-    return AuditOutcome(availability_rows, challenge_catalog_row, audit_run_row)
+    return AvailabilityAuditOutcome(availability_rows, audit_run_row)
+
+
+def build_challenge_catalog_row(now_utc: pd.Timestamp) -> dict[str, Any]:
+    """Fetch the Arena challenge snapshot. Needs ARENA_API_KEY only -- never
+    touches ENTSO-E or Yahoo Finance (spec §5.4 secret scoping, §4.5).
+    """
+    if now_utc.tzinfo is None:
+        raise ValueError("now_utc must be tz-aware")
+    run_ts_local = now_utc.tz_convert(LOCAL_TZ)
+    target_date = (run_ts_local + pd.DateOffset(days=1)).date()  # same D rule as the audit side
+    challenge = get_challenge(ARENA_CHALLENGE_ID)
+    return _challenge_catalog_row(challenge, target_date, now_utc)
 
 
 # ---------------------------------------------------------------------------
