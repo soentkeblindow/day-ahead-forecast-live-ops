@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -34,6 +36,43 @@ def _split(
     x_train, x_test = x.iloc[:n], x.iloc[n:]
     y_train = y.iloc[:n]
     return x_train, x_test, y_train, pd.DatetimeIndex(x_test.index)
+
+
+def _make_xy_right_skewed(
+    n_days: int = 60, n_features: int = 5, seed: int = 0
+) -> tuple[pd.DataFrame, pd.Series]:
+    """Synthetic data whose target noise is right-skewed (lognormal-additive).
+
+    The noise is independent of the features, so a fitted model's predictions
+    converge to the (conditional-on-nothing) mean or median of this noise
+    depending on objective -- exactly the asymmetry Step 6.3 exists to detect.
+    """
+    idx = pd.date_range("2021-01-01", periods=n_days * 24, freq="h", tz="UTC")
+    rng = np.random.default_rng(seed)
+    x = pd.DataFrame(
+        rng.normal(0, 1, (len(idx), n_features)),
+        index=idx,
+        columns=[f"f{i}" for i in range(n_features)],
+    )
+    noise = rng.lognormal(mean=0.0, sigma=1.0, size=len(idx))  # mean > median
+    y = pd.Series(50.0 + noise, index=idx, name="price")
+    return x, y
+
+
+class _RecordingLGBMRegressor:
+    """Stand-in for LGBMRegressor that records constructor kwargs, fits nothing.
+
+    Used to inspect exactly which keyword arguments LGBMForecaster.fit passes
+    through, without paying for (or depending on the output of) a real fit.
+    """
+
+    last_kwargs: dict[str, Any] | None = None
+
+    def __init__(self, **kwargs: Any) -> None:
+        type(self).last_kwargs = kwargs
+
+    def fit(self, x: pd.DataFrame, y: pd.Series) -> _RecordingLGBMRegressor:
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -191,3 +230,123 @@ def test_fitted_estimator_after_fit_returns_lgbm_regressor() -> None:
     # A fitted estimator must have booster_ and know the feature count.
     assert hasattr(est, "booster_")
     assert est.n_features_in_ == x_train.shape[1]
+
+
+# ---------------------------------------------------------------------------
+# objective wiring (Step 6.3)
+# ---------------------------------------------------------------------------
+
+
+def test_l2_objective_maps_to_lightgbm_regression_and_omits_alpha(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    x, y = _make_xy()
+    x_train, _, y_train, _ = _split(x, y)
+    monkeypatch.setattr("energy_price_forecast.models.lgbm.LGBMRegressor", _RecordingLGBMRegressor)
+
+    LGBMForecaster(objective="l2").fit(y_train, x_train)
+
+    kwargs = _RecordingLGBMRegressor.last_kwargs
+    assert kwargs is not None
+    assert kwargs["objective"] == "regression"
+    # Must be entirely absent, not just None -- LightGBM reads a present
+    # `alpha` under objective="regression" as a Huber scale parameter.
+    assert "alpha" not in kwargs
+
+
+def test_quantile_objective_passes_expected_alpha(monkeypatch: pytest.MonkeyPatch) -> None:
+    x, y = _make_xy()
+    x_train, _, y_train, _ = _split(x, y)
+    monkeypatch.setattr("energy_price_forecast.models.lgbm.LGBMRegressor", _RecordingLGBMRegressor)
+
+    LGBMForecaster(objective="quantile", alpha=0.7).fit(y_train, x_train)
+
+    kwargs = _RecordingLGBMRegressor.last_kwargs
+    assert kwargs is not None
+    assert kwargs["objective"] == "quantile"
+    assert kwargs["alpha"] == pytest.approx(0.7)
+
+
+# ---------------------------------------------------------------------------
+# alpha / objective error contracts and default resolution (Step 6.3, D2)
+# ---------------------------------------------------------------------------
+
+
+def test_l2_with_explicit_alpha_raises() -> None:
+    with pytest.raises(ValueError, match="alpha"):
+        LGBMForecaster(objective="l2", alpha=0.5)
+
+
+def test_l2_with_non_median_alpha_raises() -> None:
+    with pytest.raises(ValueError, match="alpha"):
+        LGBMForecaster(objective="l2", alpha=0.95)
+
+
+def test_unknown_objective_raises() -> None:
+    with pytest.raises(ValueError, match="objective"):
+        LGBMForecaster(objective="unsinn")  # type: ignore[arg-type]
+
+
+def test_default_objective_and_alpha() -> None:
+    model = LGBMForecaster()
+    assert model.objective == "quantile"
+    assert model.alpha == pytest.approx(0.5)
+
+
+def test_l2_default_alpha_is_none() -> None:
+    model = LGBMForecaster(objective="l2")
+    assert model.alpha is None
+
+
+# ---------------------------------------------------------------------------
+# reproducibility and NaN handling under the l2 objective (Step 6.3)
+# ---------------------------------------------------------------------------
+
+
+def test_l2_reproducibility() -> None:
+    x, y = _make_xy()
+    x_train, x_test, y_train, test_index = _split(x, y)
+
+    m1 = LGBMForecaster(objective="l2", random_state=7)
+    m1.fit(y_train, x_train)
+    p1 = m1.predict(test_index, history=y_train, x_test=x_test)
+
+    m2 = LGBMForecaster(objective="l2", random_state=7)
+    m2.fit(y_train, x_train)
+    p2 = m2.predict(test_index, history=y_train, x_test=x_test)
+
+    pd.testing.assert_series_equal(p1, p2)
+
+
+def test_l2_all_nan_feature_column_no_crash() -> None:
+    x, y = _make_xy()
+    x_train, x_test, y_train, test_index = _split(x, y)
+    x_train = x_train.copy()
+    x_test = x_test.copy()
+    x_train["all_nan"] = float("nan")
+    x_test["all_nan"] = float("nan")
+
+    model = LGBMForecaster(objective="l2")
+    model.fit(y_train, x_train)  # must not raise
+    preds = model.predict(test_index, history=y_train, x_test=x_test)
+    assert preds.notna().all()
+
+
+# ---------------------------------------------------------------------------
+# mean-above-median direction under right-skewed noise (Step 6.3)
+# ---------------------------------------------------------------------------
+
+
+def test_l2_mean_exceeds_quantile_median_under_right_skew() -> None:
+    x, y = _make_xy_right_skewed(n_days=80, seed=1)
+    x_train, x_test, y_train, test_index = _split(x, y, train_days=60)
+
+    mean_model = LGBMForecaster(objective="l2")
+    mean_model.fit(y_train, x_train)
+    mean_preds = mean_model.predict(test_index, history=y_train, x_test=x_test)
+
+    median_model = LGBMForecaster(objective="quantile", alpha=0.5)
+    median_model.fit(y_train, x_train)
+    median_preds = median_model.predict(test_index, history=y_train, x_test=x_test)
+
+    assert mean_preds.mean() > median_preds.mean()
