@@ -48,3 +48,18 @@ Two things worth knowing before reading `availability.csv`:
 - `latest_target_offset_days` is a **three-valued, censored indicator** (`0`, `-1`, or empty), not a continuous age measure: empty means no value was found anywhere in the two-day fetch range, not "the series failed" and not "the last value is older than a day." Reading it as a magnitude gives wrong conclusions.
 
 Fallback policy, submit/no-submit thresholds, and leaderboard monitoring are all Sprint 6.5 — this audit only measures and logs.
+
+## Objective and scoring metric
+
+**Claim.** The Energy Arena's point challenge (ID 2) is scored by RMSE, whose optimal estimator is the conditional *mean*. The inherited model (`objective="quantile", alpha=0.5`, Sprint 3 Entscheidung 2) predicts the conditional *median* instead — coherent with the quantile grid and the calibration work of the source project, but not RMSE-optimal on right-skewed day-ahead prices, where the mean sits systematically above the median. `scripts/backtest.py --objective l2` (Sprint 6.3) adds the RMSE-aligned alternative alongside the unchanged default.
+
+**Evidence.** Both objectives were run under the identical production configuration (`--window rolling --train-span-days 90 --refit-every 1 --test-start 2021-01-01 --test-end 2025-12-31`, untuned defaults), then compared by regime and by two time periods — `full` (the whole 5-year window) and `recent` (the last 12 months) — via `scripts/compare_objectives.py`, with a Diebold-Mariano significance test on the squared-error loss differential:
+
+| Period | RMSE median | RMSE l2 | Δ (l2 − median) | DM test p-value (daily / hourly) |
+|---|---|---|---|---|
+| `full` (2021–2025) | 26.5926 | 26.5261 | −0.0665 (l2 nominally better) | 0.901 / 0.891 — **not significant** |
+| `recent` (last 12 months) | 20.6808 | 22.2888 | +1.6080 (median better) | 0.092 / 0.083 — marginal, not significant at 5% |
+
+Full results: [`outputs/results/objective_comparison.csv`](outputs/results/objective_comparison.csv) (regime × period breakdown), [`outputs/results/dm_test_objective.csv`](outputs/results/dm_test_objective.csv) (significance tests).
+
+**Consequence.** The full-window RMSE edge for `l2` is not statistically distinguishable from noise, and in the period that actually matters for the Arena — now — the inherited median objective is *better* on both MAE and RMSE (with marginal, not conventionally significant, DM-test evidence). This is a valid, documented negative result, not an inconclusive one: there is no robust case for switching the default objective on this model and this data. Sprint 6.4 (the Arena bridge) therefore stays on the existing median/quantile default. The `--objective l2` flag remains in the codebase regardless — Sprint 8's quantile challenges need the explicit quantile/l2 separation this step introduced either way.
