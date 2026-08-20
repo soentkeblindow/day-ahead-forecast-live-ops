@@ -59,10 +59,19 @@ def _parse_args() -> argparse.Namespace:
         "--model", default="naive", choices=["naive", "lasso", "ridge", "ols", "lgbm", "arimax"]
     )
     p.add_argument(
+        "--objective",
+        default="quantile",
+        choices=["quantile", "l2"],
+        help="LightGBM loss function (--model lgbm only): 'quantile' (default) predicts "
+        "the conditional median at --alpha; 'l2' predicts the conditional mean for "
+        "RMSE-scored challenges and takes no --alpha (Step 6.3).",
+    )
+    p.add_argument(
         "--alpha",
         type=float,
-        default=0.5,
-        help="Quantile level for LightGBM (ignored for other models).",
+        default=None,
+        help="Quantile level for LightGBM/ARIMAX (ignored for other models); "
+        "defaults to 0.5 when not set. Must not be combined with --objective l2.",
     )
     p.add_argument("--random-state", type=int, default=0, help="Random seed for LightGBM.")
     p.add_argument("--target-transform", default="asinh", choices=["asinh", "identity"])
@@ -119,7 +128,15 @@ def _parse_args() -> argparse.Namespace:
         help="MLflow run ID of the tune.py run that produced --params-path "
         "(logged as tag tuned_from for lineage tracking).",
     )
-    return p.parse_args()
+    args = p.parse_args()
+    if args.objective == "l2" and args.model != "lgbm":
+        p.error("--objective l2 is only valid together with --model lgbm")
+    if args.objective == "l2" and args.alpha is not None:
+        p.error(
+            "--objective l2 predicts the conditional mean and takes no --alpha "
+            f"(got --alpha {args.alpha})"
+        )
+    return args
 
 
 def main() -> None:
@@ -176,6 +193,11 @@ def main() -> None:
         y = price.reindex(features.index)
         x = features
         index = pd.DatetimeIndex(features.index)
+        # --alpha defaults to None on the CLI (Step 6.3) so that "not passed" is
+        # distinguishable from "explicitly 0.5" for the --objective l2 guard in
+        # _parse_args; resolve it to the historical 0.5 default for everything
+        # below that needs a concrete number (arimax, quantile run naming/logging).
+        resolved_alpha = args.alpha if args.alpha is not None else 0.5
         if args.model == "lasso":
             model = LassoForecaster(
                 target_transform=args.target_transform,
@@ -195,11 +217,11 @@ def main() -> None:
         elif args.model == "arimax":
             x = select_arimax_exog(features)
             order = _parse_order(args.arima_order)
-            model = ARIMAXForecaster(alpha=args.alpha, order=order)
-            run_name = f"arimax_q{int(args.alpha * 100):02d}"
+            model = ARIMAXForecaster(alpha=resolved_alpha, order=order)
+            run_name = f"arimax_q{int(resolved_alpha * 100):02d}"
             experiment_name = SPRINT3_EXPERIMENT_NAME
             extra_params = {
-                "alpha": args.alpha,
+                "alpha": resolved_alpha,
                 "order": str(model.order),
                 "fourier_daily_k": model.fourier_daily_k,
                 "fourier_weekly_k": model.fourier_weekly_k,
@@ -224,27 +246,41 @@ def main() -> None:
                     args.params_path,
                     frozen_params.get("n_estimators"),
                 )
+                if args.objective == "l2":
+                    log.warning(
+                        "--params-path was tuned under objective='quantile' (pinball@0.5); "
+                        "using it under --objective l2 is untested by that tuning run."
+                    )
             tuned = frozen_params is not None
-            log.info("initialising LGBMForecaster (alpha=%.2f, tuned=%s)", args.alpha, tuned)
+            log.info(
+                "initialising LGBMForecaster (objective=%s, alpha=%s, tuned=%s)",
+                args.objective,
+                resolved_alpha if args.objective == "quantile" else "none",
+                tuned,
+            )
             model = LGBMForecaster(
-                alpha=args.alpha,
+                objective=args.objective,
+                alpha=args.alpha,  # None unless objective=quantile and explicitly set
                 params=frozen_params,  # None → uses _DEFAULT_PARAMS inside LGBMForecaster
                 random_state=args.random_state,
                 n_jobs=n_jobs,
             )
             extra_params = {
-                "alpha": args.alpha,
-                "objective": "quantile",
+                "alpha": resolved_alpha if args.objective == "quantile" else "none",
+                "objective": args.objective,
                 "random_state": args.random_state,
                 "n_jobs": n_jobs,
                 "dropped_features": ",".join(drop_cols) if drop_cols else "none",
                 **(frozen_params if frozen_params is not None else _DEFAULT_PARAMS),
             }
-            run_name = f"lgbm_q{int(args.alpha * 100):02d}{'_tuned' if tuned else ''}"
+            if args.objective == "l2":
+                run_name = f"lgbm_mean{'_tuned' if tuned else ''}"
+            else:
+                run_name = f"lgbm_q{int(resolved_alpha * 100):02d}{'_tuned' if tuned else ''}"
             experiment_name = SPRINT3_EXPERIMENT_NAME
         if args.model == "arimax":
             out = args.out or Path(
-                f"data/processed/preds_arimax_q{int(args.alpha * 100):02d}.parquet"
+                f"data/processed/preds_arimax_q{int(resolved_alpha * 100):02d}.parquet"
             )
         else:
             out = args.out or Path(f"data/processed/backtest_{args.model}.parquet")
@@ -277,8 +313,11 @@ def main() -> None:
     summary = summarise(predictions)
 
     if args.model in ("lgbm", "arimax"):
-        extra_metrics[f"pinball_{args.alpha:.2f}"] = pinball(
-            predictions["y_true"], predictions["y_pred"], args.alpha
+        # For objective="l2" resolved_alpha is always 0.5 (the CLI guard forbids
+        # --alpha with --objective l2): pinball_0.50 = 0.5 * MAE by identity, so
+        # this is a metric-comparability conversion, not a calibration claim.
+        extra_metrics[f"pinball_{resolved_alpha:.2f}"] = pinball(
+            predictions["y_true"], predictions["y_pred"], resolved_alpha
         )
 
     if args.experiment is not None:
