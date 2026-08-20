@@ -142,14 +142,19 @@ def test_checklist_raises_a_clear_error_for_an_unmapped_registry_entry(
     reason="data/interim/hourly.parquet not present -- local integrity check, not a CI gate (spec §5.1)",
 )
 def test_checklist_matches_hourly_parquet_columns() -> None:
-    """Known pre-existing discrepancy, deliberately not special-cased away
-    (owner decision, 2026-08-19): hourly.parquet -- copied, not rebuilt, per
-    CLAUDE.md -- carries solar_actual/wind_onshore_actual/wind_offshore_actual,
-    three raw columns absent from _RAW_AVAILABILITY and unreferenced anywhere
-    in src/tests/scripts. Likely a leftover from an earlier pipeline stage
-    that predates the current fetch_generation_by_type-based gen_solar/
-    gen_wind_onshore/gen_wind_offshore columns, but that is a data-provenance
-    question outside 6.2's scope, not something this test should paper over.
+    """Local integrity check: the checklist derived from the registry and
+    NEIGHBORS must exactly match the raw columns actually present in
+    hourly.parquet (spec §5.1).
+
+    hourly.parquet used to carry three extra columns -- solar_actual,
+    wind_onshore_actual, wind_offshore_actual -- confirmed (2026-08-20,
+    source-repo commit e37b2cb) to be exact duplicates of gen_solar/
+    gen_wind_onshore/gen_wind_offshore: an old fetcher called
+    query_generation() a second time by mistake. The source repo fixed the
+    fetcher in June 2026 but never rebuilt its own frozen interim dataset,
+    so the duplicate columns lived on in both repos' copies. Dropped from
+    this repo's hourly.parquet (2026-08-20) since they were byte-identical
+    to their gen_* counterparts and unreferenced anywhere in src/tests/scripts.
     """
     hourly = pd.read_parquet(PROJECT_ROOT / "data" / "interim" / "hourly.parquet")
     checklist_columns = {spec.column for spec in audit.build_checklist()}
