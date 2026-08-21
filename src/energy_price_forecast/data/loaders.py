@@ -13,6 +13,7 @@ from energy_price_forecast.data.entsoe_client import (
     fetch_scheduled_exchanges,
     fetch_wind_solar_forecast,
 )
+from energy_price_forecast.data.quarterhourly import validate_delivery_day_slot_counts
 
 logger = logging.getLogger(__name__)
 
@@ -218,4 +219,31 @@ def load_processed_features(
         )
     df = pd.read_parquet(path)
     logger.info("loaded %d feature rows from %s", len(df), path)
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Interim layer — native quarter-hourly day-ahead prices (sprint 6.4)
+# ---------------------------------------------------------------------------
+
+_QUARTERHOURLY_PATH = Path("data/interim/quarterhourly_prices.parquet")
+
+
+def load_interim_quarterhourly(path: Path = _QUARTERHOURLY_PATH) -> pd.DataFrame:
+    """Load the native (unresampled) quarter-hourly day-ahead price series.
+
+    Raises FileNotFoundError if the file does not exist (run
+    data.quarterhourly.build_quarterhourly_prices() first). Validates every
+    local delivery day's slot count before returning -- see
+    quarterhourly.validate_delivery_day_slot_counts; a day with a gap raises
+    rather than being silently skipped or interpolated (spec 6.4, §2.6).
+    """
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Quarter-hourly Parquet not found at {path!r}. "
+            "Run data.quarterhourly.build_quarterhourly_prices() to generate it."
+        )
+    df = pd.read_parquet(path)
+    validate_delivery_day_slot_counts(pd.DatetimeIndex(df.index))
+    logger.info("loaded %d quarter-hourly rows from %s", len(df), path)
     return df
