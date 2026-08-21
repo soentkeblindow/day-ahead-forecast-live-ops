@@ -26,10 +26,15 @@ def _month_range(start: pd.Timestamp, end: pd.Timestamp) -> list[tuple[int, int]
 
 
 def _month_bounds(year: int, month: int) -> tuple[pd.Timestamp, pd.Timestamp]:
+    # -1 second, not -1 hour: an hour-granularity offset silently truncated the
+    # last 45 minutes of every month once ENTSO-E switched DE_LU day-ahead
+    # prices to 15-minute resolution (2025-09-30) -- a bug invisible on the
+    # pure-hourly era this constant was originally written for. -1 second
+    # reaches the true end of the month regardless of the data's resolution.
     first = pd.Timestamp(year=year, month=month, day=1, tz="UTC")
     next_month = month % 12 + 1
     next_year = year + (1 if month == 12 else 0)
-    last = pd.Timestamp(year=next_year, month=next_month, day=1, tz="UTC") - pd.Timedelta(hours=1)
+    last = pd.Timestamp(year=next_year, month=next_month, day=1, tz="UTC") - pd.Timedelta(seconds=1)
     return first, last
 
 
