@@ -1,0 +1,11 @@
+# UPPER BOUND: run with the full feature set, including DA_FORECAST series that are NOT available at gate closure (see sprint 6 abstract, section 9). Not a live-capability claim.
+# mean_loss_diff_sq_eur2_mwh2 = loss(candidate) - loss(reference); a NEGATIVE value means the candidate is better.
+comparison,period,variant,n_obs,hac_lag,horizon,mean_loss_diff_sq_eur2_mwh2,dm_stat,p_value
+bridge_shape_vs_baseline,full,quarter_hourly,28316,192,96,-1330.9944160303771,-8.207512863030763,2.220446049250313e-16
+bridge_shape_vs_baseline,full,daily,295,7,1,-1331.087744244285,-7.459036095081408,9.869882688917642e-13
+bridge_shape_vs_bridge_flat,full,quarter_hourly,28316,192,96,-86.39679234582746,-10.538998252206186,0.0
+bridge_shape_vs_bridge_flat,full,daily,295,7,1,-86.39104561699017,-6.72171186516259,9.324074845551422e-11
+bridge_shape_vs_baseline,post_changeover,quarter_hourly,22172,192,96,-1432.8530107516845,-7.335846710153143,2.278177646530821e-13
+bridge_shape_vs_baseline,post_changeover,daily,231,7,1,-1432.9538233706862,-6.8635440441958195,6.175748801240388e-11
+bridge_shape_vs_bridge_flat,post_changeover,quarter_hourly,22172,192,96,-103.13839469428494,-10.615575738552087,0.0
+bridge_shape_vs_bridge_flat,post_changeover,daily,231,7,1,-103.12803602860734,-6.940302067641352,3.9470204882263715e-11
