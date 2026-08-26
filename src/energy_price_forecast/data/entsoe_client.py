@@ -60,7 +60,11 @@ _WIND_SOLAR_COLUMNS = [
 
 @functools.cache
 def _get_client() -> EntsoePandasClient:
-    return EntsoePandasClient(api_key=get_entsoe_token())
+    # timeout=30: the source repo left this at the library default (None, i.e. no
+    # timeout at all), which let a stalled request block indefinitely -- caused a
+    # real 6h hang in the 2026-08-25 audit run. Scoped, documented exception to the
+    # byte-identical copy (README "Provenance" / Beleg A, CLAUDE.md).
+    return EntsoePandasClient(api_key=get_entsoe_token(), timeout=30)
 
 
 def _get_gen_series(gen_df: pd.DataFrame, source_name: str) -> pd.Series | None:

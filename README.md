@@ -25,12 +25,14 @@ Everything else in `src/`, `tests/`, and `scripts/` was copied verbatim, byte-fo
 
 | Beleg | What it checks | Result |
 |---|---|---|
-| **A** — file-hash diff of `src/` and `tests/` against the source repo | Every line, not a sample | Byte-identical (42/42 files in `src/`, 26/26 in `tests/`) except the documented omissions above |
+| **A** — file-hash diff of `src/` and `tests/` against the source repo | Every line, not a sample | Byte-identical (42/42 files in `src/`, 26/26 in `tests/`) except the documented omissions above and one later, scoped patch to `entsoe_client.py` (see below) |
 | **B** — copied test suite (`uv run pytest`) | Behavior on the source repo's own tests | 447 passed, 1 deselected (integration marker), no test code changed. `mlflow` was pinned to `3.11.1` (matching the source repo's resolved version) after an initial run surfaced a hard failure caused by newer mlflow's `file://`-store behavior change |
 | **C** — golden fixture (`tests/test_provenance.py`) | Default `LGBMForecaster()` behavior on a fixed, in-code synthetic dataset | Bit-identical match against the frozen fixture; regression anchor for all later changes starting with 6.3 |
 | **D** — production backtest (`scripts/backtest.py --model lgbm --alpha 0.5 --window rolling --train-span-days 90 --refit-every 1 --test-start 2021-01-01 --test-end 2025-12-31`) | End-to-end reproduction of the documented headline metric | MAE = 15.3988 EUR/MWh vs. the documented reference MAE ≈ 15.40 EUR/MWh (`model_validation_report.md` in the source repo). RMSE 26.5926 vs. 26.59; WAPE 0.1285 vs. 0.129. MLflow run under experiment `arena_models`, tag `study=provenance`. Reviewed and accepted by the owner (2026-08-18) |
 
 **Dependency pinning:** `lightgbm`, `numpy`, `pandas`, `scikit-learn`, `pyarrow` are pinned to the exact versions resolved in the source repo's `uv.lock` (`4.6.0`, `2.3.5`, `2.3.3`, `1.8.0`, `23.0.1`). `mlflow` was pinned as a sixth package (`3.11.1`) after Beleg B surfaced the version-drift failure described above.
+
+**Post-copy patch (2026-08-26):** `entsoe_client.py`'s `EntsoePandasClient(...)` call got an explicit `timeout=30`. The source repo left it at the library default (`None`, i.e. no timeout at all), which let a stalled ENTSO-E request block indefinitely — this caused a real production incident, hanging the daily audit job for 6 hours and, via the `audit.yml` concurrency group, cascading into 3 skipped cron runs on 2026-08-25. This is the one intentional deviation from Beleg A's byte-identical copy; everything else in `src/`, `tests/`, and `scripts/` remains untouched.
 
 ## Daily availability audit
 

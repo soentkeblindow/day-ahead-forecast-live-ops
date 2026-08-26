@@ -28,6 +28,11 @@ permissions:
 jobs:
   audit:
     runs-on: ubuntu-latest
+    # GitHub's default is 360 min -- a stalled network call with no client-side
+    # timeout hung for 6h on 2026-08-25 and, via the concurrency group below,
+    # cascaded into 3 skipped cron runs. 20 min is generous for a job whose own
+    # steps normally finish in well under 5.
+    timeout-minutes: 20
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
