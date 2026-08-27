@@ -1,0 +1,8 @@
+{
+  "include": ["src", "tests", "scripts"],
+  "exclude": ["notebooks", ".venv"],
+  "venvPath": ".",
+  "venv": ".venv",
+  "pythonVersion": "3.12",
+  "typeCheckingMode": "standard"
+}
