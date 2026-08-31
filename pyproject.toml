@@ -122,7 +122,7 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 markers = [
-    "integration: marks tests that make real ENTSO-E API calls (deselect with '-m not integration')",
+    "integration: marks tests that make real external API calls, e.g. ENTSO-E or Open-Meteo (deselect with '-m not integration')",
 ]
 addopts = [
     "-v",
