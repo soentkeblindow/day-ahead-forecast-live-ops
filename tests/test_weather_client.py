@@ -381,13 +381,27 @@ def test_dst_conversion_produces_correct_local_hour_counts() -> None:
 
 
 # ---------------------------------------------------------------------------
-# log_availability_attempt (spec §5.4b)
+# log_availability_attempt (spec §5.4b). Goes through the ordinary cache
+# by design (spec §5.5) -- every test here redirects cache_path into
+# tmp_path so it doesn't touch the real data/cache/.
 # ---------------------------------------------------------------------------
+
+
+def _redirect_cache(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import energy_price_forecast.data.weather_client as client_module
+    from energy_price_forecast.data._weather_cache import cache_path as real_cache_path
+
+    monkeypatch.setattr(
+        client_module,
+        "cache_path",
+        lambda run_init_utc, model: real_cache_path(run_init_utc, model, root=tmp_path / "cache"),
+    )
 
 
 def test_log_availability_attempt_success_row(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    _redirect_cache(monkeypatch, tmp_path)
     log_path = tmp_path / "weather_availability_probe.csv"
     _install_fake_get(monkeypatch, _FakeResponse(200, _load_fixture()))
 
@@ -414,6 +428,7 @@ def test_log_availability_attempt_success_row(
 def test_log_availability_attempt_failure_row(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    _redirect_cache(monkeypatch, tmp_path)
     log_path = tmp_path / "weather_availability_probe.csv"
     _install_fake_get(monkeypatch, _FakeResponse(400, {"error": True, "reason": "not available"}))
 
@@ -428,6 +443,7 @@ def test_log_availability_attempt_failure_row(
 def test_log_availability_attempt_appends_not_overwrites(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    _redirect_cache(monkeypatch, tmp_path)
     log_path = tmp_path / "weather_availability_probe.csv"
     _install_fake_get(monkeypatch, _FakeResponse(200, _load_fixture()))
 
@@ -436,6 +452,30 @@ def test_log_availability_attempt_appends_not_overwrites(
 
     lines = log_path.read_text(encoding="utf-8").splitlines()
     assert len(lines) == 3  # header + two rows
+
+
+def test_log_availability_attempt_writes_to_cache_on_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """spec §5.5: a successful probe leaves the run cached, so 6.7's later
+    same-day submission computation finds it already there. A second
+    attempt for the same run must therefore make zero further HTTP calls."""
+    import energy_price_forecast.data.weather_client as client_module
+
+    _redirect_cache(monkeypatch, tmp_path)
+    log_path = tmp_path / "weather_availability_probe.csv"
+    calls = _install_fake_get(monkeypatch, _FakeResponse(200, _load_fixture()))
+
+    log_availability_attempt(_RUN, forecast_days=1, log_path=log_path)
+    assert len(calls) == 1
+
+    def fail_if_called(*args: object, **kwargs: object) -> None:
+        raise AssertionError("requests.get must not be called on a cache hit")
+
+    monkeypatch.setattr(client_module.requests, "get", fail_if_called)
+
+    row = log_availability_attempt(_RUN, forecast_days=1, log_path=log_path)
+    assert row["available"] == "true"
 
 
 # ---------------------------------------------------------------------------

@@ -333,13 +333,21 @@ def log_availability_attempt(
     forecast_days: int = 3,
     log_path: Path = _AVAILABILITY_LOG_PATH,
 ) -> dict[str, str]:
-    """Attempt fetch_run() once, live (no cache -- a probe must reflect
-    right-now availability, not a stale cache entry), and append exactly one
-    row to the committed availability log (spec 6.5.1, §5.4b). This is the
-    measurement that stands in for the F3 multi-day check the spike
-    (6.5.0) could not complete: over weeks of daily probe-workflow runs, the
-    log accumulates the real availability-time distribution, including the
-    bad days three ad-hoc checks could never have found.
+    """Attempt fetch_run() once and append exactly one row to the committed
+    availability log (spec 6.5.1, §5.4b). This is the measurement that
+    stands in for the F3 multi-day check the spike (6.5.0) could not
+    complete: over weeks of daily probe-workflow runs, the log accumulates
+    the real availability-time distribution, including the bad days three
+    ad-hoc checks could never have found.
+
+    Goes through the ordinary cache (use_cache defaults True on fetch_run):
+    a cache hit here means this exact run was already confirmed available
+    by an earlier probe today, which is a perfectly valid "available" result
+    to log again -- runs are immutable once fetched, so there is no
+    staleness concern. This is deliberate, not incidental: a successful
+    morning probe leaves the run cached, so 6.7's later same-day submission
+    computation finds it already there (spec §5.5, "Der Probe-Workflow
+    schreibt in denselben Cache").
 
     Only WeatherRunUnavailable is caught and logged as a failed attempt
     (available=false) -- any other exception (a structural fail-fast check
@@ -359,7 +367,7 @@ def log_availability_attempt(
         "error": "",
     }
     try:
-        df = fetch_run(run_init_utc, model=model, forecast_days=forecast_days, use_cache=False)
+        df = fetch_run(run_init_utc, model=model, forecast_days=forecast_days)
     except WeatherRunUnavailable as exc:
         row["http_status"] = "" if exc.http_status is None else str(exc.http_status)
         row["error"] = str(exc)[:200]

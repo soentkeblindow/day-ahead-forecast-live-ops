@@ -1,0 +1,85 @@
+name: Daily weather availability probe
+
+on:
+  schedule:
+    # UTC-only, no DST awareness in GitHub's cron. Odd minutes (:23) rather
+    # than :00/:30 on purpose -- Actions cron is notoriously unpunctual at
+    # round minutes, and this avoids colliding with audit.yml's own :00/:45
+    # slots (spec 6.5.1, §5.4c). Five morning slots, 05:00-09:00 UTC --
+    # 07:00-11:00 local in CEST, 06:00-10:00 local in CET -- so the probe
+    # brackets the documented 4-6h post-00Z availability window from both
+    # sides. This is the measurement standing in for the F3 multi-day check
+    # the spike (6.5.0) could not complete -- see
+    # docs/sprint6_step6_5_1_log.md, "Schritt 8".
+    - cron: "23 5 * * *"
+    - cron: "23 6 * * *"
+    - cron: "23 7 * * *"
+    - cron: "23 8 * * *"
+    - cron: "23 9 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: weather-availability-probe
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    # A single HTTP call plus at most two transport retries -- generous but
+    # much smaller than audit.yml's 20 min, which exists for a six-series
+    # ENTSO-E fetch this job doesn't do.
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --all-extras --dev
+
+      # No secret: Open-Meteo's non-commercial tier needs no API key (spec
+      # §3.4) -- a real simplification over audit.yml's two-secret split.
+      - name: Probe weather run availability
+        run: uv run python scripts/probe_weather_availability.py
+
+      # A probe that measures and then discards its result is worse than
+      # none (same argument as audit.yml) -- a push failure here must
+      # redden the job, not be swallowed. Same retry/conflict mechanics as
+      # audit.yml (spec §3.1, point 7): git pull --rebase covers overlapping
+      # runs, the empty-diff guard covers the should-never-happen case of no
+      # new row.
+      - name: Commit and push the availability log
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add logs/weather_availability_probe.csv
+
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "data: weather availability probe run $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          for attempt in 1 2 3; do
+            if git push; then
+              echo "Push succeeded on attempt $attempt."
+              exit 0
+            fi
+            echo "Push failed (attempt $attempt/3); pulling --rebase and retrying."
+            git pull --rebase
+          done
+
+          echo "::error::Push failed after 3 attempts -- probe result was computed but not saved."
+          exit 1
