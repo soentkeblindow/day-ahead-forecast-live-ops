@@ -104,6 +104,7 @@ def test_request_uses_all_grid_points_models_run_no_timezone(
     assert params["models"] == "ecmwf_ifs"
     assert params["run"] == "2024-06-01T00:00"
     assert "timezone" not in params
+    assert params["wind_speed_unit"] == "ms"
 
 
 # ---------------------------------------------------------------------------

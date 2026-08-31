@@ -229,6 +229,12 @@ def fetch_run(
         "models": model,
         "run": run_init_utc.strftime("%Y-%m-%dT%H:%M"),
         "forecast_days": forecast_days,
+        # Open-Meteo's default wind speed unit is km/h, not m/s -- found
+        # live while sanity-checking the wiring probe against plan E1's
+        # explicit m/s turbine thresholds (rated ~12 m/s, cutout ~25 m/s).
+        # Requested explicitly so the artefact is unambiguously SI
+        # throughout and 6.5.2 never has to guess or convert.
+        "wind_speed_unit": "ms",
     }
 
     def do_request() -> requests.Response:

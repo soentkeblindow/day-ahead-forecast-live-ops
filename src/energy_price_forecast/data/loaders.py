@@ -247,3 +247,47 @@ def load_interim_quarterhourly(path: Path = _QUARTERHOURLY_PATH) -> pd.DataFrame
     validate_delivery_day_slot_counts(pd.DatetimeIndex(df.index))
     logger.info("loaded %d quarter-hourly rows from %s", len(df), path)
     return df
+
+
+# ---------------------------------------------------------------------------
+# Interim layer — raw ECMWF IFS weather artefact (sprint 6.5.1)
+# ---------------------------------------------------------------------------
+
+_WEATHER_PATH = Path("data/interim/weather_ifs_run00.parquet")
+
+
+def load_interim_weather(path: Path = _WEATHER_PATH) -> pd.DataFrame:
+    """Load the raw weather artefact (scripts/build_weather_artefact.py).
+
+    Raises FileNotFoundError if the file does not exist. Validates the
+    artefact's shape -- MultiIndex level names, column count, dtype -- before
+    returning, rather than passing a structurally wrong frame downstream
+    (spec 6.5.1, §5.7). Does not re-check the exact column set against
+    weather_grid.expected_columns(): that's already enforced file-by-file
+    when build_weather_artefact.py reads each cached run
+    (data/_weather_cache.py::read_cached_run), so a merged artefact with the
+    wrong shape here means something outside that pipeline touched the file.
+    """
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Weather Parquet not found at {path!r}. "
+            "Run scripts/build_weather_artefact.py to generate it."
+        )
+    df = pd.read_parquet(path)
+
+    index_names = list(df.index.names)
+    if index_names != ["run_init_utc", "valid_time_utc"]:
+        raise ValueError(
+            f"weather artefact at {path!r} has index names {index_names!r}, "
+            "expected ['run_init_utc', 'valid_time_utc']"
+        )
+    if len(df.columns) != 162:
+        raise ValueError(
+            f"weather artefact at {path!r} has {len(df.columns)} columns, expected 162"
+        )
+    bad_dtypes = {col: dtype for col, dtype in df.dtypes.items() if dtype != "float32"}
+    if bad_dtypes:
+        raise ValueError(f"weather artefact at {path!r} has non-float32 columns: {bad_dtypes}")
+
+    logger.info("loaded %d weather rows from %s", len(df), path)
+    return df
