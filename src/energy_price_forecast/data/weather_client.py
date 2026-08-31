@@ -222,7 +222,7 @@ def fetch_run(
             logger.info("Weather cache hit: %s", path)
             return cached
 
-    params = {
+    params: dict[str, str | int] = {
         "latitude": ",".join(str(p.latitude) for p in GRID_POINTS),
         "longitude": ",".join(str(p.longitude) for p in GRID_POINTS),
         "hourly": ",".join(HOURLY_VARIABLES),

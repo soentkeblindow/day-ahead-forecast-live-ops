@@ -511,17 +511,18 @@ def test_lead_hour_coverage_full_local_day(target_day: dt.date) -> None:
     covered = [t for t in local_times if start <= t < end]
     assert len(covered) == 24
 
+    params: dict[str, str | int | float] = {
+        "latitude": GRID_POINTS[0].latitude,
+        "longitude": GRID_POINTS[0].longitude,
+        "hourly": "temperature_2m",
+        "models": "ecmwf_ifs",
+        "run": run.strftime("%Y-%m-%dT%H:%M"),
+        "forecast_days": 3,
+        "timezone": "Europe/Berlin",
+    }
     response = requests.get(
         "https://single-runs-api.open-meteo.com/v1/forecast",
-        params={
-            "latitude": GRID_POINTS[0].latitude,
-            "longitude": GRID_POINTS[0].longitude,
-            "hourly": "temperature_2m",
-            "models": "ecmwf_ifs",
-            "run": run.strftime("%Y-%m-%dT%H:%M"),
-            "forecast_days": 3,
-            "timezone": "Europe/Berlin",
-        },
+        params=params,
         timeout=30,
     )
     response.raise_for_status()
