@@ -280,3 +280,30 @@ def test_naive_timestamp_rejected() -> None:
 def test_invalid_run_hour_rejected() -> None:
     with pytest.raises(ValueError, match="0, 6, 12, 18"):
         fetch_run(pd.Timestamp("2024-06-01T03:00", tz="UTC"))
+
+
+# ---------------------------------------------------------------------------
+# F11 measurement 2 as a standing test (spec 6.5.1, §5.2 / §7, work order
+# step 9): live, local-only. See docs/sprint6_step6_5_1_log.md, "Schritt 8"
+# for the full F10/F11 measurement writeup this codifies.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+def test_lead_zero_of_12z_run_radiation_none_others_valued() -> None:
+    """At lead 0 of a 12 UTC run there is no "preceding hour" within the run
+    yet. Both radiation variables (mean-preceding-hour) must therefore be
+    NaN there -- not a night effect, since 12:00 UTC is bright afternoon --
+    while every instantaneous variable carries an ordinary value. If this
+    ever flips, the API's aggregation convention for radiation has changed
+    and 6.5.2 would be reading it wrong from then on.
+    """
+    run = pd.Timestamp("2025-06-21T12:00", tz="UTC")
+    df = fetch_run(run, forecast_days=1, use_cache=False)
+    lead_zero = df.iloc[0]
+
+    for point in GRID_POINTS:
+        assert pd.isna(lead_zero[f"{point.point_id}__shortwave_radiation"])
+        assert pd.isna(lead_zero[f"{point.point_id}__direct_normal_irradiance"])
+        assert not pd.isna(lead_zero[f"{point.point_id}__temperature_2m"])
+        assert not pd.isna(lead_zero[f"{point.point_id}__surface_pressure"])

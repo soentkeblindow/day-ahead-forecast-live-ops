@@ -93,16 +93,10 @@ def test_time_convention_covers_exactly_the_nine_variables() -> None:
     assert len(HOURLY_VARIABLES) == 9
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "F11 (spec 6.5.1, §5.2) has not been run yet. Eight of the nine "
-        "variables still carry ConventionProvenance.ASSUMED; this test is "
-        "the standing reminder that must turn green once F11 measures them "
-        "and step 9 of the work order (§10) updates VARIABLE_TIME_CONVENTION."
-    ),
-)
 def test_no_variable_still_assumed() -> None:
+    """F11 (spec 6.5.1, §5.2, docs/sprint6_step6_5_1_log.md "Schritt 8") has
+    measured all eight previously-ASSUMED variables; this now stays green
+    permanently rather than being the standing reminder it was before."""
     still_assumed = [
         variable
         for variable, (_, provenance) in VARIABLE_TIME_CONVENTION.items()

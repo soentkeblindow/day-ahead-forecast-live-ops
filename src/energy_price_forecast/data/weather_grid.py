@@ -97,26 +97,32 @@ class ConventionProvenance(StrEnum):
     ASSUMED = "assumed"
 
 
-# Provisional conventions, pending F11 (spec 6.5.1, §5.2). Only
-# shortwave_radiation is an actual measurement (spike 6.5.0, F7): a timestamp
-# T describes the mean over the hour preceding T. The other eight are a
-# documentation-based inference, not a measurement -- flux quantities
-# (radiation) are averaged over the preceding hour, state quantities
-# (temperature, wind, pressure, cloud cover) are instantaneous at T -- and
-# are marked ASSUMED until F11 measures each of them directly.
+# Measured, not assumed (spec 6.5.1, §5.2, F11 -- run 2026-08-31). Two
+# independent, agreeing measurements per variable: (1) whether an "_instant"
+# variant exists next to the default (it does only for the two radiation
+# variables; requesting it for any of the other seven returns the exact same
+# generic 400 as a nonexistent variable name); (2) lead 0 of a 12 UTC run
+# (bright afternoon, no night ambiguity) -- both radiation variables are None
+# there (no "preceding hour" exists yet), all seven others carry ordinary
+# values. shortwave_radiation keeps its original spike 6.5.0, F7 provenance;
+# the other eight are now MEASURED_F11. Full measurement log:
+# docs/sprint6_step6_5_1_log.md, "Schritt 8".
 VARIABLE_TIME_CONVENTION: Final[Mapping[str, tuple[TimeConvention, ConventionProvenance]]] = {
-    "wind_speed_100m": (TimeConvention.INSTANTANEOUS, ConventionProvenance.ASSUMED),
-    "wind_speed_10m": (TimeConvention.INSTANTANEOUS, ConventionProvenance.ASSUMED),
-    "wind_direction_100m": (TimeConvention.INSTANTANEOUS, ConventionProvenance.ASSUMED),
-    "temperature_2m": (TimeConvention.INSTANTANEOUS, ConventionProvenance.ASSUMED),
-    "surface_pressure": (TimeConvention.INSTANTANEOUS, ConventionProvenance.ASSUMED),
+    "wind_speed_100m": (TimeConvention.INSTANTANEOUS, ConventionProvenance.MEASURED_F11),
+    "wind_speed_10m": (TimeConvention.INSTANTANEOUS, ConventionProvenance.MEASURED_F11),
+    "wind_direction_100m": (TimeConvention.INSTANTANEOUS, ConventionProvenance.MEASURED_F11),
+    "temperature_2m": (TimeConvention.INSTANTANEOUS, ConventionProvenance.MEASURED_F11),
+    "surface_pressure": (TimeConvention.INSTANTANEOUS, ConventionProvenance.MEASURED_F11),
     "shortwave_radiation": (
         TimeConvention.MEAN_PRECEDING_HOUR,
         ConventionProvenance.MEASURED_F7,
     ),
-    "direct_normal_irradiance": (TimeConvention.MEAN_PRECEDING_HOUR, ConventionProvenance.ASSUMED),
-    "cloud_cover": (TimeConvention.INSTANTANEOUS, ConventionProvenance.ASSUMED),
-    "cloud_cover_low": (TimeConvention.INSTANTANEOUS, ConventionProvenance.ASSUMED),
+    "direct_normal_irradiance": (
+        TimeConvention.MEAN_PRECEDING_HOUR,
+        ConventionProvenance.MEASURED_F11,
+    ),
+    "cloud_cover": (TimeConvention.INSTANTANEOUS, ConventionProvenance.MEASURED_F11),
+    "cloud_cover_low": (TimeConvention.INSTANTANEOUS, ConventionProvenance.MEASURED_F11),
 }
 
 assert set(VARIABLE_TIME_CONVENTION) == set(HOURLY_VARIABLES), (
