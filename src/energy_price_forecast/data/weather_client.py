@@ -14,9 +14,12 @@ leakage-free by construction.
 from __future__ import annotations
 
 import contextlib
+import csv
+import datetime as dt
 import logging
 import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any, Final
 
 import pandas as pd
@@ -24,6 +27,8 @@ import requests
 
 from energy_price_forecast.data._weather_cache import cache_path, read_cached_run, write_cached_run
 from energy_price_forecast.data.weather_grid import GRID_POINTS, HOURLY_VARIABLES, expected_columns
+from energy_price_forecast.market_time import gate_closure_for_index
+from energy_price_forecast.ops.windows import local_day_bounds
 
 logger = logging.getLogger(__name__)
 
@@ -271,3 +276,104 @@ def fetch_run(
         write_cached_run(df, path)
 
     return df
+
+
+def run_init_for_target_day(target_day: dt.date) -> pd.Timestamp:
+    """The model run that a forecast for local delivery day ``target_day``
+    is allowed to use: the 00 UTC run of the preceding calendar day.
+
+    This is plan decision 9 in one function. Backtest and live path call it
+    with the same argument type and get the same answer, which is what
+    makes them one code path (decision 10, spec 6.5.1 §4 rule 1).
+
+    Depends ONLY on the calendar, never on what happens to be published --
+    that distinction is the whole point (spec 6.5.1, §4 rule 1, and the
+    "Kalender ja, Uhr nein" note in §11).
+
+    DST: the subtraction is done on a plain ``date``, never on a tz-aware
+    Timestamp. ``pd.Timedelta(days=1)`` on a tz-aware timestamp is the bug
+    class that has already struck four times in this sprint (spec §11).
+
+    Asserts that the resulting run initialisation is strictly before the
+    gate closure of ``target_day`` -- a checked property, not a comment
+    that can drift. By construction this always holds (the run is always
+    00:00 UTC on D-1, gate closure is always 10:00 or 11:00 UTC on D-1
+    depending on DST), so this assertion exists purely to catch a future
+    change to either constant breaking that relationship silently.
+    """
+    run_day = target_day - dt.timedelta(days=1)
+    run_init_utc = pd.Timestamp(run_day, tz="UTC")
+
+    target_start_local, _ = local_day_bounds(target_day)
+    gate_closure_utc = gate_closure_for_index(pd.DatetimeIndex([target_start_local]))[0]
+
+    assert run_init_utc < gate_closure_utc, (
+        f"run_init_utc {run_init_utc!r} is not strictly before gate closure "
+        f"{gate_closure_utc!r} for target_day {target_day!r}"
+    )
+    return run_init_utc
+
+
+_AVAILABILITY_LOG_PATH: Final[Path] = Path("logs/weather_availability_probe.csv")
+_AVAILABILITY_LOG_COLUMNS: Final[tuple[str, ...]] = (
+    "probe_time_utc",
+    "run_init_utc",
+    "model",
+    "available",
+    "http_status",
+    "n_hours",
+    "error",
+)
+
+
+def log_availability_attempt(
+    run_init_utc: pd.Timestamp,
+    *,
+    model: str = "ecmwf_ifs",
+    forecast_days: int = 3,
+    log_path: Path = _AVAILABILITY_LOG_PATH,
+) -> dict[str, str]:
+    """Attempt fetch_run() once, live (no cache -- a probe must reflect
+    right-now availability, not a stale cache entry), and append exactly one
+    row to the committed availability log (spec 6.5.1, §5.4b). This is the
+    measurement that stands in for the F3 multi-day check the spike
+    (6.5.0) could not complete: over weeks of daily probe-workflow runs, the
+    log accumulates the real availability-time distribution, including the
+    bad days three ad-hoc checks could never have found.
+
+    Only WeatherRunUnavailable is caught and logged as a failed attempt
+    (available=false) -- any other exception (a structural fail-fast check
+    from fetch_run, or a transport error surviving its own retries)
+    propagates so the caller (scripts/probe_weather_availability.py) turns
+    the workflow run red, per spec §5.4c: an unavailable run is an expected
+    outcome of an early probe, a structural error is not.
+    """
+    probe_time_utc = pd.Timestamp.now("UTC")
+    row = {
+        "probe_time_utc": probe_time_utc.isoformat(),
+        "run_init_utc": run_init_utc.isoformat(),
+        "model": model,
+        "available": "false",
+        "http_status": "",
+        "n_hours": "",
+        "error": "",
+    }
+    try:
+        df = fetch_run(run_init_utc, model=model, forecast_days=forecast_days, use_cache=False)
+    except WeatherRunUnavailable as exc:
+        row["http_status"] = "" if exc.http_status is None else str(exc.http_status)
+        row["error"] = str(exc)[:200]
+    else:
+        row["available"] = "true"
+        row["http_status"] = "200"
+        row["n_hours"] = str(len(df.index.get_level_values("valid_time_utc").unique()))
+
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not log_path.exists()
+    with log_path.open("a", newline="", encoding="utf-8") as f:
+        writer: csv.DictWriter[str] = csv.DictWriter(f, fieldnames=list(_AVAILABILITY_LOG_COLUMNS))
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+    return row

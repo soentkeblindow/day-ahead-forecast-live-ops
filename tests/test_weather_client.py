@@ -7,10 +7,11 @@ monkeypatch ``requests.get`` so nothing in this file except the tests marked
 ``integration`` touches the network.
 
 Determinism and lead-hour-coverage tests (spec 6.5.1, §7, both explicitly
-"netzwerkabhängig, lokal") are deferred to the run-derivation test step
-(§10, step 11) -- this file's scope matches its own work-order commit
-message: request shape, response parsing, every fail-fast branch, single
-attempt.
+"netzwerkabhängig, lokal") were deferred from step 5's scope (request
+shape, response parsing, every fail-fast branch, single attempt) and land
+here in step 11 instead, alongside run_init_for_target_day and the
+availability log -- both of the deferred tests are ``@pytest.mark.integration``
+and therefore excluded from the default (and CI) run.
 
 Every fetch_run() call here passes ``use_cache=False``: most tests share the
 same ``_RUN`` timestamp with different (some deliberately corrupted) mock
@@ -22,6 +23,7 @@ The cache itself is tested in tests/test_weather_cache.py.
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 from pathlib import Path
 from typing import Any
@@ -29,9 +31,16 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import pytest
+import requests
 
-from energy_price_forecast.data.weather_client import WeatherRunUnavailable, fetch_run
+from energy_price_forecast.data.weather_client import (
+    WeatherRunUnavailable,
+    fetch_run,
+    log_availability_attempt,
+    run_init_for_target_day,
+)
 from energy_price_forecast.data.weather_grid import GRID_POINTS, HOURLY_VARIABLES, expected_columns
+from energy_price_forecast.ops.windows import local_day_bounds
 
 _FIXTURE_PATH = Path(__file__).parent / "fixtures" / "open_meteo_single_run.json"
 _RUN = pd.Timestamp("2024-06-01T00:00", tz="UTC")
@@ -307,3 +316,175 @@ def test_lead_zero_of_12z_run_radiation_none_others_valued() -> None:
         assert pd.isna(lead_zero[f"{point.point_id}__direct_normal_irradiance"])
         assert not pd.isna(lead_zero[f"{point.point_id}__temperature_2m"])
         assert not pd.isna(lead_zero[f"{point.point_id}__surface_pressure"])
+
+
+# ---------------------------------------------------------------------------
+# run_init_for_target_day (spec §5.4a)
+# ---------------------------------------------------------------------------
+
+
+def test_run_init_for_target_day_normal_day() -> None:
+    result = run_init_for_target_day(dt.date(2026, 8, 31))
+    assert result == pd.Timestamp("2026-08-30T00:00", tz="UTC")
+
+
+@pytest.mark.parametrize(
+    "target_day",
+    [
+        dt.date(2026, 3, 29),  # spring-forward DST day
+        dt.date(2026, 3, 30),  # day after
+        dt.date(2025, 10, 26),  # fall-back DST day
+        dt.date(2025, 10, 27),  # day after
+    ],
+)
+def test_run_init_for_target_day_no_dst_shift(target_day: dt.date) -> None:
+    result = run_init_for_target_day(target_day)
+    expected = pd.Timestamp(target_day - dt.timedelta(days=1), tz="UTC")
+    assert result == expected
+    assert result.hour == 0
+
+
+def test_run_init_for_target_day_gate_closure_assertion_fires(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Negative control (spec §7): an artificially-too-early gate closure
+    must make the assertion fail, proving it is a live check rather than a
+    comment that can silently drift."""
+    import energy_price_forecast.data.weather_client as client_module
+
+    def fake_gate_closure(index: pd.DatetimeIndex) -> pd.DatetimeIndex:
+        return pd.DatetimeIndex([pd.Timestamp("1900-01-01", tz="UTC")])
+
+    monkeypatch.setattr(client_module, "gate_closure_for_index", fake_gate_closure)
+
+    with pytest.raises(AssertionError):
+        run_init_for_target_day(dt.date(2026, 8, 31))
+
+
+def test_dst_conversion_produces_correct_local_hour_counts() -> None:
+    """§7 "DST im Artefakt-Index": converting a run's UTC valid times to
+    Europe/Berlin across both changeover days yields 23 (spring) / 25
+    (autumn) local hours for the covered day, with no duplicate or missing
+    timestamps. Purely a pandas/tz-database check -- no network needed.
+    """
+    cases = [
+        (pd.Timestamp("2026-03-28T00:00", tz="UTC"), dt.date(2026, 3, 29), 23),
+        (pd.Timestamp("2025-10-25T00:00", tz="UTC"), dt.date(2025, 10, 26), 25),
+    ]
+    for run, target_day, expected_hours in cases:
+        utc_index = pd.date_range(run, periods=72, freq="h", tz="UTC")
+        local_index = utc_index.tz_convert("Europe/Berlin")
+        start, end = local_day_bounds(target_day)
+        covered = local_index[(local_index >= start) & (local_index < end)]
+        assert len(covered) == expected_hours
+        assert covered.is_unique
+
+
+# ---------------------------------------------------------------------------
+# log_availability_attempt (spec §5.4b)
+# ---------------------------------------------------------------------------
+
+
+def test_log_availability_attempt_success_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    log_path = tmp_path / "weather_availability_probe.csv"
+    _install_fake_get(monkeypatch, _FakeResponse(200, _load_fixture()))
+
+    row = log_availability_attempt(_RUN, forecast_days=1, log_path=log_path)
+
+    assert row["available"] == "true"
+    assert row["http_status"] == "200"
+    assert row["n_hours"] == str(_N_HOURS)
+    assert row["error"] == ""
+
+    lines = log_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2  # header + one row
+    assert lines[0].split(",") == [
+        "probe_time_utc",
+        "run_init_utc",
+        "model",
+        "available",
+        "http_status",
+        "n_hours",
+        "error",
+    ]
+
+
+def test_log_availability_attempt_failure_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    log_path = tmp_path / "weather_availability_probe.csv"
+    _install_fake_get(monkeypatch, _FakeResponse(400, {"error": True, "reason": "not available"}))
+
+    row = log_availability_attempt(_RUN, log_path=log_path)
+
+    assert row["available"] == "false"
+    assert row["http_status"] == "400"
+    assert row["n_hours"] == ""
+    assert row["error"] != ""
+
+
+def test_log_availability_attempt_appends_not_overwrites(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    log_path = tmp_path / "weather_availability_probe.csv"
+    _install_fake_get(monkeypatch, _FakeResponse(200, _load_fixture()))
+
+    log_availability_attempt(_RUN, forecast_days=1, log_path=log_path)
+    log_availability_attempt(_RUN, forecast_days=1, log_path=log_path)
+
+    lines = log_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 3  # header + two rows
+
+
+# ---------------------------------------------------------------------------
+# Determinism and lead-hour coverage (F8), deferred from step 5 -- both live,
+# local-only (spec §7)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+def test_determinism_same_run_fetched_twice() -> None:
+    run = pd.Timestamp("2024-06-01T00:00", tz="UTC")
+    first = fetch_run(run, forecast_days=1, use_cache=False)
+    second = fetch_run(run, forecast_days=1, use_cache=False)
+    pd.testing.assert_frame_equal(first, second)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("target_day", [dt.date(2025, 6, 16), dt.date(2025, 1, 16)])
+def test_lead_hour_coverage_full_local_day(target_day: dt.date) -> None:
+    """F8 as a standing test: the 00 UTC run of D-1 must cover the complete
+    local calendar day D, in both seasons. Cross-checked against the API's
+    own timezone=Europe/Berlin parameter -- the one place in this repo that
+    parameter is used (spec §2.1) -- as an independent verification of our
+    own UTC -> local conversion.
+    """
+    run = run_init_for_target_day(target_day)
+    df = fetch_run(run, forecast_days=3, use_cache=False)
+    valid_times = pd.DatetimeIndex(df.index.get_level_values("valid_time_utc").unique())
+    local_times = valid_times.tz_convert("Europe/Berlin")
+
+    start, end = local_day_bounds(target_day)
+    covered = [t for t in local_times if start <= t < end]
+    assert len(covered) == 24
+
+    response = requests.get(
+        "https://single-runs-api.open-meteo.com/v1/forecast",
+        params={
+            "latitude": GRID_POINTS[0].latitude,
+            "longitude": GRID_POINTS[0].longitude,
+            "hourly": "temperature_2m",
+            "models": "ecmwf_ifs",
+            "run": run.strftime("%Y-%m-%dT%H:%M"),
+            "forecast_days": 3,
+            "timezone": "Europe/Berlin",
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    api_local_times = pd.to_datetime(response.json()["hourly"]["time"])
+    target_day_str = target_day.isoformat()
+    api_covered = [t for t in api_local_times if t.date().isoformat() == target_day_str]
+    assert len(api_covered) == 24
