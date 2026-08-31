@@ -124,18 +124,24 @@ assert set(VARIABLE_TIME_CONVENTION) == set(HOURLY_VARIABLES), (
 )
 
 
-def _cache_fingerprint() -> str:
+def _cache_fingerprint(
+    points: tuple[GridPoint, ...] = GRID_POINTS,
+    variables: tuple[str, ...] = HOURLY_VARIABLES,
+) -> str:
     """First eight hex characters of a SHA256 over the canonical
-    serialisation of GRID_POINTS (order included) and HOURLY_VARIABLES.
+    serialisation of ``points`` (order included) and ``variables``.
 
-    Computed at import time rather than maintained by hand, so that a
-    forgotten version bump cannot cause silently mixed schemas in the cache
-    (spec 6.5.1, §2.5b).
+    Computed at import time (from the module-level defaults) rather than
+    maintained by hand, so that a forgotten version bump cannot cause
+    silently mixed schemas in the cache (spec 6.5.1, §2.5b). Accepts
+    explicit arguments so tests can prove the fingerprint actually reacts to
+    a changed point set or variable tuple, without mutating the frozen
+    module-level constants.
     """
     canonical = json.dumps(
         {
-            "points": [(p.point_id, p.latitude, p.longitude) for p in GRID_POINTS],
-            "variables": list(HOURLY_VARIABLES),
+            "points": [(p.point_id, p.latitude, p.longitude) for p in points],
+            "variables": list(variables),
         },
         separators=(",", ":"),
     )
