@@ -221,9 +221,11 @@ __marimo__/
 data/raw/*
 data/interim/*
 data/processed/*
+data/cache/*
 !data/raw/.gitkeep
 !data/interim/.gitkeep
 !data/processed/.gitkeep
+!data/cache/.gitkeep
 
 # specs
 docs/
@@ -235,10 +237,15 @@ mlartifacts/
 # Jupyter Notebook Checkpoints
 .ipynb_checkpoints/
 
-# IDE
+# IDE + Agent
 .vscode/
 .idea/
+claude.md
+
+# Throwaway exploration scripts (see docs/sprint6_step6_5_0_spike.md)
+scratch/
 
 # OS
 .DS_Store
 Thumbs.db
+

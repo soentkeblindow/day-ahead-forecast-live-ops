@@ -22,6 +22,7 @@ from typing import Any, Final
 import pandas as pd
 import requests
 
+from energy_price_forecast.data._weather_cache import cache_path, read_cached_run, write_cached_run
 from energy_price_forecast.data.weather_grid import GRID_POINTS, HOURLY_VARIABLES, expected_columns
 
 logger = logging.getLogger(__name__)
@@ -165,6 +166,7 @@ def fetch_run(
     *,
     model: str = "ecmwf_ifs",
     forecast_days: int = 3,
+    use_cache: bool = True,
 ) -> pd.DataFrame:
     """Fetch one named ECMWF IFS HRES run for the full fixed grid. One attempt.
 
@@ -180,6 +182,15 @@ def fetch_run(
 
     Returns a frame indexed by (run_init_utc, valid_time_utc) with 162 columns
     named ``{point_id}__{variable}``, dtype float32.
+
+    With ``use_cache=True`` (default), a cache hit (data/_weather_cache.py)
+    short-circuits the whole request -- no HTTP call is made at all. A miss
+    fetches and then writes the cache entry, so a live probe run in the
+    morning (spec §5.4c) leaves the run ready for the same day's later
+    consumers. The cache is pure storage (no interval arithmetic, spec
+    §2.5): it is keyed on the run and the grid/variable schema only, so it
+    assumes callers use a consistent ``forecast_days`` across a given
+    ``(model, run)`` -- true for every caller in this repo.
 
     ONE ATTEMPT, NO WAITING. If the run is not there, this raises. It does not
     sleep, poll or retry on a timer -- repetition is the scheduler's job
@@ -198,6 +209,13 @@ def fetch_run(
             f"run_init_utc must be exactly one of {sorted(_VALID_RUN_HOURS)} UTC, "
             f"got {run_init_utc!r}"
         )
+
+    path = cache_path(run_init_utc, model) if use_cache else None
+    if path is not None:
+        cached = read_cached_run(path)
+        if cached is not None:
+            logger.info("Weather cache hit: %s", path)
+            return cached
 
     params = {
         "latitude": ",".join(str(p.latitude) for p in GRID_POINTS),
@@ -247,4 +265,9 @@ def fetch_run(
     # shortwave_radiation / direct_normal_irradiance are None at night --
     # geometrically correct, not a data gap. A missing *key* is the error
     # case, and _check_variables_present already covers that.
-    return _parse_response(payload, run_init_utc)
+    df = _parse_response(payload, run_init_utc)
+
+    if path is not None:
+        write_cached_run(df, path)
+
+    return df

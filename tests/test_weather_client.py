@@ -11,6 +11,13 @@ Determinism and lead-hour-coverage tests (spec 6.5.1, §7, both explicitly
 (§10, step 11) -- this file's scope matches its own work-order commit
 message: request shape, response parsing, every fail-fast branch, single
 attempt.
+
+Every fetch_run() call here passes ``use_cache=False``: most tests share the
+same ``_RUN`` timestamp with different (some deliberately corrupted) mock
+responses, and the real per-run cache is keyed on nothing but the run --
+without this, the first passing test would write a cache entry that later
+tests would then silently hit instead of exercising their own mock response.
+The cache itself is tested in tests/test_weather_cache.py.
 """
 
 from __future__ import annotations
@@ -78,7 +85,7 @@ def test_request_uses_all_grid_points_models_run_no_timezone(
 ) -> None:
     calls = _install_fake_get(monkeypatch, _FakeResponse(200, _load_fixture()))
 
-    fetch_run(_RUN, forecast_days=1)
+    fetch_run(_RUN, forecast_days=1, use_cache=False)
 
     assert len(calls) == 1
     params = calls[0]
@@ -99,7 +106,7 @@ def test_response_parsing_against_fixture(monkeypatch: pytest.MonkeyPatch) -> No
     fixture = _load_fixture()
     _install_fake_get(monkeypatch, _FakeResponse(200, fixture))
 
-    df = fetch_run(_RUN, forecast_days=1)
+    df = fetch_run(_RUN, forecast_days=1, use_cache=False)
 
     assert df.shape == (_N_HOURS, 162)
     assert list(df.columns) == list(expected_columns())
@@ -129,7 +136,7 @@ def test_night_hours_stay_nan(monkeypatch: pytest.MonkeyPatch) -> None:
     fixture = _load_fixture()
     _install_fake_get(monkeypatch, _FakeResponse(200, fixture))
 
-    df = fetch_run(_RUN, forecast_days=1)
+    df = fetch_run(_RUN, forecast_days=1, use_cache=False)
 
     column = f"{GRID_POINTS[0].point_id}__shortwave_radiation"
     assert pd.isna(df[column].iloc[0])  # 2024-06-01T00:00 UTC, night
@@ -146,7 +153,7 @@ def test_wrong_object_count_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_get(monkeypatch, _FakeResponse(200, fixture))
 
     with pytest.raises(ValueError, match="18"):
-        fetch_run(_RUN, forecast_days=1)
+        fetch_run(_RUN, forecast_days=1, use_cache=False)
 
 
 def test_shifted_coordinate_raises(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -155,7 +162,7 @@ def test_shifted_coordinate_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_get(monkeypatch, _FakeResponse(200, fixture))
 
     with pytest.raises(ValueError, match=GRID_POINTS[0].point_id):
-        fetch_run(_RUN, forecast_days=1)
+        fetch_run(_RUN, forecast_days=1, use_cache=False)
 
 
 def test_missing_variable_raises(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -164,7 +171,7 @@ def test_missing_variable_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_get(monkeypatch, _FakeResponse(200, fixture))
 
     with pytest.raises(ValueError, match="cloud_cover"):
-        fetch_run(_RUN, forecast_days=1)
+        fetch_run(_RUN, forecast_days=1, use_cache=False)
 
 
 def test_too_short_time_series_raises(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -174,7 +181,7 @@ def test_too_short_time_series_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_get(monkeypatch, _FakeResponse(200, fixture))
 
     with pytest.raises(ValueError, match="24"):
-        fetch_run(_RUN, forecast_days=1)
+        fetch_run(_RUN, forecast_days=1, use_cache=False)
 
 
 def test_gap_in_timestamps_raises(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -188,7 +195,7 @@ def test_gap_in_timestamps_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_get(monkeypatch, _FakeResponse(200, fixture))
 
     with pytest.raises(ValueError, match="gap"):
-        fetch_run(_RUN, forecast_days=1)
+        fetch_run(_RUN, forecast_days=1, use_cache=False)
 
 
 def test_200_with_non_json_body_raises_weather_run_unavailable(
@@ -208,7 +215,7 @@ def test_200_with_non_json_body_raises_weather_run_unavailable(
     calls = _install_fake_get(monkeypatch, response)
 
     with pytest.raises(WeatherRunUnavailable) as exc_info:
-        fetch_run(_RUN, forecast_days=1)
+        fetch_run(_RUN, forecast_days=1, use_cache=False)
 
     assert len(calls) == 1
     assert exc_info.value.http_status == 200
@@ -233,7 +240,7 @@ def test_http_400_raises_weather_run_unavailable_with_run_in_message(
     _install_fake_get(monkeypatch, response)
 
     with pytest.raises(WeatherRunUnavailable) as exc_info:
-        fetch_run(_RUN, forecast_days=1)
+        fetch_run(_RUN, forecast_days=1, use_cache=False)
 
     assert "2024-06-01" in str(exc_info.value)
 
@@ -243,7 +250,7 @@ def test_single_attempt_no_retry_on_400(monkeypatch: pytest.MonkeyPatch) -> None
     calls = _install_fake_get(monkeypatch, response)
 
     with pytest.raises(WeatherRunUnavailable):
-        fetch_run(_RUN, forecast_days=1)
+        fetch_run(_RUN, forecast_days=1, use_cache=False)
 
     assert len(calls) == 1
 
@@ -253,7 +260,7 @@ def test_no_substitute_run_requested_on_400(monkeypatch: pytest.MonkeyPatch) -> 
     calls = _install_fake_get(monkeypatch, response)
 
     with pytest.raises(WeatherRunUnavailable):
-        fetch_run(_RUN, forecast_days=1)
+        fetch_run(_RUN, forecast_days=1, use_cache=False)
 
     requested_runs = {c["run"] for c in calls}
     assert requested_runs == {"2024-06-01T00:00"}
