@@ -22,6 +22,7 @@ this script's job is to measure and report, not to halt the caller.
 from __future__ import annotations
 
 import logging
+from typing import cast
 
 import pandas as pd
 
@@ -62,7 +63,10 @@ RELATIVE_ERROR_HALT_THRESHOLD = 0.05  # spec 6.5.2 section 2.5: Rueckfrage above
 def _predict(known: pd.Series, rule: CapacityExtrapolation | str, delta_days: float) -> float:
     if rule == _HOLD_LAST_VALUE:
         return float(known.iloc[-1])
-    rate_per_day = _extrapolation_rate_per_day(known, rule)
+    # rule is provably CapacityExtrapolation here (the only other member of
+    # _ALL_RULES), but it's typed as a union to hold the plain-string
+    # _HOLD_LAST_VALUE sentinel above.
+    rate_per_day = _extrapolation_rate_per_day(known, cast(CapacityExtrapolation, rule))
     return float(known.iloc[-1] + rate_per_day * delta_days)
 
 
@@ -114,7 +118,7 @@ def _log_interval_end_summary(detail: pd.DataFrame) -> list[tuple[str, str, str,
             last["error_pct"],
         )
         if abs(last["error_pct"]) > RELATIVE_ERROR_HALT_THRESHOLD * 100.0:
-            flagged.append((source, ptype, rule, float(last["error_pct"])))
+            flagged.append((str(source), str(ptype), str(rule), float(last["error_pct"])))
     return flagged
 
 
@@ -125,15 +129,16 @@ def _log_max_mean_summary(detail: pd.DataFrame) -> None:
         detail.assign(abs_error_gw=abs_gw)
         .groupby(["source", "production_type", "rule"])["abs_error_gw"]
         .agg(["max", "mean"])
+        .reset_index()
     )
-    for (source, ptype, rule), row in summary.iterrows():
+    for row in summary.itertuples():
         logger.info(
             "  %-14s %-13s %-26s  max=%.4f GW  mean=%.4f GW",
-            source,
-            ptype,
-            rule,
-            row["max"],
-            row["mean"],
+            row.source,
+            row.production_type,
+            row.rule,
+            row.max,
+            row.mean,
         )
 
 
