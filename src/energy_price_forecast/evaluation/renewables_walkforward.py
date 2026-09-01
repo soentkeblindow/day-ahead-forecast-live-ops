@@ -187,12 +187,14 @@ def run_renewables_backtest(
 
     target_tables: dict[ProductionType, pd.DataFrame] = {}
     target_labels_flat: dict[ProductionType, pd.Series] = {}
+    target_valid_time: dict[ProductionType, pd.DatetimeIndex] = {}
     for target in ProductionType:
         table = _build_target_table(
             target_hourly, target, features, valid_time, source=source, method=method
         )
         target_tables[target] = table
         vt = pd.DatetimeIndex(table.index.get_level_values("valid_time_utc"))
+        target_valid_time[target] = vt
         target_labels_flat[target] = pd.Series(
             table[f"{target.value}_cf_actual"].to_numpy(), index=vt
         )
@@ -200,6 +202,13 @@ def run_renewables_backtest(
     models: dict[ProductionType, RenewablesModel] = {
         target: RenewablesModel(target, objective=objective, seed=seed) for target in ProductionType
     }
+    # Fits are counted per target, from that target's own first usable fold
+    # -- not by the shared candidate-fold index i, which starts at the
+    # series' overall first day and may already be well past a multiple of
+    # refit_every by the time a target's weather/history requirement is
+    # first met. Without this, a target's very first fit could be skipped
+    # entirely (i % refit_every != 0), leaving predict() called before fit().
+    fits_since_refit: dict[ProductionType, int] = dict.fromkeys(ProductionType, refit_every)
 
     skip_counts: dict[str, int] = {t.value: 0 for t in ProductionType}
     n_folds = len(candidate_folds)
@@ -214,7 +223,7 @@ def run_renewables_backtest(
 
         for target in ProductionType:
             table = target_tables[target]
-            vt = pd.DatetimeIndex(table.index.get_level_values("valid_time_utc"))
+            vt = target_valid_time[target]
             test_mask = (vt >= test_lo) & (vt <= test_hi)
 
             if test_mask.sum() != len(fold.test_index):
@@ -240,7 +249,7 @@ def run_renewables_backtest(
                 )
                 continue
 
-            if i % refit_every == 0:
+            if fits_since_refit[target] >= refit_every:
                 train_mask = (vt >= train_lo) & (vt <= train_hi)
                 x_train = table.loc[train_mask, columns_for(target)]
                 y_train = table.loc[train_mask, f"{target.value}_cf_actual"]
@@ -251,6 +260,8 @@ def run_renewables_backtest(
                     x_train = x_train.loc[daylight]
                     y_train = y_train.loc[daylight]
                 models[target].fit(x_train, y_train)
+                fits_since_refit[target] = 0
+            fits_since_refit[target] += 1
 
             x_test = table.loc[test_mask, columns_for(target)]
             y_test_actual = table.loc[test_mask, f"{target.value}_cf_actual"]
