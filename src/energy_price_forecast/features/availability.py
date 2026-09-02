@@ -7,7 +7,8 @@ from enum import Enum, auto
 import numpy as np
 import pandas as pd
 
-from ..market_time import gate_closure_for_index
+from ..data.weather_client import run_init_for_target_day
+from ..market_time import _local_day, gate_closure_for_index
 
 # Publication lag of real-time actuals on the ENTSO-E Transparency Platform (~1 h).
 # Conservative bumping is allowed; a larger lag can only reject more, never accept.
@@ -22,9 +23,18 @@ class Availability(Enum):
 
     DETERMINISTIC = auto()  # calendar: known arbitrarily far in advance
     DA_FIXED = auto()  # day-ahead auction result (price, scheduled flows)
+    # Gate closure as knowledge time is the standard EPF assumption: market
+    # participants had equivalent information by then (own/commercial weather
+    # forecasts, the TSO forecast a proxy for it). NWP_RECONSTRUCTION (spec
+    # 6.5.3) turns that assumption into a fact for the renewables share --
+    # not a proxy for what was knowable, an actual reconstruction from a
+    # weather run that was itself available before gate closure.
     DA_FORECAST = auto()  # day-ahead forecast for the value day (load/RES fc)
     RT_ACTUAL = auto()  # realised in real time, ~1 h publication lag
     COMMODITY = auto()  # daily settlement, known from the next day
+    NWP_RECONSTRUCTION = (
+        auto()
+    )  # this project's own weather-run-based renewables reconstruction (spec 6.5.3)
 
 
 def knowledge_time(cls: Availability, value_index: pd.DatetimeIndex) -> pd.DatetimeIndex:
@@ -49,6 +59,19 @@ def knowledge_time(cls: Availability, value_index: pd.DatetimeIndex) -> pd.Datet
         # 22:00 UTC, which can land after gate closure (10:00 UTC) on transition
         # days. Daily settlements close ~16:00 UTC, so next UTC midnight is safe.
         return value_index.normalize() + pd.Timedelta(days=1)
+    if cls is Availability.NWP_RECONSTRUCTION:
+        # Calendar-derived, not gate-closure-derived: known as of the 00-UTC
+        # weather run of D-1 for each value's own local delivery day D (spec
+        # 6.5.3 section 3.2). run_init_for_target_day depends only on the
+        # calendar, never on the system clock or what happens to be published
+        # -- this is the abstract/general rule for the class; the concrete
+        # leakage proof for an actual reconstructed feature threads the real
+        # recorded run_init_utc from the artefact instead of recomputing this
+        # (see nwp_reconstruction_for_target, spec 6.5.3 section 4.4).
+        local_days = _local_day(value_index)
+        unique_days = pd.DatetimeIndex(pd.unique(local_days))
+        run_init_by_day = {d: run_init_for_target_day(d.date()) for d in unique_days}
+        return pd.DatetimeIndex([run_init_by_day[d] for d in local_days])
     raise ValueError(f"unknown availability class {cls!r}")
 
 
@@ -74,6 +97,14 @@ _RAW_AVAILABILITY: dict[str, Availability] = {
     "gen_other": Availability.RT_ACTUAL,
     "ttf_gas_eur_per_mwh": Availability.COMMODITY,
     "eua_co2_eur_per_t": Availability.COMMODITY,
+    # This project's own weather-run-based reconstruction (spec 6.5.3,
+    # section 3.1) -- coexists with, does not overwrite, the DA_FORECAST
+    # originals above, so both feature-building paths stay independently
+    # callable and comparable.
+    "wind_onshore_forecast_nwp": Availability.NWP_RECONSTRUCTION,
+    "wind_offshore_forecast_nwp": Availability.NWP_RECONSTRUCTION,
+    "solar_forecast_nwp": Availability.NWP_RECONSTRUCTION,
+    "residual_load_forecast_nwp": Availability.NWP_RECONSTRUCTION,
 }
 
 
@@ -153,6 +184,45 @@ def forecast_for_target(
         raise ValueError(f"forecast_for_target expects DA_FORECAST, got {column!r} ({cls})")
     values = pd.Series(raw.reindex(target_index).to_numpy(), index=target_index, name=name)
     kt = pd.Series(knowledge_time(cls, target_index), index=target_index)
+    return Feature(name, values, kt)
+
+
+def nwp_reconstruction_for_target(
+    name: str,
+    predictions: pd.DataFrame,
+    mw_column: str,
+    column: str,
+    *,
+    target_index: pd.DatetimeIndex,
+) -> Feature:
+    """This project's own weather-run-based reconstruction (spec 6.5.3),
+    used as the input for the day it forecasts.
+
+    Value for target t = predictions[mw_column] at valid_time_utc == t;
+    knowledge time = that same row's own recorded run_init_utc -- the
+    leakage proof runs via this real value carried through from the
+    artefact (spec 6.5.3, section 4.4: "nicht ueber Plausibilitaet"), not
+    via a recomputed assumption about what the run *should* have been.
+    `column` is only used for the availability-class check (must be
+    registered as NWP_RECONSTRUCTION in _RAW_AVAILABILITY); `mw_column` is
+    the actual column read from `predictions`, since the artefact's own
+    column names (e.g. "wind_onshore_mw_pred") differ from the feature's
+    registered name (e.g. "wind_onshore_forecast_nwp").
+
+    `predictions` is the artefact from Sprint 6.5.2
+    (evaluation/renewables_walkforward.run_renewables_backtest's output),
+    indexed by (run_init_utc, valid_time_utc).
+    """
+    cls = availability_of(column)
+    if cls is not Availability.NWP_RECONSTRUCTION:
+        raise ValueError(
+            f"nwp_reconstruction_for_target expects NWP_RECONSTRUCTION, got {column!r} ({cls})"
+        )
+    valid_time = pd.DatetimeIndex(predictions.index.get_level_values("valid_time_utc"))
+    flat_values = pd.Series(predictions[mw_column].to_numpy(), index=valid_time)
+    flat_run_init = pd.Series(predictions.index.get_level_values("run_init_utc"), index=valid_time)
+    values = pd.Series(flat_values.reindex(target_index).to_numpy(), index=target_index, name=name)
+    kt = pd.Series(flat_run_init.reindex(target_index).to_numpy(), index=target_index)
     return Feature(name, values, kt)
 
 

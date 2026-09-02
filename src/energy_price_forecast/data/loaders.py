@@ -291,3 +291,38 @@ def load_interim_weather(path: Path = _WEATHER_PATH) -> pd.DataFrame:
 
     logger.info("loaded %d weather rows from %s", len(df), path)
     return df
+
+
+# ---------------------------------------------------------------------------
+# Processed layer — renewables reconstruction artefact (sprint 6.5.2/6.5.3)
+# ---------------------------------------------------------------------------
+
+_RENEWABLES_PREDICTIONS_PATH = Path("data/processed/renewables_forecast_rolling365_l2.parquet")
+
+
+def load_renewables_predictions(path: Path = _RENEWABLES_PREDICTIONS_PATH) -> pd.DataFrame:
+    """Load the headline-variant renewables reconstruction artefact
+    (evaluation/renewables_walkforward.run_renewables_backtest's output,
+    written by scripts/train_renewables.py --variant rolling365_l2).
+
+    Raises FileNotFoundError if the file does not exist. Only the headline
+    variant is a valid feature source (spec 6.5.3, section 4.2) -- the two
+    comparison variants (expanding_l2, rolling365_quantile) are for 6.5.4's
+    own DM-test comparison, not for feeding the price model.
+    """
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Renewables predictions Parquet not found at {path!r}. "
+            "Run scripts/train_renewables.py --variant rolling365_l2 to generate it."
+        )
+    df = pd.read_parquet(path)
+
+    index_names = list(df.index.names)
+    if index_names != ["run_init_utc", "valid_time_utc"]:
+        raise ValueError(
+            f"renewables predictions artefact at {path!r} has index names {index_names!r}, "
+            "expected ['run_init_utc', 'valid_time_utc']"
+        )
+
+    logger.info("loaded %d renewables prediction rows from %s", len(df), path)
+    return df

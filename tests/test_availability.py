@@ -1,7 +1,10 @@
+import datetime as dt
+
 import numpy as np
 import pandas as pd
 import pytest
 
+from energy_price_forecast.data.weather_client import run_init_for_target_day
 from energy_price_forecast.evaluation.walkforward import walk_forward_splits
 from energy_price_forecast.features.availability import (
     Availability,
@@ -14,6 +17,7 @@ from energy_price_forecast.features.availability import (
     forecast_for_target,
     knowledge_time,
     lag,
+    nwp_reconstruction_for_target,
 )
 from energy_price_forecast.market_time import gate_closure_for_index
 
@@ -72,6 +76,26 @@ def test_knowledge_time_commodity_is_next_utc_midnight() -> None:
     assert result[0] == pd.Timestamp("2024-01-16 00:00", tz="UTC")
 
 
+def test_knowledge_time_nwp_reconstruction_matches_run_init_for_target_day() -> None:
+    # spec 6.5.3 section 3.2: calendar-derived via run_init_for_target_day(D),
+    # not gate-closure-derived. 2024-01-15 10:00 UTC's local (Europe/Berlin)
+    # delivery day is 2024-01-15 (CET, no DST) -> run_init_for_target_day(2024-01-15).
+    idx = pd.DatetimeIndex(["2024-01-15 10:00"], tz="UTC")
+    result = knowledge_time(Availability.NWP_RECONSTRUCTION, idx)
+    expected = run_init_for_target_day(dt.date(2024, 1, 15))
+    assert result[0] == expected
+
+
+def test_knowledge_time_nwp_reconstruction_spans_dst_boundary_correctly() -> None:
+    # 2024-01-14 23:00 UTC is 2024-01-15 00:00 CET local -> already day 2024-01-15,
+    # while 2024-01-14 22:00 UTC is still 2024-01-14 23:00 CET -> day 2024-01-14.
+    # Each gets its own run_init_for_target_day, not a single value for the batch.
+    idx = pd.DatetimeIndex(["2024-01-14 22:00", "2024-01-14 23:00"], tz="UTC")
+    result = knowledge_time(Availability.NWP_RECONSTRUCTION, idx)
+    assert result[0] == run_init_for_target_day(dt.date(2024, 1, 14))
+    assert result[1] == run_init_for_target_day(dt.date(2024, 1, 15))
+
+
 # ---------------------------------------------------------------------------
 # availability_of — registry and prefix rules
 # ---------------------------------------------------------------------------
@@ -101,6 +125,18 @@ def test_availability_of_physical_prefix() -> None:
 def test_availability_of_unknown_raises_key_error() -> None:
     with pytest.raises(KeyError, match="unknown_column"):
         availability_of("unknown_column")
+
+
+def test_availability_of_nwp_reconstruction_columns() -> None:
+    for col in (
+        "wind_onshore_forecast_nwp",
+        "wind_offshore_forecast_nwp",
+        "solar_forecast_nwp",
+        "residual_load_forecast_nwp",
+    ):
+        assert availability_of(col) is Availability.NWP_RECONSTRUCTION
+    # The originals stay DA_FORECAST -- the _nwp columns coexist, not overwrite.
+    assert availability_of("wind_onshore_forecast") is Availability.DA_FORECAST
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +186,68 @@ def test_forecast_for_target_non_forecast_column_raises() -> None:
     raw = _raw("2024-01-14 23:00", 24, "day_ahead_price")
     with pytest.raises(ValueError, match="DA_FORECAST"):
         forecast_for_target("price_fc", raw, "day_ahead_price", target_index=_TARGET_JAN15)
+
+
+# ---------------------------------------------------------------------------
+# nwp_reconstruction_for_target
+# ---------------------------------------------------------------------------
+
+
+def _synthetic_predictions(run_init: str, valid_times: pd.DatetimeIndex) -> pd.DataFrame:
+    index = pd.MultiIndex.from_arrays(
+        [pd.DatetimeIndex([run_init] * len(valid_times), tz="UTC"), valid_times],
+        names=["run_init_utc", "valid_time_utc"],
+    )
+    return pd.DataFrame(
+        {"wind_onshore_mw_pred": np.arange(len(valid_times), dtype=float)}, index=index
+    )
+
+
+def test_nwp_reconstruction_for_target_threads_real_run_init() -> None:
+    # The real recorded run_init_utc must be used as knowledge_time -- not a
+    # recomputed run_init_for_target_day(D) -- spec 6.5.3 section 4.4: the
+    # leakage proof runs via the value actually in the data.
+    predictions = _synthetic_predictions("2024-01-14 00:00", _TARGET_JAN15)
+    f = nwp_reconstruction_for_target(
+        "wind_onshore_forecast_nwp",
+        predictions,
+        "wind_onshore_mw_pred",
+        "wind_onshore_forecast_nwp",
+        target_index=_TARGET_JAN15,
+    )
+    assert (f.knowledge_time == pd.Timestamp("2024-01-14 00:00", tz="UTC")).all()
+    np.testing.assert_array_equal(f.values.to_numpy(), np.arange(24, dtype=float))
+    assert_no_leakage([f])  # real run_init is well before gate closure here
+
+
+def test_nwp_reconstruction_for_target_deliberately_wrong_run_init_fails_leakage() -> None:
+    # Negative control for the knowledge-time threading itself: an
+    # artificially late run_init (after gate closure) must be caught by the
+    # existing, unmodified assert_no_leakage -- proves the threaded value is
+    # actually load-bearing, not decorative.
+    late_run_init = gate_closure_for_index(_TARGET_JAN15)[0] + pd.Timedelta(hours=1)
+    predictions = _synthetic_predictions(str(late_run_init), _TARGET_JAN15)
+    f = nwp_reconstruction_for_target(
+        "wind_onshore_forecast_nwp",
+        predictions,
+        "wind_onshore_mw_pred",
+        "wind_onshore_forecast_nwp",
+        target_index=_TARGET_JAN15,
+    )
+    with pytest.raises(LeakageError, match="wind_onshore_forecast_nwp"):
+        assert_no_leakage([f])
+
+
+def test_nwp_reconstruction_for_target_non_nwp_column_raises() -> None:
+    predictions = _synthetic_predictions("2024-01-14 00:00", _TARGET_JAN15)
+    with pytest.raises(ValueError, match="NWP_RECONSTRUCTION"):
+        nwp_reconstruction_for_target(
+            "bad",
+            predictions,
+            "wind_onshore_mw_pred",
+            "wind_onshore_forecast",  # a real column, but DA_FORECAST class
+            target_index=_TARGET_JAN15,
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import datetime as dt
+
 import pandas as pd
 
+from ..ops.windows import local_day_bounds
 from .availability import build_matrix
 from .calendar import build_calendar_features
 from .config import FeatureConfig
@@ -12,6 +15,7 @@ from .lags import (
     build_forecast_error_lags,
     build_price_lags,
 )
+from .nwp_fundamentals import build_nwp_forecast_fundamentals
 
 
 def build_feature_matrix(df: pd.DataFrame, config: FeatureConfig | None = None) -> pd.DataFrame:
@@ -27,6 +31,53 @@ def build_feature_matrix(df: pd.DataFrame, config: FeatureConfig | None = None) 
     features = [
         *build_calendar_features(target_index, cfg),
         *build_forecast_fundamentals(df, target_index),
+        *build_commodity_features(df, target_index, cfg),
+        *build_price_lags(df, target_index, cfg),
+        *build_actual_lags(df, target_index, cfg),
+        *build_forecast_error_lags(df, target_index, cfg),
+        *build_cross_border_lags(df, target_index, cfg),
+    ]
+    return build_matrix(features)  # asserts no leakage, then concatenates
+
+
+def _hourly_utc_index_for_local_day(target_day: dt.date) -> pd.DatetimeIndex:
+    """UTC hourly timestamps of one local (Europe/Berlin) delivery day --
+    23/24/25 rows across DST, derived purely from the calendar (spec 6.5.3
+    section 3.4, E7: never derived from the system clock)."""
+    start, end = local_day_bounds(target_day)
+    return pd.date_range(start, end, freq="h", inclusive="left").tz_convert("UTC")
+
+
+def build_feature_set_for_day(
+    target_day: dt.date,
+    df: pd.DataFrame,
+    renewables_predictions: pd.DataFrame,
+    config: FeatureConfig | None = None,
+) -> pd.DataFrame:
+    """The complete, live-viable feature set for one local delivery day
+    (spec 6.5.3, sections 3.4/4.2 -- E7 in code).
+
+    Calendar/regime, NWP-reconstruction-based forecast fundamentals
+    (features/nwp_fundamentals.py), commodities, and the unchanged
+    price/actual/forecast-error/cross-border lags (fundamentals.py/lags.py,
+    untouched) -- for exactly target_day's hourly rows. Contains no
+    DA_FORECAST-class renewables column (spec 6.5.3 section 5.3).
+
+    Backtest and live call this function identically, with target_day as
+    the only day-identifying argument -- never the system clock. What
+    differs between the two contexts is only which rows `df` and
+    `renewables_predictions` happen to contain at call time, never the
+    code path (spec 6.5.3 section 3.4).
+
+    Raises IncompleteReconstructionError (features.nwp_fundamentals) if the
+    renewables reconstruction does not fully cover target_day -- the whole
+    day is unusable per spec 6.5.3 section 3.3, not partially fillable.
+    """
+    cfg = config if config is not None else FeatureConfig()
+    target_index = _hourly_utc_index_for_local_day(target_day)
+    features = [
+        *build_calendar_features(target_index, cfg),
+        *build_nwp_forecast_fundamentals(df, renewables_predictions, target_index),
         *build_commodity_features(df, target_index, cfg),
         *build_price_lags(df, target_index, cfg),
         *build_actual_lags(df, target_index, cfg),

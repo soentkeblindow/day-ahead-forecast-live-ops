@@ -159,10 +159,19 @@ _BASE_FETCH_GROUP: dict[str, str] = {
 
 
 def build_checklist() -> list[SeriesSpec]:
-    """Derive the raw-series checklist from the registry + NEIGHBORS (spec §5.1)."""
+    """Derive the raw-series checklist from the registry + NEIGHBORS (spec §5.1).
+
+    Skips NWP_RECONSTRUCTION entries (spec 6.5.3): this audit measures what
+    the model would see from the external data clients it fetches from
+    (module docstring above), and the NWP reconstruction columns are never
+    fetched -- they're computed in-process from this project's own
+    renewables model output, so they have no _BASE_FETCH_GROUP and don't
+    belong on a fetch-availability checklist.
+    """
     items = [
         SeriesSpec(column, cls, _BASE_FETCH_GROUP[column])
         for column, cls in _RAW_AVAILABILITY.items()
+        if cls is not Availability.NWP_RECONSTRUCTION
     ]
     for neighbor in NEIGHBORS:
         suffix = neighbor.lower()
