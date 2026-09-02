@@ -111,3 +111,22 @@ The price of this rule is real and worth naming: Open-Meteo's Historical Forecas
 **Consequence.** Sprint 6.5.2's training window for the renewables model is bounded by this archive start, not by how far back ENTSO-E or Yahoo Finance data goes — a real, named cost rather than a silent one. `.github/workflows/weather_availability_probe.yml` runs at several odd-minute morning UTC slots (`23 5,6,7,8,9 * * *`, deliberately off the audit workflow's `:00`/`:45` cron to avoid dispatch congestion) and measures, live, how early the 00-UTC run of D−1 actually becomes available each morning. That is a handover to Sprint 6.7: the submission workflow needs **multiple cron runs spread across the morning**, not one — a single too-early look must not cost the whole day, and GitHub Actions' own schedule-cron drift (observed repeatedly on this repo's `audit.yml`) makes a single well-timed run unreliable regardless. The concrete slot times are 6.7's to derive from whatever the availability log has accumulated by then, not fixed here. Also handed over explicitly: this step builds **no fallback** for a missing run — `fetch_run`/`run_init_for_target_day` raise `WeatherRunUnavailable` and propagate it; catching that exception and deciding not to submit is Sprint 6.7's job (Entscheidung 5b), not this one's.
 
 Weather data by [Open-Meteo](https://open-meteo.com/), used under their free non-commercial terms. Calls stay to what's operationally needed: every run (historical or live) is fetched at most once, via the per-run cache under `data/cache/weather_single_runs/`.
+
+## Capacity anchor table
+
+`data/capacity_anchors_public_registry.csv` holds monthly installed-capacity
+support points for solar, onshore wind and offshore wind. They normalise the
+renewables target into a capacity factor, so that the model learns weather
+rather than build-out. The file is a checked-in snapshot of a public registry
+source (Energy-Charts, Fraunhofer ISE), not a live lookup: installed capacity
+moves by a fraction of a percent per month and is not worth a runtime
+dependency at gate closure.
+
+It does have a shelf life. Values are interpolated between anchors and
+extrapolated at most four monthly intervals past the last usable anchor — the
+two most recent months are discarded, because the registry still revises them.
+Past that limit `installed_capacity_at` raises instead of quietly extending a
+stale trend. Every run logs how long the current table is still valid and warns
+21 days before it expires. Refresh it roughly monthly:
+
+    uv run python scripts/build_capacity_anchors.py

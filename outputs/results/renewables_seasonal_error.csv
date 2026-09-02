@@ -1,0 +1,13 @@
+target,season,n,mae_mw,mean_actual_mw,expectation,verdict
+solar,winter,2112,483.4290373190753,2628.01953125,mae_mw[summer] > mae_mw[winter],pass
+solar,spring,3958,1057.5128493227974,12312.47265625,mae_mw[summer] > mae_mw[winter],pass
+solar,summer,3192,1326.1619517002337,14201.08984375,mae_mw[summer] > mae_mw[winter],pass
+solar,autumn,2017,589.2357902898592,6048.4921875,mae_mw[summer] > mae_mw[winter],pass
+wind_onshore,winter,2112,1389.6629702261923,17193.939453125,mae_mw[winter] > mae_mw[summer],pass
+wind_onshore,spring,3958,1070.684497262686,9888.2568359375,mae_mw[winter] > mae_mw[summer],pass
+wind_onshore,summer,3192,1155.9407283721175,9913.2890625,mae_mw[winter] > mae_mw[summer],pass
+wind_onshore,autumn,2017,1147.2439454068724,15191.3984375,mae_mw[winter] > mae_mw[summer],pass
+wind_offshore,winter,2112,417.53754070207486,4592.658203125,mae_mw[winter] > mae_mw[summer],pass
+wind_offshore,spring,3958,345.6680534533811,2320.5234375,mae_mw[winter] > mae_mw[summer],pass
+wind_offshore,summer,3192,362.152773714947,2293.266357421875,mae_mw[winter] > mae_mw[summer],pass
+wind_offshore,autumn,2017,367.6316080361372,3657.74169921875,mae_mw[winter] > mae_mw[summer],pass

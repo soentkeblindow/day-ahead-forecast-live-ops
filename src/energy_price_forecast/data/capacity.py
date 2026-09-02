@@ -9,15 +9,34 @@ sources reached through different code paths, would not cancel a shared
 systematic error the way one rule and one code path does (decision 10,
 train/serve consistency).
 
-Source (spec 6.5.2, section 2.11): the ENTSO-E Transparency Platform (which
-would supply 14.1.A, the regulatory series this project would otherwise use)
-has been unreachable since 2026-08-30 with no known recovery date. Rather
-than block on it, `installed_capacity_at` takes a `source` parameter with two
-values behind one interface: `CapacitySource.PUBLIC_REGISTRY` (implemented
-now) and `CapacitySource.ENTSOE_14_1_A` (deferred, raises NotImplementedError
-until the platform is reachable again -- see docs/sprint6_step6_5_2_log.md).
-The interpolation/extrapolation rule itself does not know or care which
-source supplied the anchors.
+Source (spec 6.5.2a, section 5.5): `CapacitySource.PUBLIC_REGISTRY` is fixed
+as the permanent capacity source, decided rather than measured -- the
+source comparison spec 6.5.2 section 2.11 originally envisioned (weighing
+it against `ENTSOE_14_1_A`) is deliberately **not run**. Four reasons:
+
+1. Monthly resolution, against presumably yearly for 14.1.A.
+2. Checked against two independent references (the leave-one-out
+   extrapolation diagnostic's own numbers, spec 6.5.2a section 5.2, largest
+   deviation 1.6%; the Fraunhofer ISE end-of-2025 press release for solar).
+3. No runtime dependency on a platform that was unreachable for more than
+   40 hours in September 2026 (spec 6.5.2, section 2.11's original reason
+   for adding the swappable-source interface in the first place).
+4. A source switch would mean retraining (it changes the label
+   denominator), not a configuration change -- so the comparison would have
+   been expensive, and its likely outcome was already foreseeable.
+
+`installed_capacity_at` still takes a `source` parameter with two values
+behind one interface -- `CapacitySource.PUBLIC_REGISTRY` (implemented) and
+`CapacitySource.ENTSOE_14_1_A` (a **rejected alternative**, not a pending
+one; raises `NotImplementedError` unconditionally) -- because the interface
+is already built and tested and the two-source equality test
+(`test_both_sources_share_the_same_code_path`) stays valuable. The
+interpolation/extrapolation rule itself does not know or care which source
+supplied the anchors. Work-order item 18 (the 14.1.A connection) is closed,
+not open -- see docs/sprint6_step6_5_2a_log.md. The original
+"unreachable since 2026-08-30, deferred" framing is what
+docs/sprint6_step6_5_2_log.md still records, unchanged, since logs are a
+record, not something to rewrite in place.
 
 PUBLIC_REGISTRY anchor table provenance (spec 6.5.2, section 2.11 -- full
 detail also in docs/sprint6_step6_5_2_log.md, section "Schritt 2 (neu)"):
@@ -43,6 +62,7 @@ detail also in docs/sprint6_step6_5_2_log.md, section "Schritt 2 (neu)"):
 
 from __future__ import annotations
 
+import logging
 from enum import StrEnum
 from typing import Final
 
@@ -50,6 +70,8 @@ import numpy as np
 import pandas as pd
 
 from energy_price_forecast.config import PROJECT_ROOT
+
+logger = logging.getLogger(__name__)
 
 PUBLIC_REGISTRY_ANCHORS_PATH: Final = PROJECT_ROOT / "data" / "capacity_anchors_public_registry.csv"
 
@@ -66,6 +88,26 @@ TRAILING_ANCHORS_DISCARDED: Final[int] = 2
 # (and subject to TRAILING_ANCHORS_DISCARDED); at or above, as yearly (spec
 # 6.5.2, section 2.11: "bei jaehrlicher Aufloesung entfaellt die Regel").
 _MONTHLY_CADENCE_THRESHOLD_DAYS: Final[float] = 60.0
+
+# spec 6.5.2a section 2.3 -- derived from the operating cadence, not fitted to
+# the error diagnostic: a monthly refresh at the start of month M sees a
+# newest raw anchor of M-1; after discarding TRAILING_ANCHORS_DISCARDED (2),
+# the last retained anchor is the end of M-3, so 3 intervals are needed for
+# full coverage of M and a 4th as a buffer against a late refresh. Measured
+# against the leave-one-out diagnostic before being set (spec 6.5.2a section
+# 5.2 Haltepunkt) -- not picked from the error table itself.
+MAX_EXTRAPOLATION_INTERVALS: Final[int] = 4
+
+# spec 6.5.2a section 5.3 -- three weeks gives enough room for a refresh that
+# depends on an external publication plus a manual commit to happen inside a
+# normal work rhythm, without warning so early that it becomes background
+# noise (spec 6.5.2a, Implementation Notes).
+_STALENESS_WARNING_DAYS: Final[int] = 21
+
+# Anchor-table validity is logged on INFO once per process, not once per
+# timestamp queried -- installed_capacity_at is called many times per
+# walk-forward run, and per-call logging would drown the signal.
+_VALIDITY_LOGGED_FOR: set[CapacitySource] = set()
 
 _EPOCH: Final = pd.Timestamp("1970-01-01", tz="UTC")
 
@@ -107,9 +149,10 @@ def _load_public_registry_anchors(production_type: ProductionType) -> pd.Series:
 
 def _load_entsoe_anchors(production_type: ProductionType) -> pd.Series:
     raise NotImplementedError(
-        "CapacitySource.ENTSOE_14_1_A is deferred (spec 6.5.2, section 2.11) -- the "
-        "ENTSO-E Transparency Platform has been unreachable since 2026-08-30. Use "
-        "CapacitySource.PUBLIC_REGISTRY, or see docs/sprint6_step6_5_2_log.md for status."
+        "CapacitySource.ENTSOE_14_1_A is a rejected alternative, not a pending one "
+        "(spec 6.5.2a, section 5.5) -- CapacitySource.PUBLIC_REGISTRY is the fixed, "
+        "permanent capacity source. See the module docstring above for the rationale, "
+        "or docs/sprint6_step6_5_2a_log.md."
     )
 
 
@@ -166,6 +209,63 @@ def _extrapolation_rate_per_day(anchors: pd.Series, method: CapacityExtrapolatio
     raise ValueError(f"unknown extrapolation method: {method!r}")  # pragma: no cover
 
 
+def anchor_table_valid_until(source: CapacitySource) -> pd.Timestamp:
+    """Last timestamp for which ``installed_capacity_at`` can return a value
+    for ``source`` (spec 6.5.2a, section 5.3) -- the last retained anchor
+    (after ``TRAILING_ANCHORS_DISCARDED``) plus ``MAX_EXTRAPOLATION_INTERVALS``
+    times the last anchor interval. Computed in exactly this one place;
+    ``installed_capacity_at`` calls it rather than recomputing the boundary.
+
+    All three production types come from one registry pull (spec 6.5.2,
+    section 2.11) and therefore share one anchor cadence and last anchor
+    date -- so the boundary is a property of the source, not of a specific
+    production type. That assumption is checked here, explicitly, rather
+    than picked for one production type and trusted silently: if the
+    production types ever disagreed, a per-production-type boundary would
+    be needed instead of a per-source one, and this should fail loudly
+    rather than silently pick one.
+    """
+    boundaries: set[pd.Timestamp] = set()
+    for production_type in ProductionType:
+        anchors = _discard_trailing_anchors(_ANCHOR_LOADERS[source](production_type))
+        anchor_days = _days_since_epoch(pd.DatetimeIndex(anchors.index))
+        last_interval_days = anchor_days[-1] - anchor_days[-2]
+        boundaries.add(
+            anchors.index[-1] + pd.Timedelta(days=last_interval_days * MAX_EXTRAPOLATION_INTERVALS)
+        )
+    if len(boundaries) != 1:
+        raise ValueError(
+            f"production types disagree on the anchor-table validity boundary for "
+            f"source={source.value!r}: {sorted(boundaries)} -- anchor_table_valid_until "
+            "assumes one shared registry vintage per source (spec 6.5.2a section 5.3)"
+        )
+    return boundaries.pop()
+
+
+def _log_validity_once(source: CapacitySource, valid_until: pd.Timestamp) -> None:
+    if source in _VALIDITY_LOGGED_FOR:
+        return
+    _VALIDITY_LOGGED_FOR.add(source)
+    days_left = (valid_until.normalize() - pd.Timestamp.now(tz="UTC").normalize()).days
+    logger.info(
+        "capacity anchor table valid until %s (%d days left)",
+        valid_until.date().isoformat(),
+        days_left,
+    )
+
+
+def _warn_if_near_expiry(
+    source: CapacitySource, ts_max: pd.Timestamp, valid_until: pd.Timestamp
+) -> None:
+    if valid_until - ts_max <= pd.Timedelta(days=_STALENESS_WARNING_DAYS):
+        logger.warning(
+            "capacity anchor table for source=%s is only valid until %s -- refresh "
+            "it soon via scripts/build_capacity_anchors.py",
+            source.value,
+            valid_until.date().isoformat(),
+        )
+
+
 def installed_capacity_at(
     production_type: ProductionType,
     timestamps: pd.DatetimeIndex,
@@ -177,9 +277,11 @@ def installed_capacity_at(
 
     Linear interpolation between known anchor points; extrapolation beyond
     the last anchor by the most recently observed increment (spec 2.5).
-    Raises if asked for a point more than one anchor interval beyond the
-    last known one -- silently carrying a stale capacity forward is the
-    error this function exists to prevent.
+    Raises if asked for a point beyond ``anchor_table_valid_until(source)``
+    -- silently carrying a stale capacity forward is the error this
+    function exists to prevent. That boundary is computed in exactly one
+    place (spec 6.5.2a, section 5.3); this function calls it rather than
+    recomputing it.
 
     The interpolation rule is independent of the source (spec 2.11): both
     sources feed the same code path, they are not two implementations.
@@ -204,17 +306,19 @@ def installed_capacity_at(
     anchor_days = _days_since_epoch(pd.DatetimeIndex(anchors.index))
     first_anchor = anchors.index[0]
     last_anchor = anchors.index[-1]
-    last_interval_days = anchor_days[-1] - anchor_days[-2]
-    max_extrapolation = last_anchor + pd.Timedelta(days=last_interval_days)
+    max_extrapolation = anchor_table_valid_until(source)
+    _log_validity_once(source, max_extrapolation)
 
     ts_min, ts_max = timestamps.min(), timestamps.max()
     if ts_min < first_anchor:
         raise ValueError(f"timestamp {ts_min} precedes the first known anchor {first_anchor}")
     if ts_max > max_extrapolation:
         raise ValueError(
-            f"timestamp {ts_max} is more than one anchor interval beyond the last "
-            f"known anchor {last_anchor}"
+            f"timestamp {ts_max} is beyond the capacity anchor table's validity "
+            f"boundary {max_extrapolation} for source={source.value!r}; refresh "
+            "the anchor table via scripts/build_capacity_anchors.py"
         )
+    _warn_if_near_expiry(source, ts_max, max_extrapolation)
 
     in_range = timestamps <= last_anchor
     result = np.empty(len(timestamps), dtype="float64")

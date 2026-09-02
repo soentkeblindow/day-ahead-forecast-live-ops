@@ -26,3 +26,19 @@ numbers.
 Golden Fixture (a), the payload example from the `energy-arena-participate` starter repo, was not
 retrieved (spec §3, Entscheidung 3) — Fixture (b) above is authoritative because it comes from the
 Arena API itself, not from a reference implementation.
+
+## `energy_charts_installed_power.json`
+
+- **Retrieved:** 2026-09-02 (source's own `last_update` field: 2026-09-01T13:03:43 UTC)
+- **Endpoint:** `GET https://api.energy-charts.info/installed_power?country=de&time_step=monthly&installation_decommission=false`
+- **Command:**
+
+  ```sh
+  curl -s "https://api.energy-charts.info/installed_power?country=de&time_step=monthly&installation_decommission=false"
+  ```
+
+Full, unmodified real API response (18.7 KB) used by
+`tests/test_capacity.py`'s `scripts/build_capacity_anchors.py` tests (spec 6.5.2a section 5.4) --
+no network access in the tests themselves. Covers `01.2002` through `09.2026`; the tests fix
+`as_of=2026-09-02` so the retained-range logic (through the last *complete* calendar month) is
+deterministic regardless of when the tests run.

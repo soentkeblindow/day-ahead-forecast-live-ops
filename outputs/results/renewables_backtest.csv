@@ -1,3 +1,4 @@
+# Capacity anchor vintage (spec 6.5.2a section 5.5): source=public_registry (Energy-Charts API, Fraunhofer ISE), fetched 2026-09-01 (source last_update: 2026-08-31T14:49:27 UTC) -- see data/capacity_anchors_public_registry.csv. The capacity-factor labels behind every row in this file were built against this anchor vintage.
 variant,target,breakdown,n,rmse_cf_model,mae_cf_model,rmse_mw_model,mae_mw_model,rmse_cf_baseline,mae_cf_baseline,rmse_mw_baseline,mae_mw_baseline
 rolling365_l2,solar,overall,11279,0.015637420599122796,0.008184096818170316,1785.893729991227,943.0873137126413,0.03321678630113034,0.015903485318159452,3831.6383093954,1835.2348801457874
 rolling365_l2,solar,daylight,6734,0.020233416754468957,0.013700679447118998,2310.786000256761,1578.7893610093074,0.04297954410059706,0.026625017308863994,4957.796534697443,3072.4833281775773
