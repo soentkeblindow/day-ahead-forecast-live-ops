@@ -10,6 +10,7 @@ integrity checks) -- they are not a CI gate, those artefacts are gitignored.
 from __future__ import annotations
 
 import datetime as dt
+from collections.abc import Iterable
 
 import numpy as np
 import pandas as pd
@@ -187,8 +188,8 @@ _FORBIDDEN_LIVE_COLUMNS = frozenset(
 )
 
 
-def _assert_no_da_forecast_renewables_column(columns: object) -> None:
-    leaked = _FORBIDDEN_LIVE_COLUMNS & set(columns)  # type: ignore[arg-type]
+def _assert_no_da_forecast_renewables_column(columns: Iterable[str]) -> None:
+    leaked = _FORBIDDEN_LIVE_COLUMNS & set(columns)
     if leaked:
         raise AssertionError(
             f"DA_FORECAST-class renewables column(s) leaked into the live feature set: "
