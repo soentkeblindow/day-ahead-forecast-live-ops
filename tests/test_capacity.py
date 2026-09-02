@@ -353,8 +353,10 @@ def test_build_capacity_anchors_matches_expected_structure_from_frozen_fixture()
 
     # GW -> MW conversion against the raw fixture value, and 'Solar DC' (not
     # 'Solar AC') is the series actually used.
-    by_name = {p["name"]: p["data"] for p in response["production_types"]}  # type: ignore[union-attr]
-    idx = response["time"].index("01.2015")  # type: ignore[union-attr]
+    production_types = cast("list[dict[str, object]]", response["production_types"])
+    time_labels = cast("list[str]", response["time"])
+    by_name = {str(p["name"]): cast("list[float]", p["data"]) for p in production_types}
+    idx = time_labels.index("01.2015")
     expected_solar_mw = by_name["Solar DC"][idx] * 1000.0
     solar_2015 = anchors.loc[
         (anchors["production_type"] == "solar")

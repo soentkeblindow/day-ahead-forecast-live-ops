@@ -28,7 +28,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import logging
-from typing import Final
+from typing import Final, cast
 
 import numpy as np
 import pandas as pd
@@ -91,11 +91,10 @@ def parse_anchors(response: dict[str, object], *, as_of: pd.Timestamp) -> pd.Dat
     through the last complete calendar month before ``as_of``, GW converted
     to MW. Raises on a missing target series or a null value inside the
     retained range."""
-    time_labels: list[str] = response["time"]  # type: ignore[assignment]
-    production_types: list[dict[str, object]] = response["production_types"]  # type: ignore[assignment]
+    time_labels = cast("list[str]", response["time"])
+    production_types = cast("list[dict[str, object]]", response["production_types"])
     by_name: dict[str, list[float | None]] = {
-        str(p["name"]): p["data"]  # type: ignore[misc]
-        for p in production_types
+        str(p["name"]): cast("list[float | None]", p["data"]) for p in production_types
     }
 
     last_complete = _last_complete_month_end(as_of)
@@ -213,7 +212,7 @@ def validate_against_committed(
 def build_csv_text(
     anchors: pd.DataFrame, response: dict[str, object], *, fetched_at: pd.Timestamp
 ) -> str:
-    last_update_ts: int = response["last_update"]  # type: ignore[assignment]
+    last_update_ts = cast("int", response["last_update"])
     last_update = dt.datetime.fromtimestamp(last_update_ts, tz=dt.UTC)
     url = requests.Request("GET", _ENDPOINT, params=_PARAMS).prepare().url
 
