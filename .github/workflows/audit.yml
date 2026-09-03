@@ -16,6 +16,21 @@ on:
     - cron: "45 9 * * *"
     - cron: "0 10 * * *"
     - cron: "45 10 * * *"
+    # TEMPORARY, added 2026-09-03: this workflow has been drifting ~4-5h late
+    # since 2026-08-27 (see docs/cron_jobs.md), so the 10:45 slot -- the one
+    # closest to gate closure -- rarely actually lands there anymore. One
+    # duplicate slot, offset 4h30 earlier (06:15), bets the same drift lands
+    # it near the original 10:45 target instead, for a couple of confirming
+    # gate-closure-adjacent measurements post ENTSO-E-outage. Deliberately
+    # only ONE extra slot, not a full duplicate set like
+    # weather_availability_probe.yml's -- audit.yml already has clean
+    # pre-drift 08:00-11:00 UTC coverage from 2026-08-19 through 08-26, so
+    # the marginal need is smaller, and this is a private repo where Actions
+    # minutes actually count against a monthly budget (unlike a public
+    # repo). Remove after 1-2 usable confirming measurements, or if the
+    # drift resolves (in which case this would start firing ~4-5h too early
+    # and become useless) -- don't leave this in place unmonitored.
+    - cron: "15 6 * * *"
   workflow_dispatch: {}
 
 concurrency:
