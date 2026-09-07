@@ -48,6 +48,29 @@ def _hourly_utc_index_for_local_day(target_day: dt.date) -> pd.DatetimeIndex:
     return pd.date_range(start, end, freq="h", inclusive="left").tz_convert("UTC")
 
 
+def _build_day_matrix(
+    target_index: pd.DatetimeIndex,
+    fundamentals: list,
+    df: pd.DataFrame,
+    cfg: FeatureConfig,
+) -> pd.DataFrame:
+    """Shared Bausteinliste for one day's feature rows (spec 6.6 section
+    5.1: "derselbe target_index, dieselbe Bausteinliste" for both the live
+    and the original feature-set builder below). Only the fundamentals
+    (forecast columns) differ between the two callers; calendar,
+    commodities and lags are identical."""
+    features = [
+        *build_calendar_features(target_index, cfg),
+        *fundamentals,
+        *build_commodity_features(df, target_index, cfg),
+        *build_price_lags(df, target_index, cfg),
+        *build_actual_lags(df, target_index, cfg),
+        *build_forecast_error_lags(df, target_index, cfg),
+        *build_cross_border_lags(df, target_index, cfg),
+    ]
+    return build_matrix(features)  # asserts no leakage, then concatenates
+
+
 def build_feature_set_for_day(
     target_day: dt.date,
     df: pd.DataFrame,
@@ -75,16 +98,31 @@ def build_feature_set_for_day(
     """
     cfg = config if config is not None else FeatureConfig()
     target_index = _hourly_utc_index_for_local_day(target_day)
-    features = [
-        *build_calendar_features(target_index, cfg),
-        *build_nwp_forecast_fundamentals(df, renewables_predictions, target_index),
-        *build_commodity_features(df, target_index, cfg),
-        *build_price_lags(df, target_index, cfg),
-        *build_actual_lags(df, target_index, cfg),
-        *build_forecast_error_lags(df, target_index, cfg),
-        *build_cross_border_lags(df, target_index, cfg),
-    ]
-    return build_matrix(features)  # asserts no leakage, then concatenates
+    fundamentals = build_nwp_forecast_fundamentals(df, renewables_predictions, target_index)
+    return _build_day_matrix(target_index, fundamentals, df, cfg)
+
+
+def build_original_feature_set_for_day(
+    target_day: dt.date,
+    df: pd.DataFrame,
+    config: FeatureConfig | None = None,
+) -> pd.DataFrame:
+    """The 'original' (upper-bound) feature set for one local delivery day
+    (spec 6.6 section 5.1) -- the same day-by-day construction as
+    build_feature_set_for_day above, sharing its Bausteinliste, but with
+    the TSO-sourced fundamentals (build_forecast_fundamentals) instead of
+    the NWP reconstruction.
+
+    Never a live candidate: contains DA_FORECAST-class renewables columns
+    that the 6.2 audit found unavailable at gate closure. Exists so 6.6 can
+    measure both feature sets through the identical per-day code path --
+    not by reading the precomputed features.parquet, a different code path
+    (spec 6.6 section 5.1).
+    """
+    cfg = config if config is not None else FeatureConfig()
+    target_index = _hourly_utc_index_for_local_day(target_day)
+    fundamentals = build_forecast_fundamentals(df, target_index)
+    return _build_day_matrix(target_index, fundamentals, df, cfg)
 
 
 def trim_warmup(matrix: pd.DataFrame, config: FeatureConfig | None = None) -> pd.DataFrame:

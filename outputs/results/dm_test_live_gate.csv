@@ -1,0 +1,19 @@
+# 'live' uses only features available at gate closure (NWP reconstruction). 'original' is an UPPER BOUND using TSO DA_FORECAST series that are NOT available at gate closure -- reference line, never a live candidate.
+# mean_loss_diff_sq_eur2_mwh2 = loss(candidate) - loss(reference); a NEGATIVE value means the candidate is better.
+comparison,period,variant,n_obs,hac_lag,horizon,mean_loss_diff_sq_eur2_mwh2,dm_stat,p_value,resolution
+live_vs_baseline,full,hourly,10271,48,24,-1062.651602311969,-9.793079194271948,0.0,hourly
+live_vs_baseline,full,daily,428,7,1,-1062.751568616657,-8.753645129751911,0.0,hourly
+live_vs_original,full,hourly,10271,48,24,69.59597382728934,4.857339654987178,1.2073032420456542e-06,hourly
+live_vs_original,full,daily,428,7,1,69.58608185985878,4.152674710998407,3.969601663555977e-05,hourly
+live_vs_baseline,post_changeover,hourly,5879,48,24,-1150.1567052160915,-6.9602869058786245,3.765432410318681e-12,hourly
+live_vs_baseline,post_changeover,daily,245,7,1,-1150.3164584097742,-6.41441364513346,7.275446911592097e-10,hourly
+live_vs_original,post_changeover,hourly,5879,48,24,88.64044584011826,4.031674012895273,5.6081441352828776e-05,hourly
+live_vs_original,post_changeover,daily,245,7,1,88.61992632286321,3.4216801537844965,0.0007295710179473,hourly
+live_vs_baseline,full,quarter_hourly,29276,192,96,-1138.9523404517995,-7.919905819852265,2.4424906541753444e-15,quarterhourly
+live_vs_baseline,full,daily,305,7,1,-1139.081257676939,-7.155271605603862,6.2803096056995855e-12,quarterhourly
+live_vs_original,full,quarter_hourly,29276,192,96,76.49851459225472,4.113720200481416,3.9039679330166166e-05,quarterhourly
+live_vs_original,full,daily,305,7,1,76.48365129781035,3.5248753335840255,0.0004888802617242227,quarterhourly
+live_vs_baseline,post_changeover,quarter_hourly,23516,192,96,-1186.9655904688102,-6.96289058797115,3.4212632726848824e-12,quarterhourly
+live_vs_baseline,post_changeover,daily,245,7,1,-1187.1179137405795,-6.448984673880989,5.989586604471242e-10,quarterhourly
+live_vs_original,post_changeover,quarter_hourly,23516,192,96,88.55319942522571,4.037435497754038,5.420989789728381e-05,quarterhourly
+live_vs_original,post_changeover,daily,245,7,1,88.53264602383697,3.4160930323518004,0.000744000862458849,quarterhourly

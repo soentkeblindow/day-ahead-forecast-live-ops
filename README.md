@@ -130,3 +130,31 @@ stale trend. Every run logs how long the current table is still valid and warns
 21 days before it expires. Refresh it roughly monthly:
 
     uv run python scripts/build_capacity_anchors.py
+
+## Live-capable feature set
+
+**Claim.** The official TSO forecast columns (`wind_onshore_forecast`, `wind_offshore_forecast`, `solar_forecast`, and the `residual_load_forecast` term derived from them) are not published in time for the Arena's own gate-closure deadline. This is not an assumption: the first real `audit.yml` run (2026-08-19, ~15:59 local — well after the 12:00 deadline) measured `coverage_ratio=0` and `latest_target_offset_days=-1` for all three wind/solar series for delivery day D, while `load_forecast_day_ahead` was already complete (Sprint 6.2, `docs/sprint6_step6_2_log.md` Schritt 8).
+
+**They are reconstructed from weather model data instead.** Sprint 6.5.1's Open-Meteo Single Runs archive (fixed 00-UTC run of D−1, the only architecture that doesn't leak past gate closure — see "Weather data" above) feeds Sprint 6.5.2's own capacity-factor models, which stand in for the missing TSO series wherever the 6.2 audit found them unavailable (`features/nwp_fundamentals.py`, `_nwp`-suffixed columns, spec 6.5.3).
+
+**What that costs.** Walk-forward over the full evaluable window, two independently-trained hourly LightGBM models (production config, untuned) built per delivery day from two disjoint feature sets — `live` (only what's available at gate closure) and `original` (the full TSO-fundamentals set, an upper-bound reference line, never itself a go-live candidate):
+
+| Resolution | Days evaluated | `original` RMSE (upper bound) | `live` RMSE |
+|---|---|---|---|
+| Quarter-hourly (binding, 28-day shape profile) | 305 of 312 candidates | 28.7183 | 30.0207 |
+| Hourly (secondary, non-binding) | 428 of 451 candidates | 26.0418 | 27.3454 |
+
+Reconstructing from weather data instead of reading the TSO forecast costs about **1.3 EUR/MWh of RMSE** at both resolutions. In physical units (MW, against the realised TSO series over the same window, `scripts/compare_residual_load_mw.py`, `outputs/results/residual_load_reconstruction_mw.csv`): residual load MAE 1993 MW / RMSE 2829 MW (mean error −509 MW, i.e. the reconstruction runs slightly low on average); wind onshore MAE 1210 MW; wind offshore MAE 398 MW; solar MAE 1089 MW.
+
+**What's left.** `live` against the Arena persistence baseline replica — the actual go-live criterion (Entscheidung 24: RMSE(live) < RMSE(baseline) **and** a one-sided Diebold-Mariano test at p < 0.10 on the binding quarter-hourly resolution):
+
+| Candidate | RMSE (quarter-hourly, binding) |
+|---|---|
+| `live` | 30.0207 |
+| Arena persistence baseline | 45.1685 |
+
+DM test p ≈ 0.0000 (squared daily-block loss, HAC lag 192, quarter-hourly horizon 96). **Result: PASS.** Even with only what's honestly available at gate closure, the reconstructed feature set beats the Arena's own baseline decisively — the cost measured above does not erase the advantage found in Sprint 6.4's upper-bound bridge measurement.
+
+Full results: [`outputs/results/arena_live_gate.csv`](outputs/results/arena_live_gate.csv) (both resolutions, both periods, three candidates), [`outputs/results/dm_test_live_gate.csv`](outputs/results/dm_test_live_gate.csv), [`outputs/results/residual_load_reconstruction_mw.csv`](outputs/results/residual_load_reconstruction_mw.csv).
+
+**A number that must never sit next to this one without its difference stated (Entscheidung 8):** the source project's own production-backtest MAE (15.3988 EUR/MWh, Sprint 6.1's provenance proof) is an **hourly, full-feature, 2021–2025** measurement — a different resolution, a different feature set, and a different evaluation window from every number on this page. They answer different questions and are not a before/after comparison.

@@ -45,10 +45,25 @@ def _is_complete_month(year: int, month: int) -> bool:
     return last < pd.Timestamp.now("UTC") - pd.Timedelta(days=1)
 
 
+def _infer_resolution_seconds(df: pd.DataFrame) -> float:
+    # Falls back to hourly when there's not enough spacing information to infer
+    # anything (empty/single-row frame) -- a too-small df fails the completeness
+    # check regardless of what resolution we assume here.
+    if not isinstance(df.index, pd.DatetimeIndex) or len(df.index) < 2:
+        return 3600.0
+    return df.index.to_series().diff().dropna().median().total_seconds()
+
+
 def _is_sufficiently_complete(df: pd.DataFrame, year: int, month: int) -> bool:
+    # Resolution is inferred from the cached data itself, not hardcoded to
+    # hourly -- day_ahead_price has been 15-minute resolution since the
+    # 2025-09-30 ENTSO-E switch, and a hardcoded hourly expected-count let a
+    # stale, ~4x-too-short quarter-hourly cache file pass this check silently
+    # (root cause of the 2026-09-06 late-August NaN gap).
     first, last = _month_bounds(year, month)
-    expected_hours = int((last - first).total_seconds() / 3600) + 1
-    return len(df) >= 0.9 * expected_hours
+    resolution_seconds = _infer_resolution_seconds(df)
+    expected_periods = int((last - first).total_seconds() / resolution_seconds) + 1
+    return len(df) >= 0.9 * expected_periods
 
 
 def _cache_filepath(cache_dir: Path, file_prefix: str, year: int, month: int) -> Path:

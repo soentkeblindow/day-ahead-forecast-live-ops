@@ -5,7 +5,16 @@ import datetime as dt
 import numpy as np
 import pandas as pd
 
-from energy_price_forecast.evaluation.arena_walkforward import run_arena_backtest
+from energy_price_forecast.data.weather_client import run_init_for_target_day
+from energy_price_forecast.evaluation.arena_walkforward import (
+    _hourly_persistence_forecast,
+    run_arena_backtest,
+    run_live_gate_backtest,
+)
+from energy_price_forecast.features.build import (
+    build_feature_set_for_day,
+    build_original_feature_set_for_day,
+)
 
 _TZ = "Europe/Berlin"
 _SHAPE = np.array([2.0, -2.0, 1.0, -1.0])
@@ -153,3 +162,227 @@ def test_output_shape_and_index_integrity() -> None:
         gaps = group.index.to_series().diff().dropna().unique()
         assert len(gaps) == 1
         assert gaps[0] == pd.Timedelta(minutes=15)
+
+
+# ---------------------------------------------------------------------------
+# 6.6: run_live_gate_backtest -- two feature sets, both resolutions
+# ---------------------------------------------------------------------------
+
+
+class _RecordingMeanModelPerCandidate(_RecordingMeanModel):
+    """Same recording behaviour as _RecordingMeanModel; kept as a distinct
+    name so a test can hold one instance per candidate without confusion."""
+
+
+def _build_full_hourly_df(periods: int, start: str = "2024-01-01 00:00") -> pd.DataFrame:
+    """Every raw column build_feature_set_for_day/build_original_feature_set_for_day
+    need, filled with constant values -- same shape as
+    test_feature_integration.py's own fixture of the same purpose."""
+    idx = pd.date_range(start, periods=periods, freq="h", tz="UTC")
+    return pd.DataFrame(
+        {
+            "day_ahead_price": np.full(periods, 50.0),
+            "load_actual": np.full(periods, 40000.0),
+            "load_forecast_day_ahead": np.full(periods, 40000.0),
+            "gen_wind_onshore": np.full(periods, 8000.0),
+            "wind_onshore_forecast": np.full(periods, 8000.0),
+            "gen_wind_offshore": np.full(periods, 2000.0),
+            "wind_offshore_forecast": np.full(periods, 2000.0),
+            "gen_solar": np.full(periods, 5000.0),
+            "solar_forecast": np.full(periods, 5000.0),
+            "scheduled_net_de_to_AT": np.full(periods, 1000.0),
+            "scheduled_net_de_to_BE": np.full(periods, 500.0),
+            "physical_net_de_to_AT": np.full(periods, 1200.0),
+            "physical_net_de_to_BE": np.full(periods, 600.0),
+            "ttf_gas_eur_per_mwh": np.full(periods, 30.0),
+            "eua_co2_eur_per_t": np.full(periods, 70.0),
+        },
+        index=idx,
+    )
+
+
+def _build_renewables_predictions_for_range(days: list[dt.date]) -> pd.DataFrame:
+    """One synthetic NWP-reconstruction block per day, correct run_init_utc
+    (spec 6.5.3's knowledge-time contract), concatenated into one artefact
+    covering every day in ``days``."""
+    frames = []
+    for day in days:
+        start = pd.Timestamp(day, tz=_TZ)
+        end = pd.Timestamp(day + dt.timedelta(days=1), tz=_TZ)
+        target_index = pd.date_range(start, end, freq="h", inclusive="left").tz_convert("UTC")
+        run_init = run_init_for_target_day(day)
+        index = pd.MultiIndex.from_arrays(
+            [pd.DatetimeIndex([run_init] * len(target_index), tz="UTC"), target_index],
+            names=["run_init_utc", "valid_time_utc"],
+        )
+        frames.append(
+            pd.DataFrame(
+                {
+                    "wind_onshore_mw_pred": np.full(len(target_index), 8000.0),
+                    "wind_offshore_mw_pred": np.full(len(target_index), 2000.0),
+                    "solar_mw_pred": np.full(len(target_index), 5000.0),
+                },
+                index=index,
+            )
+        )
+    return pd.concat(frames)
+
+
+_LIVE_GATE_DAYS = [dt.date(2024, 1, 1) + dt.timedelta(days=i) for i in range(60)]
+
+
+def test_two_feature_sets_differ_as_expected() -> None:
+    """spec 6.6 section 7: 'original' carries the three TSO forecast columns
+    plus renewable_share_forecast; 'live' carries their _nwp counterparts
+    and none of the originals. Checked as set membership, not a sample."""
+    df = _build_full_hourly_df(30 * 24)
+    predictions = _build_renewables_predictions_for_range(_LIVE_GATE_DAYS[:30])
+    target_day = dt.date(2024, 1, 20)
+
+    original = build_original_feature_set_for_day(target_day, df)
+    live = build_feature_set_for_day(target_day, df, predictions)
+
+    tso_only = {
+        "wind_onshore_forecast",
+        "wind_offshore_forecast",
+        "solar_forecast",
+        "renewable_share_forecast",
+    }
+    nwp_only = {
+        "wind_onshore_forecast_nwp",
+        "wind_offshore_forecast_nwp",
+        "solar_forecast_nwp",
+        "renewable_share_forecast_nwp",
+    }
+
+    assert tso_only <= set(original.columns)
+    assert not (tso_only & set(live.columns))
+    assert nwp_only <= set(live.columns)
+    assert not (nwp_only & set(original.columns))
+
+
+def test_run_live_gate_backtest_quarterhourly_produces_two_candidates() -> None:
+    df = _build_full_hourly_df(60 * 24)
+    predictions = _build_renewables_predictions_for_range(_LIVE_GATE_DAYS)
+    y_hourly = df["day_ahead_price"]
+    prices_qh = _build_quarterhourly(y_hourly, dt.date(2024, 1, 15), 35)
+
+    result = run_live_gate_backtest(
+        df,
+        predictions,
+        _RecordingMeanModelPerCandidate(),
+        _RecordingMeanModelPerCandidate(),
+        resolution="quarterhourly",
+        prices_qh=prices_qh,
+        shape_window_days=5,
+        train_span_days=10,
+    )
+
+    assert set(result.columns) == {
+        "y_true",
+        "pred_original",
+        "pred_live",
+        "pred_baseline",
+        "delivery_day",
+        "n_slots_in_day",
+    }
+    assert not result.index.has_duplicates
+    assert result["delivery_day"].nunique() > 0
+    assert result["pred_original"].notna().all()
+    assert result["pred_live"].notna().all()
+
+
+def test_run_live_gate_backtest_hourly_resolution_no_shape_profile() -> None:
+    """spec 6.6 section 7: --resolution hourly builds no shape profile and
+    never produces quarter-hourly slot counts (92/96/100)."""
+    df = _build_full_hourly_df(60 * 24)
+    predictions = _build_renewables_predictions_for_range(_LIVE_GATE_DAYS)
+
+    result = run_live_gate_backtest(
+        df,
+        predictions,
+        _RecordingMeanModelPerCandidate(),
+        _RecordingMeanModelPerCandidate(),
+        resolution="hourly",
+        train_span_days=10,
+    )
+
+    assert set(result.columns) == {
+        "y_true",
+        "pred_original",
+        "pred_live",
+        "pred_baseline",
+        "delivery_day",
+        "n_slots_in_day",
+    }
+    assert result["n_slots_in_day"].between(20, 26).all()
+    assert not result["n_slots_in_day"].isin([92, 96, 100]).any()
+
+
+def test_missing_nwp_day_excludes_the_fold_for_both_candidates() -> None:
+    """spec 6.6 section 3.4: a day the live feature set cannot build
+    (incomplete NWP reconstruction) is excluded for the original candidate
+    too -- pred_original and pred_live are always defined on identical
+    delivery days."""
+    df = _build_full_hourly_df(60 * 24)
+    excluded_day = dt.date(2024, 1, 25)
+    predictions = _build_renewables_predictions_for_range(
+        [d for d in _LIVE_GATE_DAYS if d != excluded_day]
+    )
+
+    result = run_live_gate_backtest(
+        df,
+        predictions,
+        _RecordingMeanModelPerCandidate(),
+        _RecordingMeanModelPerCandidate(),
+        resolution="hourly",
+        train_span_days=10,
+    )
+
+    delivery_days = pd.DatetimeIndex(result["delivery_day"].unique())
+    assert excluded_day not in delivery_days.date
+
+
+def test_both_models_train_only_on_data_before_delivery_day() -> None:
+    """spec 6.6 section 7: the training window ends at D-1 and never
+    includes D -- for both feature sets."""
+    df = _build_full_hourly_df(60 * 24)
+    predictions = _build_renewables_predictions_for_range(_LIVE_GATE_DAYS)
+    y_hourly = df["day_ahead_price"]
+    prices_qh = _build_quarterhourly(y_hourly, dt.date(2024, 1, 15), 35)
+
+    model_live = _RecordingMeanModelPerCandidate()
+    model_original = _RecordingMeanModelPerCandidate()
+    result = run_live_gate_backtest(
+        df,
+        predictions,
+        model_live,
+        model_original,
+        resolution="quarterhourly",
+        prices_qh=prices_qh,
+        shape_window_days=5,
+        train_span_days=10,
+    )
+
+    delivery_days = pd.DatetimeIndex(result["delivery_day"].drop_duplicates().sort_values())
+    assert len(model_live.fit_calls) == len(delivery_days)
+    assert len(model_original.fit_calls) == len(delivery_days)
+    for train_index, delivery_day in zip(model_live.fit_calls, delivery_days, strict=True):
+        assert train_index.max() < delivery_day
+    for train_index, delivery_day in zip(model_original.fit_calls, delivery_days, strict=True):
+        assert train_index.max() < delivery_day
+
+
+def test_hourly_persistence_baseline_matches_d_minus_1_wall_clock() -> None:
+    """spec 6.6 section 3.3: the hourly baseline is the realised price of
+    the same wall-clock hour on D-1 -- not the mean, not D itself."""
+    idx = pd.date_range("2024-01-01", periods=72, freq="h", tz="UTC")
+    y = pd.Series(np.arange(len(idx), dtype=float), index=idx)  # strictly increasing, no ties
+    target_day = pd.Timestamp("2024-01-03", tz=_TZ)
+
+    baseline = _hourly_persistence_forecast(y, target_day, tz=_TZ)
+
+    prev_day_start = pd.Timestamp("2024-01-02", tz=_TZ)
+    prev_day_end = prev_day_start + pd.Timedelta(days=1)
+    expected = y.loc[(y.index >= prev_day_start) & (y.index < prev_day_end)].to_numpy()
+    np.testing.assert_array_equal(baseline.to_numpy(), expected)

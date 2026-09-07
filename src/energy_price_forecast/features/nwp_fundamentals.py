@@ -92,6 +92,34 @@ def build_residual_load_nwp(load: Feature, won: Feature, woff: Feature, solar: F
     return combine("residual_load_forecast_nwp", [load, won, woff, solar], _residual_load_formula)
 
 
+def _renewable_share_formula(
+    load: pd.Series, won: pd.Series, woff: pd.Series, solar: pd.Series
+) -> pd.Series:
+    """Same formula as fundamentals.py's renewable_share_forecast term (spec
+    6.6 section 3.2) -- reproduced here exactly, not shared code, same
+    identity-test discipline as _residual_load_formula above."""
+    return (won + woff + solar) / load
+
+
+def build_renewable_share_nwp(
+    load: Feature, won: Feature, woff: Feature, solar: Feature
+) -> Feature:
+    """renewable_share_forecast_nwp = (won + woff + solar) / load.
+
+    Added in 6.6 (spec section 3.2): 6.5.3 built only the four columns the
+    6.2 audit found unavailable, and renewable_share_forecast was not one of
+    them -- but the 'original' feature set in 6.6 carries the TSO-sourced
+    renewable_share_forecast, so 'live' needs an NWP-sourced counterpart or
+    the two candidates would differ by more than reconstruction quality
+    alone. Exposed standalone for the same reason as
+    build_residual_load_nwp: the identity test calls it directly with
+    TSO-sourced Features.
+    """
+    return combine(
+        "renewable_share_forecast_nwp", [load, won, woff, solar], _renewable_share_formula
+    )
+
+
 def build_nwp_forecast_fundamentals(
     df: pd.DataFrame,
     renewables_predictions: pd.DataFrame,
@@ -102,10 +130,12 @@ def build_nwp_forecast_fundamentals(
     load_forecast_day_ahead is unchanged (still DA_FORECAST -- verified
     available at gate closure, spec 6.5.3 section 2, no reason to rebuild
     it); wind_onshore_forecast_nwp / wind_offshore_forecast_nwp /
-    solar_forecast_nwp / residual_load_forecast_nwp come from this
-    project's own reconstruction (NWP_RECONSTRUCTION). Contains no
-    DA_FORECAST-class renewables column -- spec 6.5.3 section 5.3's own
-    test asserts this holds for whatever calls this function.
+    solar_forecast_nwp / residual_load_forecast_nwp / renewable_share_forecast_nwp
+    come from this project's own reconstruction (NWP_RECONSTRUCTION). The
+    fifth column was added in 6.6 (spec section 3.2), not 6.5.3 -- see
+    build_renewable_share_nwp's docstring. Contains no DA_FORECAST-class
+    renewables column -- spec 6.5.3 section 5.3's own test asserts this
+    holds for whatever calls this function.
 
     Raises IncompleteReconstructionError (whole target day, spec 6.5.3
     section 3.3) if renewables_predictions does not fully cover
@@ -141,4 +171,5 @@ def build_nwp_forecast_fundamentals(
         target_index=target_index,
     )
     residual_nwp = build_residual_load_nwp(load, won_nwp, woff_nwp, solar_nwp)
-    return [load, won_nwp, woff_nwp, solar_nwp, residual_nwp]
+    share_nwp = build_renewable_share_nwp(load, won_nwp, woff_nwp, solar_nwp)
+    return [load, won_nwp, woff_nwp, solar_nwp, residual_nwp, share_nwp]

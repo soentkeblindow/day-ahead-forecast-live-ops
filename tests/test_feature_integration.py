@@ -25,6 +25,7 @@ from energy_price_forecast.features.fundamentals import build_forecast_fundament
 from energy_price_forecast.features.nwp_fundamentals import (
     IncompleteReconstructionError,
     build_nwp_forecast_fundamentals,
+    build_renewable_share_nwp,
     build_residual_load_nwp,
 )
 from energy_price_forecast.market_time import gate_closure_for_index
@@ -179,12 +180,42 @@ def test_residual_load_formula_identity_against_tso_series() -> None:
     )
 
 
+def test_renewable_share_formula_identity_against_tso_series() -> None:
+    """Same identity discipline as the residual-load probe above, for
+    renewable_share_forecast_nwp (spec 6.6 section 3.2): feeding
+    build_renewable_share_nwp the TSO-sourced Features must reproduce the
+    original renewable_share_forecast column bit-exact, values and
+    knowledge time."""
+    df = _make_full_df_with_lags()
+    target_index = _local_hourly_index(_TARGET_DAY)
+    old_feats = {f.name: f for f in build_forecast_fundamentals(df, target_index)}
+
+    new_share = build_renewable_share_nwp(
+        old_feats["load_forecast_day_ahead"],
+        old_feats["wind_onshore_forecast"],
+        old_feats["wind_offshore_forecast"],
+        old_feats["solar_forecast"],
+    )
+
+    pd.testing.assert_series_equal(
+        new_share.values, old_feats["renewable_share_forecast"].values, check_names=False
+    )
+    pd.testing.assert_series_equal(
+        new_share.knowledge_time, old_feats["renewable_share_forecast"].knowledge_time
+    )
+
+
 # ---------------------------------------------------------------------------
 # 5.3 No DA_FORECAST column in the live feature set
 # ---------------------------------------------------------------------------
 
 _FORBIDDEN_LIVE_COLUMNS = frozenset(
-    {"wind_onshore_forecast", "wind_offshore_forecast", "solar_forecast"}
+    {
+        "wind_onshore_forecast",
+        "wind_offshore_forecast",
+        "solar_forecast",
+        "renewable_share_forecast",
+    }
 )
 
 
@@ -310,10 +341,16 @@ def test_builder_source_never_touches_the_system_clock() -> None:
     by source inspection, since datetime.date/datetime and pd.Timestamp are
     immutable C-extension types that cannot be monkeypatched to prove a
     negative dynamically (confirmed: assigning to date.today/datetime.now
-    raises TypeError on this Python)."""
+    raises TypeError on this Python).
+
+    Extended in 6.6 (spec section 5.1/section 7) to also cover
+    fundamentals.py, the 'original' feature-set path used by 6.6's
+    pred_original reference line -- both feature-set builders are covered,
+    not just the live path."""
     modules = [
         PROJECT_ROOT / "src" / "energy_price_forecast" / "features" / "build.py",
         PROJECT_ROOT / "src" / "energy_price_forecast" / "features" / "nwp_fundamentals.py",
+        PROJECT_ROOT / "src" / "energy_price_forecast" / "features" / "fundamentals.py",
     ]
     for path in modules:
         text = path.read_text(encoding="utf-8")

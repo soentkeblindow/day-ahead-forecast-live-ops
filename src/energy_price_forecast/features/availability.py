@@ -105,6 +105,9 @@ _RAW_AVAILABILITY: dict[str, Availability] = {
     "wind_offshore_forecast_nwp": Availability.NWP_RECONSTRUCTION,
     "solar_forecast_nwp": Availability.NWP_RECONSTRUCTION,
     "residual_load_forecast_nwp": Availability.NWP_RECONSTRUCTION,
+    # Added in 6.6 (spec section 3.2), not 6.5.3 -- see
+    # nwp_fundamentals.py::build_renewable_share_nwp for why.
+    "renewable_share_forecast_nwp": Availability.NWP_RECONSTRUCTION,
 }
 
 
