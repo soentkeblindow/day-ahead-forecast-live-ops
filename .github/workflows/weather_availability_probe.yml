@@ -1,36 +1,14 @@
 name: Daily weather availability probe
 
 on:
-  schedule:
-    # UTC-only, no DST awareness in GitHub's cron. Odd minutes (:23/:53)
-    # rather than :00/:30 on purpose -- Actions cron is notoriously
-    # unpunctual at round minutes, and this avoids colliding with
-    # audit.yml's own :00/:45 slots (spec 6.5.1, §5.4c). Five morning slots,
-    # 05:00-09:00 UTC -- 07:00-11:00 local in CEST, 06:00-10:00 local in CET
-    # -- so the probe brackets the documented 4-6h post-00Z availability
-    # window from both sides. This is the measurement standing in for the
-    # F3 multi-day check the spike (6.5.0) could not complete -- see
-    # docs/sprint6_step6_5_1_log.md, "Schritt 8".
-    - cron: "23 5 * * *"
-    - cron: "23 6 * * *"
-    - cron: "23 7 * * *"
-    - cron: "23 8 * * *"
-    - cron: "23 9 * * *"
-    # TEMPORARY, added 2026-09-02: audit.yml and this workflow have both
-    # been drifting a whole-batch ~4h06-5h24 late since 2026-08-27 (see
-    # docs/cron_jobs.md), so the five slots above have never actually
-    # landed in the intended 05:00-09:00 UTC window -- no confirmed F3
-    # measurement yet. These five duplicate slots, offset 4h30 earlier
-    # (00:53-04:53), are a bet that the same drift pushes THEM into
-    # roughly the original target window instead. Remove once we have 1-2
-    # usable F3 measurements, or if the underlying drift resolves (in
-    # which case these would start firing 4-5h too early and become
-    # useless -- don't leave this in place unmonitored).
-    - cron: "53 0 * * *"
-    - cron: "53 1 * * *"
-    - cron: "53 2 * * *"
-    - cron: "53 3 * * *"
-    - cron: "53 4 * * *"
+  # schedule: removed 2026-09-09 (spec 6.7.1, Entscheidung 20): the
+  # Cloudflare Worker under ops/trigger/ is now the sole timekeeper,
+  # calling workflow_dispatch from a well-timed local slot (06:30
+  # Europe/Berlin). GitHub's own schedule: trigger measured a median
+  # dispatch delay of +242min (max +693min) since 2026-08-27 -- the exact
+  # drift problem the temporary duplicate-slot crons below were bolted on
+  # to work around; both the original five-slot schedule and that
+  # workaround are now moot. docs/sprint6_step6_7_1_log.md, "Nachtrag A2".
   workflow_dispatch: {}
 
 concurrency:
