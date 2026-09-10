@@ -43,12 +43,14 @@ Current slot table (spec 6.7.1 section 5.1):
 | 11:30 | `audit.yml` |
 
 6.7.2 adds submission slots as additional rows to this table and to
-`CRON_TO_SLOT` -- the structure is meant to be extended, not rebuilt.
+`SLOTS` -- the structure is meant to be extended, not rebuilt.
 
 ## Rollout (owner tasks, spec 6.7.1 section 3.5)
 
-1. **O1 -- Cloudflare account.** Free tier is far more than this needs (ten
-   scheduled invocations/day against a 100k-requests/day free quota).
+1. **O1 -- Cloudflare account.** Free tier is far more than this needs (288
+   poll invocations/day, one every 5 minutes, against a 100k-requests/day
+   free quota -- the poll design, not the original ten-fixed-cron one; see
+   "What it does" above).
 2. **O2 -- GitHub token.** Create a **fine-grained personal access token**,
    scoped to **only this repository**, with **Actions: read and write**
    permission, and an **explicit expiration date**. Do not use a
@@ -65,16 +67,24 @@ Current slot table (spec 6.7.1 section 5.1):
    (paste the token from O2 when prompted; wrangler stores it in Cloudflare's
    secret store, not in this repo).
 7. Deploy: `npx wrangler deploy`.
-8. **O4, last step -- trigger once by hand** to confirm the deployment works
-   before relying on the cron schedule:
+8. **O4, last step -- confirm the deployment works before relying on the
+   cron schedule.** **Cron Trigger changes take up to 15 minutes to
+   propagate globally (Cloudflare's own docs) -- deploy once, then wait a
+   full comfortable window (an hour-plus lead to a round local time worked
+   well) before checking, rather than iterating with fast redeploys.** A
+   real rollout (2026-09-09) burned most of a session on exactly this: a
+   messy local `wrangler dev --test-scheduled` detour, then several rapid
+   production redeploys nudging a temporary test slot a few minutes into
+   the future each time -- every one of which likely reset the propagation
+   window before it ever completed, so the whole fast-iteration campaign
+   never had a real chance to succeed. One clean deploy plus one patient
+   wait is what actually worked. Full narrative:
+   `docs/sprint6_step6_7_1_log.md`, step O4.
    ```
    npx wrangler deployments list   # confirm the deploy landed
    ```
-   A full scheduled-event dry run without waiting for the next real cron tick
-   can be done locally against `wrangler dev --test-scheduled` (see the
-   Wrangler docs for the exact invocation, since the CLI flag has changed
-   across versions) -- confirm the console log shows a dispatch attempt, then
-   check the Actions tab of the repo for the resulting run.
+   Then check the Actions tab of the repo (or `gh run list --workflow=<name>`)
+   for the resulting `workflow_dispatch` run once the wait is over.
 
 ## What must never live in this repo
 
