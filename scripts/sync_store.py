@@ -123,10 +123,30 @@ def _sync_entsoe_source(
     previous = _previous_entry(manifest, source.name)
     period_start = _gap_start(previous, _ENTSOE_DEFAULT_LOOKBACK_DAYS, as_of).floor("D")
     period_end = as_of.floor("D") + pd.Timedelta(days=1)
+    # Fetched from the source's true covered_start_utc, not just period_start
+    # (the gap) -- cached_fetch() only hits the API for genuinely new
+    # months, so this is cheap, but it's required for correctness: the
+    # manifest-growth check below and the SourceManifestEntry built at the
+    # end of this function both assume `frame` is the *cumulative* series
+    # (matching how commodities' own combine_first merge already works),
+    # not just the newly-fetched delta. Confirmed a real, not theoretical,
+    # bug by A10's first live wiring probe (2026-09-10): every ENTSO-E
+    # source failed with "row count shrank: 67 < previous 83495"-style
+    # errors every single incremental sync, because a period_start-only
+    # fetch's tiny row count was being compared against the full historical
+    # previous.count. Also explains a second symptom from the same run --
+    # `generation`'s column mismatch (`gen_nuclear` missing) -- a
+    # gap-only fetch since 2026-09 never spans the pre-April-2023 window
+    # gen_nuclear has any real (non-empty) values in.
+    fetch_start = (
+        pd.Timestamp(previous.covered_start_utc)
+        if previous is not None and previous.covered_start_utc is not None
+        else period_start
+    )
 
     backup = _backup_dir(source.cache_dir)
     try:
-        frame = source.fetch(period_start, as_of)
+        frame = source.fetch(fetch_start, as_of)
         row.fetched = True
     except Exception as exc:  # noqa: BLE001 -- an unreachable source is a green outcome (spec 2.7)
         logger.warning("Source %r unreachable this run: %s", source.name, exc)
