@@ -162,6 +162,7 @@ def _sync_entsoe_source(
         period_end=period_end,
         as_of=as_of,
         previous=previous,
+        mode="live",
     )
     row.validation = "ok" if result.ok else "; ".join(result.reasons)
 
@@ -231,6 +232,7 @@ def _sync_commodity_source(
         period_end=as_of,
         as_of=as_of,
         previous=previous,
+        mode="live",
     )
     row.validation = "ok" if result.ok else "; ".join(result.reasons)
 

@@ -457,9 +457,9 @@ def test_unexpected_nan_in_a_non_exempt_column_is_rejected() -> None:
 
 
 def test_live_tail_nan_within_settling_buffer_is_not_rejected() -> None:
-    """A9 finding: individual generation-by-type columns can lag others by
-    up to ~2h at the live edge -- a normal reporting artefact, not a gap
-    (see store.py's _NAN_CHECK_SETTLING_BUFFER)."""
+    """A9/A10 finding: individual generation-by-type columns can lag others
+    by hours at the live edge -- a normal reporting artefact, not a gap.
+    Only applies in mode="live" (see store.py's LIVE_SETTLING_BUFFER)."""
     expectation = store.EXPECTATION_TABLE["generation"]
     as_of = pd.Timestamp("2026-09-10T13:42:00", tz="UTC")
     period_start = pd.Timestamp("2026-09-08", tz="UTC")
@@ -468,7 +468,65 @@ def test_live_tail_nan_within_settling_buffer_is_not_rejected() -> None:
         period_start, as_of - pd.Timedelta(hours=1), freq="15min", inclusive="left"
     )
     data = {col: np.arange(len(index), dtype=float) for col in expectation.expected_columns}
-    tail_mask = index >= (as_of - pd.Timedelta(hours=2))  # inside the 12h settling buffer
+    tail_mask = index >= (as_of - pd.Timedelta(hours=2))  # inside the 24h settling buffer
+    data["gen_hard_coal"] = np.where(tail_mask, np.nan, np.arange(len(index), dtype=float))
+    frame = pd.DataFrame(data, index=index)
+
+    result = store.validate_source(
+        "generation",
+        frame,
+        expectation,
+        period_start=period_start,
+        period_end=period_end,
+        as_of=as_of,
+        mode="live",
+    )
+
+    assert result.ok is True
+
+
+def test_settled_nan_outside_the_buffer_is_still_rejected() -> None:
+    """The settling buffer must not swallow a genuine gap once the data is
+    old enough that live reporting lag no longer explains it (mode="live",
+    a full-column gap well beyond LIVE_MAX_NAN_FRACTION too)."""
+    expectation = store.EXPECTATION_TABLE["generation"]
+    as_of = pd.Timestamp("2026-09-10T13:42:00", tz="UTC")
+    period_start = pd.Timestamp("2026-09-08", tz="UTC")
+    period_end = as_of.floor("D") + pd.Timedelta(days=1)
+    index = pd.date_range(
+        period_start, as_of - pd.Timedelta(hours=25), freq="15min", inclusive="left"
+    )
+    data = {col: np.arange(len(index), dtype=float) for col in expectation.expected_columns}
+    data["gen_gas"] = np.full(len(index), np.nan)  # settled, real gap -- well before as_of - 24h
+    frame = pd.DataFrame(data, index=index)
+
+    result = store.validate_source(
+        "generation",
+        frame,
+        expectation,
+        period_start=period_start,
+        period_end=period_end,
+        as_of=as_of,
+        mode="live",
+    )
+
+    assert result.ok is False
+    assert any("gen_gas" in r for r in result.reasons)
+
+
+def test_rebuild_mode_applies_no_settling_buffer_and_the_strict_tolerance() -> None:
+    """mode="rebuild" (the default) never excludes a live tail and never
+    loosens to LIVE_MAX_NAN_FRACTION -- a live-tail-shaped gap right at
+    as_of must still be judged against the strict rebuild tolerance."""
+    expectation = store.EXPECTATION_TABLE["generation"]
+    as_of = pd.Timestamp("2026-09-10T13:42:00", tz="UTC")
+    period_start = pd.Timestamp("2026-09-08", tz="UTC")
+    period_end = as_of.floor("D") + pd.Timedelta(days=1)
+    index = pd.date_range(
+        period_start, as_of - pd.Timedelta(hours=1), freq="15min", inclusive="left"
+    )
+    data = {col: np.arange(len(index), dtype=float) for col in expectation.expected_columns}
+    tail_mask = index >= (as_of - pd.Timedelta(hours=2))
     data["gen_hard_coal"] = np.where(tail_mask, np.nan, np.arange(len(index), dtype=float))
     frame = pd.DataFrame(data, index=index)
 
@@ -481,21 +539,19 @@ def test_live_tail_nan_within_settling_buffer_is_not_rejected() -> None:
         as_of=as_of,
     )
 
-    assert result.ok is True
+    assert result.ok is False
+    assert any("gen_hard_coal" in r for r in result.reasons)
 
 
-def test_settled_nan_outside_the_buffer_is_still_rejected() -> None:
-    """The settling buffer must not swallow a genuine gap once the data is
-    old enough that live reporting lag no longer explains it."""
+def test_live_mode_never_loosens_a_permanent_exemption() -> None:
+    """LIVE_MAX_NAN_FRACTION must be a floor, not a ceiling -- gen_nuclear's
+    permanent 1.0 exemption must survive mode="live" unchanged."""
     expectation = store.EXPECTATION_TABLE["generation"]
-    as_of = pd.Timestamp("2026-09-10T13:42:00", tz="UTC")
-    period_start = pd.Timestamp("2026-09-08", tz="UTC")
-    period_end = as_of.floor("D") + pd.Timedelta(days=1)
-    index = pd.date_range(
-        period_start, as_of - pd.Timedelta(hours=13), freq="15min", inclusive="left"
-    )
+    period_start = pd.Timestamp("2026-08-01", tz="UTC")
+    period_end = pd.Timestamp("2026-09-01", tz="UTC")
+    index = pd.date_range(period_start, period_end, freq="15min", inclusive="left")
     data = {col: np.arange(len(index), dtype=float) for col in expectation.expected_columns}
-    data["gen_gas"] = np.full(len(index), np.nan)  # settled, real gap -- well before as_of - 12h
+    data["gen_nuclear"] = np.full(len(index), np.nan)
     frame = pd.DataFrame(data, index=index)
 
     result = store.validate_source(
@@ -504,11 +560,42 @@ def test_settled_nan_outside_the_buffer_is_still_rejected() -> None:
         expectation,
         period_start=period_start,
         period_end=period_end,
-        as_of=as_of,
+        as_of=pd.Timestamp("2026-09-08", tz="UTC"),
+        mode="live",
     )
 
-    assert result.ok is False
-    assert any("gen_gas" in r for r in result.reasons)
+    assert result.ok is True
+
+
+def test_live_mode_tolerates_an_isolated_cell_in_a_small_window() -> None:
+    """A10's real finding (2026-09-10): one already-known isolated cell in
+    a small daily-sync window is ~5% of that window, over the rebuild-sized
+    0.001 tolerance -- LIVE_MAX_NAN_FRACTION must absorb this.
+    load_forecast_day_ahead specifically: not in live_settling_columns, so
+    this isolates LIVE_MAX_NAN_FRACTION's own effect from the settling
+    buffer's (a settling-buffered column this close to as_of would have its
+    entire small window excluded before the fraction check ever ran)."""
+    expectation = store.EXPECTATION_TABLE["load"]
+    period_start = pd.Timestamp("2026-09-10T00:00", tz="UTC")
+    period_end = pd.Timestamp("2026-09-11T00:00", tz="UTC")
+    index = pd.date_range(
+        period_start, pd.Timestamp("2026-09-10T06:00", tz="UTC"), freq="15min", inclusive="left"
+    )
+    data = {col: np.arange(len(index), dtype=float) for col in expectation.expected_columns}
+    data["load_forecast_day_ahead"][0] = np.nan  # one isolated cell in a 24-row window (~4.2%)
+    frame = pd.DataFrame(data, index=index)
+
+    result = store.validate_source(
+        "load",
+        frame,
+        expectation,
+        period_start=period_start,
+        period_end=period_end,
+        as_of=pd.Timestamp("2026-09-10T16:48", tz="UTC"),
+        mode="live",
+    )
+
+    assert result.ok is True
 
 
 def test_cross_border_flows_tolerates_an_isolated_settled_gap() -> None:

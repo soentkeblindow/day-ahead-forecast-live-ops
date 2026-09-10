@@ -42,7 +42,7 @@ import tempfile
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Final, cast
+from typing import Any, Final, Literal, cast
 
 import pandas as pd
 
@@ -317,12 +317,26 @@ class SourceExpectation:
     other period is judged normally -- unlike max_nan_fraction, this can't
     be approximated by a single tolerance float without permanently waving
     through a genuine large-scale failure outside the known window.
+
+    ``live_settling_columns`` names the columns that are TSO-reported
+    *actuals* (measured after the fact, with a variable reporting lag) as
+    opposed to forecasts/schedules (published once, in advance, for the
+    whole delivery day -- no "still trickling in" dynamic to account for).
+    Only these columns get LIVE_SETTLING_BUFFER excluded from the tail in
+    ``mode="live"`` validation (see validate_source); everything else is
+    judged over its full checked window in both modes. A real measurement
+    (2026-09-10, A10) of the trailing contiguous NaN run right now across
+    every actuals column found 0h for most, but 10h for gen_hard_coal in
+    that one snapshot -- high enough variance that a short, precisely-fitted
+    buffer is not defensible; see LIVE_SETTLING_BUFFER's own comment for
+    the reasoning behind the chosen width.
     """
 
     expected_columns: frozenset[str]
     max_nan_fraction: dict[str, float] = field(default_factory=dict)
     grid_based: bool = True
     known_low_resolution_windows: dict[str, tuple[str, str]] = field(default_factory=dict)
+    live_settling_columns: frozenset[str] = field(default_factory=frozenset)
 
 
 # Six ENTSO-E fetch groups (data/entsoe_client.py's own _FETCH_FUNCTIONS/
@@ -340,8 +354,13 @@ EXPECTATION_TABLE: Final[dict[str, SourceExpectation]] = {
         # cells; load_forecast_day_ahead had two full missing calendar days
         # (2022-02-xx, 2022-03-xx, 96 quarter-hours each) plus known DST
         # fall-back hours -- same small/isolated/permanent-gap category as
-        # generation's finding, same 0.001 tolerance for the same reason.
+        # generation's finding, same 0.001 tolerance for the same reason
+        # (rebuild-mode only -- see validate_source's mode parameter).
         max_nan_fraction={"load_actual": 0.001, "load_forecast_day_ahead": 0.001},
+        # load_actual is a TSO actual (measured after the fact, variable
+        # reporting lag) -- load_forecast_day_ahead is published once, in
+        # advance, for the whole day; no live-tail dynamic to account for.
+        live_settling_columns=frozenset({"load_actual"}),
     ),
     "wind_solar": SourceExpectation(
         expected_columns=frozenset(
@@ -404,13 +423,33 @@ EXPECTATION_TABLE: Final[dict[str, SourceExpectation]] = {
             "gen_solar": 0.001,
             "gen_other": 0.001,
         },
+        # generation-by-type is a TSO actual, reported after the fact --
+        # gen_nuclear excluded since it is permanently ~100% NaN anyway
+        # (max_nan_fraction=1.0 above already covers it regardless of mode).
+        live_settling_columns=frozenset(
+            {
+                "gen_lignite",
+                "gen_hard_coal",
+                "gen_gas",
+                "gen_oil",
+                "gen_biomass",
+                "gen_hydro",
+                "gen_wind_onshore",
+                "gen_wind_offshore",
+                "gen_solar",
+                "gen_other",
+            }
+        ),
     ),
     "scheduled_exchanges": SourceExpectation(
         expected_columns=frozenset(f"scheduled_net_de_to_{n.lower()}" for n in NEIGHBORS),
-        # Same 0.001 backstop tolerance as "generation" and for the same
-        # structural reason (live-tail skew, isolated settled gaps) --
-        # applied to every neighbor column since the mechanism applies to
-        # all of them, not just the ones observed so far.
+        # Same 0.001 backstop tolerance as "generation", for isolated
+        # settled gaps -- applied to every neighbor column since the
+        # mechanism applies to all of them, not just the ones observed so
+        # far. No live_settling_columns here: scheduled exchanges are a
+        # day-ahead schedule, published once in advance for the whole
+        # delivery day, not a TSO actual with a variable after-the-fact
+        # reporting lag -- there is no live tail to exclude.
         max_nan_fraction={f"scheduled_net_de_to_{n.lower()}": 0.001 for n in NEIGHBORS},
         # A9's real full-history rebuild (2026-09-10) found scheduled_net_
         # de_to_{at,ch,nl,pl,dk_1} genuinely reported hourly, not
@@ -437,14 +476,16 @@ EXPECTATION_TABLE: Final[dict[str, SourceExpectation]] = {
     "cross_border_flows": SourceExpectation(
         expected_columns=frozenset(f"physical_net_de_to_{n.lower()}" for n in NEIGHBORS),
         # Same 0.001 backstop as scheduled_exchanges above -- A9's probe run
-        # (2026-09-10, 75-day window) separately found a live-tail lag in
-        # physical_net_de_to_at spanning ~6h45m (longer than generation's,
-        # which is why _NAN_CHECK_SETTLING_BUFFER was widened from 6h to
-        # 12h globally rather than kept generation-specific) and an
-        # isolated settled gap in physical_net_de_to_pl at 2026-09-02 03:00
-        # UTC -- both the same small/permanent-gap category as generation's
-        # finding, independent of the resolution-transition finding below.
+        # (2026-09-10, 75-day window) separately found an isolated settled
+        # gap in physical_net_de_to_pl at 2026-09-02 03:00 UTC, the same
+        # small/permanent-gap category as generation's finding, independent
+        # of the resolution-transition finding below.
         max_nan_fraction={f"physical_net_de_to_{n.lower()}": 0.001 for n in NEIGHBORS},
+        # physical cross-border flows are TSO actuals (realised, measured
+        # after the fact) -- unlike scheduled_exchanges, which are a
+        # day-ahead schedule. Every neighbor column gets the live-tail
+        # settling exclusion.
+        live_settling_columns=frozenset(f"physical_net_de_to_{n.lower()}" for n in NEIGHBORS),
         # Same hourly-vs-quarter-hourly resolution-transition phenomenon as
         # scheduled_exchanges, found in the same A9 real full-history
         # rebuild (2026-09-10): physical_net_de_to_{fr,pl} were genuinely
@@ -479,28 +520,49 @@ EXPECTATION_TABLE: Final[dict[str, SourceExpectation]] = {
 # there to double-check).
 _COMPLETENESS_BUFFER: Final[pd.Timedelta] = pd.Timedelta(days=1)
 
-# The per-column NaN check needs its own, much shorter settling buffer,
-# separate from _COMPLETENESS_BUFFER above (that one-day buffer is sized
-# for "is this calendar month over", not "has every generation-by-type
-# column finished reporting this quarter-hour" -- reusing it here would
-# hold back fresh data from the store for a full day on every run). A9's
-# first-ever full-history rebuild found individual columns (gen_hard_coal)
-# still NaN up to ~1h45m after other columns in the same row already had
-# values, purely a live reporting-lag artefact, not a data-quality issue --
-# in a one-shot rebuild spanning years this is negligible, but a live
-# sync's short period window is often *entirely* this trailing lag, which
-# would otherwise reject the run every time. A follow-up probe the same
-# day found physical_net_de_to_at lagging further still, ~6h45m -- one
-# global constant (not per-source, for simplicity: a buffer that's wider
-# than a given source strictly needs is harmless, since it only holds back
-# judgment on the freshest hours and heal_recent picks the same window up
-# again on every later run regardless) is set to 12h, comfortably covering
-# both observed lags with margin rather than fitted exactly to either one.
-# Safe to exclude this tail from the write-time NaN judgment: heal_recent's
-# own HEAL_LOOKBACK_DAYS=10 re-examines and backfills the same trailing
-# window on every later run regardless, so a gap here is not permanently
-# unseen.
-_NAN_CHECK_SETTLING_BUFFER: Final[pd.Timedelta] = pd.Timedelta(hours=12)
+# --- Two validation contexts, deliberately not one shared tolerance ---
+#
+# A9/A10 (2026-09-10) found that a single NaN tolerance cannot serve both
+# of this store's real use cases at once:
+#
+# 1. "rebuild" -- scripts/rebuild_store.py, a one-shot or occasional
+#    from-zero pass over years of history. max_nan_fraction (EXPECTATION_
+#    TABLE, e.g. 0.001) is sized against that huge denominator -- a handful
+#    of genuine isolated permanent gaps (6.5.1's weather gaps, A9's ENTSO-E
+#    equivalents) stay negligible as a fraction. No settling buffer is
+#    needed here: even a full day of live-tail lag is a tiny fraction of a
+#    multi-year window.
+# 2. "live" -- scripts/sync_store.py, a small incremental window (often
+#    under a day). The exact same 0.001 fraction is meaningless there: one
+#    isolated permanent cell in a ~20-row window is already ~5%, and
+#    A10's first real wiring-probe run against production hit exactly
+#    this ("row count shrank"-adjacent NaN-fraction failures on load/
+#    generation from a single already-known cell, confirmed via
+#    docs/sprint6_step6_7_1_log.md). A live sync needs its own, much
+#    coarser tolerance, sized like a classic data-quality gate rather than
+#    a permanent-gap allowance.
+#
+# LIVE_MAX_NAN_FRACTION (~5%) is that live-mode default; max_nan_fraction
+# entries still act as a floor under it (a full 1.0 exemption like
+# gen_nuclear's must never be *lowered* by the live default -- see
+# validate_source's max() below).
+LIVE_MAX_NAN_FRACTION: Final[float] = 0.05
+
+# LIVE_SETTLING_BUFFER only matters for live_settling_columns (TSO
+# actuals -- see SourceExpectation's own docstring for why forecasts/
+# schedules don't need it at all). Sized from a real measurement, not
+# fitted to one or two anecdotes: on 2026-09-10, the trailing contiguous
+# NaN run right now was measured across every actuals column at once
+# (tests/test_store.py-adjacent scratch check, not committed) -- most
+# showed 0h, but gen_hard_coal showed 10h in that single snapshot. That
+# range (0-10h in one sample) is wide enough that a short, precisely-fit
+# buffer would misrepresent how settled the underlying signal really is.
+# 24h is chosen deliberately round, not fitted: it comfortably covers the
+# one high observation with real margin, and costs nothing beyond a day's
+# apparent freshness in the manifest, since heal_recent's own
+# HEAL_LOOKBACK_DAYS=10 re-examines and backfills the same trailing window
+# on every later run regardless of what this buffer excluded today.
+LIVE_SETTLING_BUFFER: Final[pd.Timedelta] = pd.Timedelta(hours=24)
 
 
 def _infer_resolution_seconds(index: pd.DatetimeIndex) -> float | None:
@@ -527,21 +589,34 @@ def validate_source(
     period_end: pd.Timestamp,
     as_of: pd.Timestamp,
     previous: SourceManifestEntry | None = None,
+    mode: Literal["rebuild", "live"] = "rebuild",
 ) -> ValidationResult:
     """Independent input control for one row-oriented source (spec section
     2.4). Checks, in order: exact column set; a sane tz-aware UTC index
     with no duplicate timestamps; for ``grid_based`` sources whose
     ``[period_start, period_end)`` is definitely over (``as_of`` past
     ``period_end`` plus a one-day buffer), gaplessness at the
-    independently-inferred resolution; per-column NaN fraction within
-    ``[period_start, min(period_end, as_of - _NAN_CHECK_SETTLING_BUFFER))``
-    against ``expectation.max_nan_fraction`` (a shorter, separate buffer
-    than the gaplessness check above -- excludes the still-settling live
-    tail, where individual columns can lag each other by up to a couple of
-    hours, from being judged as a NaN violation), with any per-column
-    ``expectation.known_low_resolution_windows`` additionally excluded from
-    that same NaN judgment; and, if ``previous`` is given, that the covered
-    range and row count only ever grow.
+    independently-inferred resolution; per-column NaN fraction against a
+    tolerance and checked window that both depend on ``mode`` (see below);
+    and, if ``previous`` is given, that the covered range and row count
+    only ever grow.
+
+    ``mode`` picks which of this store's two real use cases is being
+    validated (A9/A10 finding, 2026-09-10 -- see LIVE_MAX_NAN_FRACTION's
+    own comment for the full reasoning): ``"rebuild"`` (the default) uses
+    ``expectation.max_nan_fraction`` as-is over the full
+    ``[period_start, period_end)`` window, sized for scripts/
+    rebuild_store.py's multi-year denominator. ``"live"`` is for scripts/
+    sync_store.py's small incremental windows: the per-column allowance
+    becomes ``max(expectation.max_nan_fraction.get(column, 0.0),
+    LIVE_MAX_NAN_FRACTION)`` (a permanent exemption like gen_nuclear's 1.0
+    is never *lowered* by the live default), and columns in
+    ``expectation.live_settling_columns`` additionally get the trailing
+    ``LIVE_SETTLING_BUFFER`` excluded from the checked window (TSO actuals
+    only -- forecasts/schedules have no live-tail dynamic to exclude).
+    ``expectation.known_low_resolution_windows`` are excluded from the NaN
+    judgment in both modes, since those are real, dated historical facts,
+    not a live-vs-rebuild distinction.
 
     Returns a result object rather than raising, so one bad source does
     not stop another source of the same run from being written (spec
@@ -597,14 +672,21 @@ def validate_source(
                             f"(inferred resolution {resolution_seconds:.0f}s)"
                         )
 
-            # Judged only up to the settling cutoff, not all the way to
-            # period_end/as_of -- see _NAN_CHECK_SETTLING_BUFFER above.
-            settled_end = min(period_end, as_of - _NAN_CHECK_SETTLING_BUFFER)
-            nan_check_period = frame[(dt_index >= period_start) & (dt_index < settled_end)]
+            nan_check_period = frame[(dt_index >= period_start) & (dt_index < period_end)]
             if len(nan_check_period):
                 for column in sorted(expectation.expected_columns):
-                    allowed = expectation.max_nan_fraction.get(column, 0.0)
+                    base_allowed = expectation.max_nan_fraction.get(column, 0.0)
+                    allowed = (
+                        max(base_allowed, LIVE_MAX_NAN_FRACTION) if mode == "live" else base_allowed
+                    )
                     column_frame = nan_check_period
+                    column_period_end = period_end
+
+                    if mode == "live" and column in expectation.live_settling_columns:
+                        column_period_end = min(period_end, as_of - LIVE_SETTLING_BUFFER)
+                        column_index = cast(pd.DatetimeIndex, column_frame.index)
+                        column_frame = column_frame[column_index < column_period_end]
+
                     window = expectation.known_low_resolution_windows.get(column)
                     if window is not None:
                         win_start = pd.Timestamp(window[0], tz="UTC")
@@ -619,8 +701,8 @@ def validate_source(
                     if nan_fraction > allowed:
                         reasons.append(
                             f"column {column!r}: NaN fraction {nan_fraction:.3f} "
-                            f"exceeds allowed {allowed:.3f} in {period_start}..{settled_end} "
-                            "(outside any known_low_resolution_windows exclusion)"
+                            f"exceeds allowed {allowed:.3f} in {period_start}..{column_period_end} "
+                            f"(mode={mode!r}, outside any known_low_resolution_windows exclusion)"
                         )
 
     if previous is not None and index_usable and index_is_utc and len(frame.index):
