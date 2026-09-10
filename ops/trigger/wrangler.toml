@@ -1,0 +1,19 @@
+name = "sbl-energy-forecast-trigger"
+main = "src/index.ts"
+compatibility_date = "2026-09-08"
+
+# One UTC entry, polling every 5 minutes -- NOT one entry per local slot
+# (spec 6.7.1 section 5.1 / section 2.1 originally called for ten: five
+# local Europe/Berlin slots x two (CET, CEST) fixed UTC times). Revised
+# during O4 rollout (docs/sprint6_step6_7_1_log.md, step A2 addendum):
+# Cloudflare Workers Free caps an account at 5 registered cron triggers,
+# discovered live when the ninth/tenth entry failed to deploy (error code
+# 10072). A poll-and-check design needs only one entry regardless of how
+# many local slots exist, because src/index.ts::SLOTS re-derives the actual
+# Europe/Berlin local time from event.scheduledTime on every tick and
+# checks it against all five slots itself -- the CET/CEST doubling served
+# no purpose once local time is recomputed per tick rather than encoded as
+# a fixed UTC cron string. 288 invocations/day, far under the separate
+# 100k/day Workers Free invocation quota.
+[triggers]
+crons = ["*/5 * * * *"]

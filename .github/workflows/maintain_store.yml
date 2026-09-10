@@ -1,0 +1,84 @@
+name: Maintain data store
+
+on:
+  # workflow_dispatch only (spec 6.7.1, section 3.2/5.1) -- no schedule:
+  # block. GitHub's own schedule trigger measured a median dispatch delay
+  # of +242min (max +693min, docs/cron_jobs.md section 2); the external
+  # trigger under ops/trigger/ is the sole timekeeper for this workflow,
+  # calling this exact dispatch endpoint from well-timed local slots
+  # (10:10 and 11:05 Europe/Berlin).
+  workflow_dispatch: {}
+
+concurrency:
+  # Two overlapping maintenance runs must never write the store at the same
+  # time (spec section 2.2, "Auflage" -- last-write-wins would silently
+  # lose one run's work, and that failure mode is invisible in every metric
+  # this project measures). cancel-in-progress: false, not true: a
+  # cancelled-mid-write run would be worse than a queued one.
+  group: maintain-store
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  maintain:
+    runs-on: ubuntu-latest
+    # A full ENTSO-E gap fetch across six fetch groups plus commodities and
+    # one weather run is normally a handful of minutes; generous headroom
+    # without being audit.yml's old 360-min default (same reasoning as
+    # audit.yml's own timeout-minutes, CLAUDE.md "Provenance" section).
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --all-extras --dev
+
+      # ENTSOE_API_KEY for the six ENTSO-E fetch groups; GITHUB_TOKEN
+      # (built-in, permissions: contents: write above) for release assets
+      # and the log commit below -- no new secret (spec section 3.4).
+      - name: Sync the data store
+        env:
+          ENTSOE_API_KEY: ${{ secrets.ENTSOE_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: uv run python scripts/sync_store.py
+
+      # Same push discipline as audit.yml/weather_availability_probe.yml
+      # (spec section 3.1 point 4): a maintenance run that measures and
+      # then discards its own log is worse than none.
+      - name: Commit and push the sync log
+        if: always()
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add logs/store_sync.csv
+
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "data: store sync run $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          for attempt in 1 2 3; do
+            if git push; then
+              echo "Push succeeded on attempt $attempt."
+              exit 0
+            fi
+            echo "Push failed (attempt $attempt/3); pulling --rebase and retrying."
+            git pull --rebase
+          done
+
+          echo "::error::Push failed after 3 attempts -- sync log was computed but not saved."
+          exit 1

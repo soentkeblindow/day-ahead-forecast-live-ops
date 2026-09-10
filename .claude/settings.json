@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv run pyright)",
+      "Bash(uv run pyright *)",
+      "Bash(uv run python -m pytest *)",
+      "Bash(.venv/Scripts/python.exe -m pytest *)",
+      "Bash(.venv\\Scripts\\python.exe -m pytest *)",
+      "Bash(uv run python -m ruff check *)",
+      "Bash(.venv/Scripts/python.exe -m mypy *)",
+      "Bash(.venv\\Scripts\\python.exe -m mypy *)",
+      "Bash(uv run python -m ruff format --check*)",
+      "Bash(.venv/Scripts/python.exe -m ruff check *)",
+      "Bash(.venv\\Scripts\\python.exe -m ruff check *)",
+      "Bash(.venv/Scripts/python.exe -m ruff format --check*)",
+      "Bash(.venv\\Scripts\\python.exe -m ruff format --check*)",
+      "Bash(uv run python -m mypy *)",
+      "Bash(git check-ignore *)",
+      "Bash(git fetch *)",
+      "Bash(uv tool run pyright*)"
+    ]
+  }
+}

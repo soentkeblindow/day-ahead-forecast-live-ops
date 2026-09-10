@@ -249,3 +249,18 @@ scratch/
 .DS_Store
 Thumbs.db
 
+# ops/trigger (Cloudflare Worker, npm/wrangler) -- node_modules and the
+# local wrangler dev cache are build/dev artifacts; .dev.vars is where
+# wrangler dev reads local secrets (e.g. GITHUB_DISPATCH_TOKEN) from and
+# must never be committed (README.md "What must never live in this repo").
+ops/trigger/node_modules/
+ops/trigger/.wrangler/
+ops/trigger/.dev.vars
+ops/trigger/.dev.vars.*
+
+# Claude Code project settings: settings.json is shared tooling config
+# (test/lint/typecheck permission allowlist), settings.local.json is
+# personal and can reference session-specific paths (e.g. a scratchpad
+# script under a session temp dir) that won't exist in a future session.
+.claude/settings.local.json
+
