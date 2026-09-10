@@ -264,3 +264,10 @@ ops/trigger/.dev.vars.*
 # script under a session temp dir) that won't exist in a future session.
 .claude/settings.local.json
 
+# store.load_store() unpacks the published store's manifest.json directly
+# at the repo root (root == workdir, ops/store.py's own convention) -- a
+# local artefact of running sync_store.py/rebuild_store.py or a probe
+# script, never meant to be committed (the real manifest lives inside the
+# packed tar on GitHub Releases).
+/manifest.json
+
