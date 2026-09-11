@@ -414,8 +414,29 @@ def _write_log_row(
 
     frame = pd.DataFrame([row])
     STORE_SYNC_LOG.parent.mkdir(parents=True, exist_ok=True)
-    write_header = not STORE_SYNC_LOG.exists()
-    frame.to_csv(STORE_SYNC_LOG, mode="a", header=write_header, index=False)
+
+    if not STORE_SYNC_LOG.exists():
+        frame.to_csv(STORE_SYNC_LOG, index=False)
+        return
+
+    existing = pd.read_csv(STORE_SYNC_LOG)
+    if list(existing.columns) == list(frame.columns):
+        frame.to_csv(STORE_SYNC_LOG, mode="a", header=False, index=False)
+        return
+
+    # The column set grows whenever RunLog.sources covers a source name
+    # never seen before, or a new per-source field is added (real incident,
+    # 2026-09-11: adding SourceLogRow.hints left the file's existing header
+    # at its old, narrower width while the next row was written with more
+    # fields than that header declared -- unparseable, pd.read_csv raised
+    # ParserError. A plain mode="a" append can never fix this on its own,
+    # since it never looks at what's already in the file.) Rewrite with the
+    # union of old and new columns instead of silently appending a
+    # mismatched row -- old rows get "" for a column they predate.
+    union_columns = list(dict.fromkeys([*existing.columns, *frame.columns]))
+    existing = existing.reindex(columns=union_columns)
+    frame = frame.reindex(columns=union_columns)
+    pd.concat([existing, frame], ignore_index=True).to_csv(STORE_SYNC_LOG, index=False)
 
 
 def main() -> int:
