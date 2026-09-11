@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import tarfile
 import tempfile
 from collections.abc import Callable, Iterable
@@ -51,9 +52,16 @@ from typing import Any, Final, Literal, cast
 import pandas as pd
 
 from energy_price_forecast.data.entsoe_client import NEIGHBORS
-from energy_price_forecast.data.weather_grid import HOURLY_VARIABLES, expected_columns
+from energy_price_forecast.data.weather_grid import (
+    HOURLY_VARIABLES,
+    KNOWN_WEATHER_DEFECTS,
+    KnownWeatherDefectCategory,
+    expected_columns,
+)
 from energy_price_forecast.ops import release_assets
 from energy_price_forecast.ops.release_assets import AssetRef
+
+logger = logging.getLogger(__name__)
 
 STORE_RELEASE_TAG: Final[str] = "data-store"
 STORE_FORMAT_VERSION: Final[int] = 1
@@ -1027,24 +1035,72 @@ def validate_historical_weather_runs(
     should block packing weather entirely for this run, not be papered
     over. Returns (None, reasons) if any file fails or none exist; the
     caller decides what a None entry means for the overall run (mirrors
-    validate_source/write_if_valid's own split of concerns).
+    validate_source/write_if_valid's own split of concerns). A known-bad
+    file that shows up again is never waved through here -- KNOWN_WEATHER_
+    DEFECTS (data/weather_grid.py) only changes how a finding is reported
+    below, never whether it is checked (docs/sprint6_auftrag_known_data_
+    defects.md §3: "Eine als korrupt bekannte Datei ... muss weiterhin an
+    validate_weather_run() scheitern").
+
+    Also logs an inventory report distinguishing calendar days in range,
+    present/usable run files, known-defective days (by category), and any
+    NEWLY missing or corrupt day -- named individually, never folded into a
+    count, so a real new provider gap is never silently absorbed into the
+    known list's numbers (docs/sprint6_auftrag_known_data_defects.md §2).
     """
     paths = _matched_paths(root, ("weather_single_runs",))
     if not paths:
         return None, ("no cached weather run files found",)
 
     run_inits: list[pd.Timestamp] = []
+    present_inits: set[pd.Timestamp] = set()
     for rel_path in paths:
         df = pd.read_parquet(root / rel_path)
         result = validate_weather_run(df)
-        if not result.ok:
-            return None, (f"{rel_path}: {'; '.join(result.reasons)}",)
         # Filename is "{YYYY-MM-DD}THHZ.parquet" (data/_weather_cache.py::
-        # cache_path) -- the run's own init time, not read from file content
+        # cache_path) -- the run's own init date, not read from file content
         # since HOURLY_VARIABLES columns hold forecast valid-times, not the
-        # run init itself.
+        # run init itself. This IS the KNOWN_WEATHER_DEFECTS key space
+        # already (both are run-init timestamps) -- no delivery-day shift
+        # needed here, unlike a caller that reports by delivery day.
         date_part, hour_part = rel_path.stem.split("T")
-        run_inits.append(pd.Timestamp(f"{date_part}T{hour_part.rstrip('Z')}:00:00", tz="UTC"))
+        run_init = pd.Timestamp(f"{date_part}T{hour_part.rstrip('Z')}:00:00", tz="UTC")
+        if not result.ok:
+            defect = KNOWN_WEATHER_DEFECTS.get(run_init)
+            if defect is None or defect.category != KnownWeatherDefectCategory.PROVIDER_CORRUPT:
+                logger.warning(
+                    "New weather defect, not in KNOWN_WEATHER_DEFECTS: %s (%s)",
+                    run_init.date(),
+                    "; ".join(result.reasons),
+                )
+            return None, (f"{rel_path}: {'; '.join(result.reasons)}",)
+        run_inits.append(run_init)
+        present_inits.add(run_init.normalize())
+
+    calendar_days = pd.date_range(min(run_inits).normalize(), max(run_inits).normalize(), freq="D")
+    missing_days = [d for d in calendar_days if d not in present_inits]
+    # A missing day here means "no file present" -- true both for a
+    # PROVIDER_UNAVAILABLE day (never had one) and a PROVIDER_CORRUPT day
+    # (had one, physically removed in 6.7.1 A9 once found bad); this scan
+    # cannot and need not distinguish the two, so either category explains
+    # an absence (confirmed: without this, the two known-corrupt days'
+    # already-deleted files showed up here as unexplained "new" misses).
+    known_missing = [d for d in missing_days if d in KNOWN_WEATHER_DEFECTS]
+    new_missing = [d for d in missing_days if d not in known_missing]
+    if new_missing:
+        logger.warning(
+            "New missing weather run(s), not in KNOWN_WEATHER_DEFECTS: %s",
+            [d.date().isoformat() for d in new_missing],
+        )
+    logger.info(
+        "Weather run inventory: %d calendar day(s) in range, %d present, %d usable, "
+        "%d known-defective (missing, either category), %d newly missing",
+        len(calendar_days),
+        len(present_inits),
+        len(run_inits),
+        len(known_missing),
+        len(new_missing),
+    )
 
     return (
         SourceManifestEntry(

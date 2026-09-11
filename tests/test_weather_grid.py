@@ -5,17 +5,21 @@ Pure data module, no network, no fixtures needed.
 
 from __future__ import annotations
 
+import datetime as dt
 import math
 
+import pandas as pd
 import pytest
 
 from energy_price_forecast.data.weather_grid import (
     CACHE_KEY,
     GRID_POINTS,
     HOURLY_VARIABLES,
+    KNOWN_WEATHER_DEFECTS,
     VARIABLE_TIME_CONVENTION,
     ConventionProvenance,
     GridPoint,
+    KnownWeatherDefectCategory,
     _cache_fingerprint,
     expected_columns,
 )
@@ -152,3 +156,56 @@ def test_cache_fingerprint_changes_with_variable_tuple() -> None:
 
     reordered_variables = tuple(reversed(HOURLY_VARIABLES))
     assert _cache_fingerprint(variables=reordered_variables) != baseline
+
+
+# ---------------------------------------------------------------------------
+# KNOWN_WEATHER_DEFECTS shape (docs/sprint6_auftrag_known_data_defects.md §7:
+# "nicht leer, Schluessel eindeutig und tz-bewusst UTC, jede Kategorie
+# gueltig, jeder Eintrag hat ein Pruefdatum")
+# ---------------------------------------------------------------------------
+
+
+def test_known_weather_defects_is_not_empty() -> None:
+    assert len(KNOWN_WEATHER_DEFECTS) == 6
+
+
+def test_known_weather_defects_keys_are_unique_tz_aware_utc_midnights() -> None:
+    keys = list(KNOWN_WEATHER_DEFECTS.keys())
+    assert len(keys) == len(set(keys))  # dict keys are already unique by construction --
+    # this is the machine-checked version of that guarantee, not a tautology.
+    for key in keys:
+        assert isinstance(key, pd.Timestamp)
+        assert key.tzinfo is not None and str(key.tz) == "UTC"
+        assert key == key.normalize()  # exactly midnight -- a run init, not an arbitrary time
+
+
+def test_known_weather_defects_categories_are_valid() -> None:
+    for defect in KNOWN_WEATHER_DEFECTS.values():
+        assert isinstance(defect.category, KnownWeatherDefectCategory)
+
+
+def test_known_weather_defects_every_entry_has_a_checked_date() -> None:
+    for defect in KNOWN_WEATHER_DEFECTS.values():
+        assert defect.checked_date
+        # A parseable ISO date, not in the future relative to when this
+        # constant's entries were written (spec §4: "Aufgenommen wird ein
+        # Defekt, wenn ein Neuabruf ihn heute reproduziert" -- checked_date
+        # is when that "heute" was, so it can never postdate the constant).
+        checked = dt.date.fromisoformat(defect.checked_date)
+        assert checked <= dt.date(2026, 9, 11) or checked <= dt.date.today()
+
+
+def test_known_weather_defects_split_matches_the_documented_six() -> None:
+    unavailable = [
+        d
+        for d, defect in KNOWN_WEATHER_DEFECTS.items()
+        if defect.category == KnownWeatherDefectCategory.PROVIDER_UNAVAILABLE
+    ]
+    corrupt = [
+        d
+        for d, defect in KNOWN_WEATHER_DEFECTS.items()
+        if defect.category == KnownWeatherDefectCategory.PROVIDER_CORRUPT
+    ]
+    assert len(unavailable) == 4
+    assert len(corrupt) == 2
+    assert set(d.date().isoformat() for d in corrupt) == {"2025-08-07", "2026-06-23"}

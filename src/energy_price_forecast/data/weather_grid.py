@@ -20,6 +20,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Final, Literal
 
+import pandas as pd
+
 GRID_VERSION: Final[str] = "grid_v1"
 
 
@@ -162,3 +164,91 @@ def expected_columns() -> tuple[str, ...]:
     return tuple(
         f"{point.point_id}__{variable}" for point in GRID_POINTS for variable in HOURLY_VARIABLES
     )
+
+
+class KnownWeatherDefectCategory(StrEnum):
+    """Two, and the distinction is not cosmetic (docs/sprint6_auftrag_known_data_defects.md, §2).
+
+    PROVIDER_UNAVAILABLE: a real refetch returns ``WeatherRunUnavailable``
+    (Open-Meteo's own ``modelRunUnavailable`` reason) -- no file was ever
+    written for this run. Archives are occasionally backfilled, so this
+    category could in principle close on its own; that is exactly why every
+    entry must be re-verified before being trusted (see KNOWN_WEATHER_DEFECTS'
+    own docstring).
+
+    PROVIDER_CORRUPT: HTTP 200, but the response is near-total NaN across
+    most non-radiation variables (real, reproducible measurement -- not
+    every variable is NaN, but enough are that the run is unusable; see
+    validate_weather_run()). Very unlikely to self-correct.
+    """
+
+    PROVIDER_UNAVAILABLE = "provider_unavailable"
+    PROVIDER_CORRUPT = "provider_corrupt"
+
+
+@dataclass(frozen=True)
+class KnownWeatherDefect:
+    category: KnownWeatherDefectCategory
+    checked_date: str  # ISO date -- when this entry was last confirmed by a real refetch
+    note: str
+
+
+# Keys are the 00 UTC RUN INITIALISATION time, NOT the delivery day --
+# run_init_for_target_day(D) uses the 00 UTC run of D-1, so a defect keyed
+# 2026-06-23T00:00 UTC here affects delivery day 2026-06-24, one calendar
+# day later. A caller indexing by delivery day must shift by one. This
+# project has hit four real off-by-one/DST bugs around exactly this kind of
+# date arithmetic this sprint (docs/sprint6_auftrag_known_data_defects.md,
+# §2) -- this is the next likely candidate, so it is spelled out here
+# rather than left implicit.
+#
+# Every entry was re-verified by a real fetch_run(..., use_cache=False) call
+# on the date in ``checked_date``, not carried forward from an old finding
+# (docs/sprint6_auftrag_known_data_defects.md, §4: "Aufgenommen wird ein
+# Defekt, wenn ein Neuabruf ihn heute reproduziert."). All six re-verified
+# 2026-09-11: the four PROVIDER_UNAVAILABLE runs still raise
+# WeatherRunUnavailable; the two PROVIDER_CORRUPT runs still return HTTP 200
+# with 100% NaN in several non-radiation variables (e.g. 2025-08-07:
+# wind_speed_100m/temperature_2m/surface_pressure/cloud_cover all 1.0,
+# wind_speed_10m/cloud_cover_low 0.0 -- the failure is real but partial by
+# variable, which is exactly why validate_weather_run()'s per-variable check
+# (any non-radiation variable with any NaN fails the whole run) is what
+# actually catches it, not a single aggregate threshold).
+KNOWN_WEATHER_DEFECTS: Final[dict[pd.Timestamp, KnownWeatherDefect]] = {
+    pd.Timestamp("2025-08-05", tz="UTC"): KnownWeatherDefect(
+        category=KnownWeatherDefectCategory.PROVIDER_UNAVAILABLE,
+        checked_date="2026-09-11",
+        note="First noticed in 6.5.1's bulk fetch (896/900 calendar days), confirmed in 6.7.1 A9.",
+    ),
+    pd.Timestamp("2025-08-06", tz="UTC"): KnownWeatherDefect(
+        category=KnownWeatherDefectCategory.PROVIDER_UNAVAILABLE,
+        checked_date="2026-09-11",
+        note="First noticed in 6.5.1's bulk fetch (896/900 calendar days), confirmed in 6.7.1 A9.",
+    ),
+    pd.Timestamp("2025-08-08", tz="UTC"): KnownWeatherDefect(
+        category=KnownWeatherDefectCategory.PROVIDER_UNAVAILABLE,
+        checked_date="2026-09-11",
+        note="First noticed in 6.5.1's bulk fetch (896/900 calendar days), confirmed in 6.7.1 A9.",
+    ),
+    pd.Timestamp("2025-08-09", tz="UTC"): KnownWeatherDefect(
+        category=KnownWeatherDefectCategory.PROVIDER_UNAVAILABLE,
+        checked_date="2026-09-11",
+        note="First noticed in 6.5.1's bulk fetch (896/900 calendar days), confirmed in 6.7.1 A9.",
+    ),
+    pd.Timestamp("2025-08-07", tz="UTC"): KnownWeatherDefect(
+        category=KnownWeatherDefectCategory.PROVIDER_CORRUPT,
+        checked_date="2026-09-11",
+        note=(
+            "Found and reproduced by a real refetch in 6.7.1 A9; the cached file was "
+            "physically removed there. Affects delivery day 2025-08-08."
+        ),
+    ),
+    pd.Timestamp("2026-06-23", tz="UTC"): KnownWeatherDefect(
+        category=KnownWeatherDefectCategory.PROVIDER_CORRUPT,
+        checked_date="2026-09-11",
+        note=(
+            "Found and reproduced by a real refetch in 6.7.1 A9; the cached file was "
+            "physically removed there. Affects delivery day 2026-06-24."
+        ),
+    ),
+}

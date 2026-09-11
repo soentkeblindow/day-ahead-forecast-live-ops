@@ -28,6 +28,10 @@ import pandas as pd
 
 from energy_price_forecast.data._weather_cache import cache_path, read_cached_run
 from energy_price_forecast.data.weather_client import WeatherRunUnavailable, fetch_run
+from energy_price_forecast.data.weather_grid import (
+    KNOWN_WEATHER_DEFECTS,
+    KnownWeatherDefectCategory,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -126,7 +130,14 @@ def main() -> int:
     if missing:
         logger.warning("Gap report: %d of %d calendar days have no run:", len(missing), len(runs))
         for run in missing:
-            logger.warning("  missing: %s", run.date())
+            defect = KNOWN_WEATHER_DEFECTS.get(run)
+            if (
+                defect is not None
+                and defect.category == KnownWeatherDefectCategory.PROVIDER_UNAVAILABLE
+            ):
+                logger.warning("  missing (known, checked %s): %s", defect.checked_date, run.date())
+            else:
+                logger.warning("  missing (NEW, not in KNOWN_WEATHER_DEFECTS): %s", run.date())
     else:
         logger.info("Gap report: no missing days.")
 
