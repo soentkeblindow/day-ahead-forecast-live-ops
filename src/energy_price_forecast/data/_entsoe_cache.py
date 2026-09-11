@@ -1,4 +1,6 @@
 import logging
+import os
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 
@@ -78,8 +80,42 @@ def _read_parquet(path: Path) -> pd.DataFrame:
 
 
 def _write_parquet(df: pd.DataFrame, path: Path) -> None:
+    """Write df to path atomically: temp file in the same directory, then
+    os.replace (atomic on Windows too). 6.7.1a: now that a write can follow
+    a read-merge (see _merge_and_write below), a crash mid-write must not
+    leave a half-written file that looks like a completed month on the next
+    run -- mirrors data/_weather_cache.py::write_cached_run's existing
+    pattern for the same reason.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(path, compression="snappy")
+    tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    df.to_parquet(tmp_path, compression="snappy")
+    os.replace(tmp_path, path)
+
+
+def _merge_and_write(fresh: pd.DataFrame, path: Path) -> pd.DataFrame:
+    """Merge fresh into whatever is already on disk at path, then write the
+    result back atomically (6.7.1a, spec section 5.2).
+
+    Existing values win; fresh only fills cells the existing file doesn't
+    have and appends new rows (pandas combine_first, the same primitive
+    ops/store.py::heal_recent already uses for an identical reason). Before
+    this, the open month -- never a cache hit by construction, since
+    _is_complete_month requires a closed month -- was fully REPLACED on
+    every maintenance run: a value ENTSO-E revised to NaN was lost, and once
+    the month closed that loss froze permanently (the shape of the
+    2026-09-06 incident). The returned frame is exactly what was written, so
+    a caller can never observe a value the store does not hold.
+    """
+    if path.exists():
+        existing = _read_parquet(path)
+        merged = existing.combine_first(fresh)
+        if len(existing.columns):
+            merged = merged[existing.columns]
+    else:
+        merged = fresh
+    _write_parquet(merged, path)
+    return merged
 
 
 def cached_fetch(
@@ -88,7 +124,17 @@ def cached_fetch(
     cache_dir: Path,
     file_prefix: str,
     fetch_fn: Callable[[pd.Timestamp, pd.Timestamp], pd.DataFrame],
+    *,
+    use_cache: bool = True,
 ) -> pd.DataFrame:
+    """...
+
+    ``use_cache=False`` skips the cache READ for every month in range and
+    always queries the API. The cache WRITE still happens, with fill
+    semantics (see _merge_and_write) -- that is what makes
+    ops/store.py::heal_recent's refetch actually persist instead of living
+    only in the frame it returns (6.7.1a, spec section 5.2).
+    """
     start = _to_utc(start)
     end = _to_utc(end)
 
@@ -97,7 +143,7 @@ def cached_fetch(
         path = _cache_filepath(cache_dir, file_prefix, year, month)
 
         cached_df: pd.DataFrame | None = None
-        if path.exists() and _is_complete_month(year, month):
+        if use_cache and path.exists() and _is_complete_month(year, month):
             candidate = _read_parquet(path)
             if _is_sufficiently_complete(candidate, year, month):
                 logger.info("Cache hit: %s", path.name)
@@ -116,7 +162,7 @@ def cached_fetch(
             month_start, month_end = _month_bounds(year, month)
             df = fetch_fn(month_start, month_end)
             if not df.empty:
-                _write_parquet(df, path)
+                df = _merge_and_write(df, path)
             chunks.append(df)
 
     non_empty = [c for c in chunks if not c.empty]

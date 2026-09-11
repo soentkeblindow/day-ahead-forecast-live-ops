@@ -16,6 +16,7 @@ import requests
 from entsoe.exceptions import NoMatchingDataError
 from freezegun import freeze_time
 
+from energy_price_forecast.data import _entsoe_cache
 from energy_price_forecast.data._entsoe_retry import EntsoeFetchError
 from energy_price_forecast.data.entsoe_client import (
     _GEN_COLUMNS,
@@ -217,6 +218,129 @@ def test_incomplete_cache_triggers_refetch(client_mock: MagicMock, cache_root: P
 
     client_mock.query_day_ahead_prices.assert_called_once()
     assert len(result) == 744
+
+
+# ---------------------------------------------------------------------------
+# 6.7.1a: use_cache parameter and fill semantics (spec section 5.1/5.2/7)
+# ---------------------------------------------------------------------------
+
+
+def test_use_cache_default_true_still_reads_cache(client_mock: MagicMock, cache_root: Path) -> None:
+    """Additivity check (spec section 3.7): a caller that never passes
+    use_cache at all must see byte-for-byte the same cache-hit behavior as
+    before this spec -- test_cache_hit above already proves this
+    implicitly; this makes the guarantee explicit for the new parameter."""
+    _write_month_cache(cache_root, "DE_LU_2022-01.parquet", _make_series("2022-01-01", 744))
+
+    result = fetch_day_ahead_prices(
+        pd.Timestamp("2022-01-01", tz="UTC"),
+        pd.Timestamp("2022-01-31 23:00", tz="UTC"),
+        use_cache=True,
+    )
+
+    client_mock.query_day_ahead_prices.assert_not_called()
+    assert len(result) == 744
+
+
+def test_use_cache_false_skips_the_read_even_for_a_complete_cached_month(
+    client_mock: MagicMock, cache_root: Path
+) -> None:
+    _write_month_cache(cache_root, "DE_LU_2022-01.parquet", _make_series("2022-01-01", 744))
+    client_mock.query_day_ahead_prices.return_value = _make_series("2022-01-01", 744)
+
+    fetch_day_ahead_prices(
+        pd.Timestamp("2022-01-01", tz="UTC"),
+        pd.Timestamp("2022-01-31 23:00", tz="UTC"),
+        use_cache=False,
+    )
+
+    client_mock.query_day_ahead_prices.assert_called_once()
+
+
+def test_fill_semantics_preserves_an_existing_value_revised_to_nan(
+    client_mock: MagicMock, cache_root: Path
+) -> None:
+    """spec 6.7.1a section 5.2: a fresh response with NaN where the cache
+    already has a real value must not erase that value -- the exact shape
+    of the 2026-09-06 incident (a fully-replacing write on the open
+    month)."""
+    idx = pd.date_range("2022-01-01", periods=3, freq="h", tz="UTC")
+    existing = pd.Series([10.0, 20.0, 30.0], index=idx)
+    _write_month_cache(cache_root, "DE_LU_2022-01.parquet", existing)
+
+    revised = pd.Series([10.0, float("nan"), 30.0], index=idx)
+    client_mock.query_day_ahead_prices.return_value = revised
+
+    result = fetch_day_ahead_prices(
+        pd.Timestamp("2022-01-01", tz="UTC"),
+        pd.Timestamp("2022-01-01T02:00", tz="UTC"),
+        use_cache=False,
+    )
+
+    assert list(result["day_ahead_price"]) == [10.0, 20.0, 30.0]
+    on_disk = pd.read_parquet(cache_root / "entsoe" / "day_ahead_prices" / "DE_LU_2022-01.parquet")
+    assert list(on_disk["day_ahead_price"]) == [10.0, 20.0, 30.0]
+
+
+def test_fill_semantics_fills_a_gap_and_appends_new_rows(
+    client_mock: MagicMock, cache_root: Path
+) -> None:
+    idx_existing = pd.date_range("2022-01-01", periods=2, freq="h", tz="UTC")
+    existing = pd.Series([10.0, float("nan")], index=idx_existing)  # hour 1 missing
+    _write_month_cache(cache_root, "DE_LU_2022-01.parquet", existing)
+
+    idx_fresh = pd.date_range("2022-01-01", periods=4, freq="h", tz="UTC")  # 2 new hours too
+    fresh = pd.Series([999.0, 20.0, 30.0, 40.0], index=idx_fresh)  # hour 0 would-be overwrite
+    client_mock.query_day_ahead_prices.return_value = fresh
+
+    result = fetch_day_ahead_prices(
+        pd.Timestamp("2022-01-01", tz="UTC"),
+        pd.Timestamp("2022-01-01T03:00", tz="UTC"),
+        use_cache=False,
+    )
+
+    assert list(result["day_ahead_price"]) == [10.0, 20.0, 30.0, 40.0]  # hour 0 NOT overwritten
+
+
+def test_written_file_and_returned_frame_are_identical(
+    client_mock: MagicMock, cache_root: Path
+) -> None:
+    idx = pd.date_range("2022-01-01", periods=2, freq="h", tz="UTC")
+    _write_month_cache(
+        cache_root, "DE_LU_2022-01.parquet", pd.Series([1.0, float("nan")], index=idx)
+    )
+    client_mock.query_day_ahead_prices.return_value = pd.Series([1.0, 2.0], index=idx)
+
+    result = fetch_day_ahead_prices(
+        pd.Timestamp("2022-01-01", tz="UTC"),
+        pd.Timestamp("2022-01-01T01:00", tz="UTC"),
+        use_cache=False,
+    )
+
+    on_disk = pd.read_parquet(cache_root / "entsoe" / "day_ahead_prices" / "DE_LU_2022-01.parquet")
+    pd.testing.assert_frame_equal(result, on_disk)
+
+
+def test_cache_write_is_atomic(tmp_path: Path) -> None:
+    """A crash mid-write must leave the previous file untouched, not a
+    half-written one at the real path (spec 6.7.1a section 5.2, mirrors
+    data/_weather_cache.py::write_cached_run's existing guarantee)."""
+    path = tmp_path / "some_source_2022-01.parquet"
+    idx = pd.date_range("2022-01-01", periods=2, freq="h", tz="UTC")
+    original = pd.DataFrame({"day_ahead_price": [1.0, 2.0]}, index=idx)
+    original.to_parquet(path, compression="snappy")
+
+    with (
+        patch.object(pd.DataFrame, "to_parquet", side_effect=OSError("simulated crash")),
+        pytest.raises(OSError, match="simulated crash"),
+    ):
+        _entsoe_cache._merge_and_write(
+            pd.DataFrame({"day_ahead_price": [3.0, 4.0]}, index=idx), path
+        )
+
+    restored = pd.read_parquet(path)
+    assert list(restored["day_ahead_price"]) == [1.0, 2.0]  # untouched, not half-written
+    assert list(path.parent.glob(".*.tmp")) == []  # no leftover temp file
 
 
 # ---------------------------------------------------------------------------

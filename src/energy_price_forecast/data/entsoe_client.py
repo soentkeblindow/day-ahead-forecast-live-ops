@@ -90,7 +90,19 @@ def fetch_day_ahead_prices(
     start: pd.Timestamp,
     end: pd.Timestamp,
     area: str = AREA_DE_LU,
+    *,
+    use_cache: bool = True,
 ) -> pd.DataFrame:
+    """...
+
+    ``use_cache=False`` skips the cache READ and always queries the API.
+    The cache WRITE still happens, with fill semantics (see
+    _entsoe_cache.cached_fetch) -- that is what makes a heal actually
+    persist instead of living only in the returned frame (6.7.1a).
+
+    Mirrors weather_client.fetch_run's long-standing ``use_cache`` flag
+    (6.5.1); the ENTSO-E client simply never had the equivalent.
+    """
     cache_dir = DATA_RAW / "entsoe" / "day_ahead_prices"
 
     def fetch_fn(s: pd.Timestamp, e: pd.Timestamp) -> pd.DataFrame:
@@ -102,14 +114,17 @@ def fetch_day_ahead_prices(
             return pd.DataFrame(columns=["day_ahead_price"])
         return series.tz_convert("UTC").rename("day_ahead_price").to_frame()
 
-    return cached_fetch(start, end, cache_dir, area, fetch_fn)
+    return cached_fetch(start, end, cache_dir, area, fetch_fn, use_cache=use_cache)
 
 
 def fetch_load(
     start: pd.Timestamp,
     end: pd.Timestamp,
     area: str = AREA_DE_LU,
+    *,
+    use_cache: bool = True,
 ) -> pd.DataFrame:
+    """See fetch_day_ahead_prices for the ``use_cache`` contract (6.7.1a)."""
     cache_dir = DATA_RAW / "entsoe" / "load"
     _columns = ["load_actual", "load_forecast_day_ahead"]
 
@@ -153,14 +168,17 @@ def fetch_load(
 
         return pd.concat([actual, forecast], axis=1)
 
-    return cached_fetch(start, end, cache_dir, area, fetch_fn)
+    return cached_fetch(start, end, cache_dir, area, fetch_fn, use_cache=use_cache)
 
 
 def fetch_wind_solar_forecast(
     start: pd.Timestamp,
     end: pd.Timestamp,
     area: str = AREA_DE_LU,
+    *,
+    use_cache: bool = True,
 ) -> pd.DataFrame:
+    """See fetch_day_ahead_prices for the ``use_cache`` contract (6.7.1a)."""
     cache_dir = DATA_RAW / "entsoe" / "wind_solar"
 
     def fetch_fn(s: pd.Timestamp, e: pd.Timestamp) -> pd.DataFrame:
@@ -188,14 +206,17 @@ def fetch_wind_solar_forecast(
             return pd.DataFrame(columns=_WIND_SOLAR_COLUMNS)
         return pd.concat(parts, axis=1)
 
-    return cached_fetch(start, end, cache_dir, area, fetch_fn)
+    return cached_fetch(start, end, cache_dir, area, fetch_fn, use_cache=use_cache)
 
 
 def fetch_generation_by_type(
     start: pd.Timestamp,
     end: pd.Timestamp,
     area: str = AREA_DE_LU,
+    *,
+    use_cache: bool = True,
 ) -> pd.DataFrame:
+    """See fetch_day_ahead_prices for the ``use_cache`` contract (6.7.1a)."""
     cache_dir = DATA_RAW / "entsoe" / "generation"
 
     def fetch_fn(s: pd.Timestamp, e: pd.Timestamp) -> pd.DataFrame:
@@ -235,7 +256,7 @@ def fetch_generation_by_type(
             return pd.DataFrame(columns=_GEN_COLUMNS)
         return pd.DataFrame(result)
 
-    return cached_fetch(start, end, cache_dir, area, fetch_fn)
+    return cached_fetch(start, end, cache_dir, area, fetch_fn, use_cache=use_cache)
 
 
 def _build_neighbor_fetch_fn(
@@ -271,12 +292,17 @@ def _fetch_border_flows(
     cache_subdir: str,
     col_prefix: str,
     query_fn: Callable[[str, str, pd.Timestamp, pd.Timestamp], pd.Series],
+    *,
+    use_cache: bool = True,
 ) -> pd.DataFrame:
     """Shared loop logic for scheduled_exchanges and cross_border_flows.
 
     For each neighbor, calls query_fn in both directions and caches the resulting
     net-flow Series (positive = export from area to neighbor) as a single-column
     Parquet. The six per-neighbor DataFrames are concatenated column-wise.
+
+    ``use_cache`` is threaded through to every per-neighbor cached_fetch call
+    (6.7.1a) -- see fetch_day_ahead_prices for the contract.
     """
     cache_dir = DATA_RAW / "entsoe" / cache_subdir
     neighbor_frames: list[pd.DataFrame] = []
@@ -285,7 +311,9 @@ def _fetch_border_flows(
         col_name = f"{col_prefix}_de_to_{neighbor.lower()}"
         file_prefix = f"{area}_{neighbor}"
         fetch_fn = _build_neighbor_fetch_fn(area, neighbor, col_name, cache_subdir, query_fn)
-        neighbor_frames.append(cached_fetch(start, end, cache_dir, file_prefix, fetch_fn))
+        neighbor_frames.append(
+            cached_fetch(start, end, cache_dir, file_prefix, fetch_fn, use_cache=use_cache)
+        )
 
     if not neighbor_frames:
         return pd.DataFrame()
@@ -296,19 +324,31 @@ def fetch_scheduled_exchanges(
     start: pd.Timestamp,
     end: pd.Timestamp,
     area: str = AREA_DE_LU,
+    *,
+    use_cache: bool = True,
 ) -> pd.DataFrame:
+    """See fetch_day_ahead_prices for the ``use_cache`` contract (6.7.1a)."""
+
     def query_pair(from_a: str, to_a: str, s: pd.Timestamp, e: pd.Timestamp) -> pd.Series:
         return _get_client().query_scheduled_exchanges(from_a, to_a, start=s, end=e, dayahead=True)
 
-    return _fetch_border_flows(start, end, area, "scheduled_exchanges", "scheduled_net", query_pair)
+    return _fetch_border_flows(
+        start, end, area, "scheduled_exchanges", "scheduled_net", query_pair, use_cache=use_cache
+    )
 
 
 def fetch_cross_border_flows(
     start: pd.Timestamp,
     end: pd.Timestamp,
     area: str = AREA_DE_LU,
+    *,
+    use_cache: bool = True,
 ) -> pd.DataFrame:
+    """See fetch_day_ahead_prices for the ``use_cache`` contract (6.7.1a)."""
+
     def query_pair(from_a: str, to_a: str, s: pd.Timestamp, e: pd.Timestamp) -> pd.Series:
         return _get_client().query_crossborder_flows(from_a, to_a, start=s, end=e)
 
-    return _fetch_border_flows(start, end, area, "cross_border_flows", "physical_net", query_pair)
+    return _fetch_border_flows(
+        start, end, area, "cross_border_flows", "physical_net", query_pair, use_cache=use_cache
+    )

@@ -44,6 +44,7 @@ from energy_price_forecast.ops.store_sources import (
     COMMODITIES_DIR,
     COMMODITY_SOURCES,
     ENTSOE_SOURCES,
+    EntsoeFetchFn,
     EntsoeSource,
     RowFetchFn,
     code_sha,
@@ -71,6 +72,11 @@ class SourceLogRow:
     rows_added: int = 0
     healed_cells: int = 0
     validation: str = "not_run"
+    # Non-blocking findings from validate_source (spec 6.7.1a section 5.4:
+    # "gehen ins Manifest und in die Protokollzeile"). Separate column, not
+    # folded into `validation`, so a green run's log row still shows what
+    # was found even though nothing blocked.
+    hints: str = ""
 
 
 @dataclass
@@ -102,6 +108,67 @@ def _restore_dir(cache_dir: Path, backup: dict[Path, bytes]) -> None:
         path.write_bytes(content)
     for path in current - set(backup):
         path.unlink()
+
+
+def _read_cache_dir(cache_dir: Path) -> pd.DataFrame:
+    """Direct on-disk read of every month/neighbor file under cache_dir,
+    concatenated (6.7.1a, spec section 5.4) -- used only for the heal
+    read-back verification below. Must not go through cached_fetch: that
+    would risk triggering yet another live API call for the still-open
+    month (data/_entsoe_cache.py::_is_complete_month gates the cache READ,
+    not just the write), on top of the two the heal step already makes.
+    "Rücklesen der betroffenen Monatsdateien" (spec section 3.1) means
+    reading the files, not re-fetching through the client.
+    """
+    if not cache_dir.exists():
+        return pd.DataFrame()
+    frames = [pd.read_parquet(p) for p in sorted(cache_dir.glob("*.parquet"))]
+    if not frames:
+        return pd.DataFrame()
+    combined = pd.concat(frames)
+    if isinstance(combined.index, pd.DatetimeIndex) and combined.index.tz is None:
+        combined.index = combined.index.tz_localize("UTC")
+    return combined.sort_index()
+
+
+def _verify_heal_persisted(
+    source_name: str,
+    cache_dir: Path,
+    healed: pd.DataFrame,
+    window_start: pd.Timestamp,
+    as_of: pd.Timestamp,
+) -> None:
+    """Raise StoreError if any cell heal_recent reported as filled is not
+    actually on disk (spec 6.7.1a, section 5.4 point 3 / section 8
+    acceptance criterion: "der Beweis wird geführt, nicht behauptet" --
+    the exact discipline heal_recent's own rule 4 already applies to the
+    in-memory result, now extended to what's actually written).
+    """
+    on_disk = _read_cache_dir(cache_dir)
+    healed_window = healed[(healed.index >= window_start) & (healed.index < as_of)]
+    on_disk_window = (
+        on_disk[(on_disk.index >= window_start) & (on_disk.index < as_of)]
+        if len(on_disk)
+        else on_disk
+    )
+    common = healed_window.index.intersection(on_disk_window.index)
+    for column in healed_window.columns:
+        if column not in on_disk_window.columns:
+            raise store.StoreError(
+                f"heal_recent for {source_name!r} reported filled cells in column "
+                f"{column!r}, but that column is not on disk after the heal "
+                "(spec 6.7.1a section 5.4)"
+            )
+        claimed = healed_window.loc[common, column]
+        on_disk_values = on_disk_window.loc[common, column]
+        mismatch = claimed.notna() & (on_disk_values.isna() | (on_disk_values != claimed))
+        if mismatch.any():
+            raise store.StoreError(
+                f"heal_recent for {source_name!r} reported {int(mismatch.sum())} filled "
+                f"cell(s) in column {column!r} that are not actually on disk after the "
+                "heal -- the heal's own report must be verified, not trusted "
+                "(spec 6.7.1a section 5.4)"
+            )
 
 
 def _previous_entry(manifest: store.Manifest, name: str) -> store.SourceManifestEntry | None:
@@ -165,6 +232,7 @@ def _sync_entsoe_source(
         mode="live",
     )
     row.validation = "ok" if result.ok else "; ".join(result.reasons)
+    row.hints = "; ".join(result.hints)
 
     if not result.ok:
         logger.error("Source %r failed validation, reverting: %s", source.name, result.reasons)
@@ -183,6 +251,7 @@ def _sync_entsoe_source(
         count=len(frame),
         last_success_utc=as_of.isoformat(),
         last_attempt_utc=as_of.isoformat(),
+        live_nan_cell_counts=result.nan_cell_counts,
     )
 
 
@@ -235,6 +304,7 @@ def _sync_commodity_source(
         mode="live",
     )
     row.validation = "ok" if result.ok else "; ".join(result.reasons)
+    row.hints = "; ".join(result.hints)
 
     if not result.ok:
         logger.error("Commodity source %r failed validation, not writing: %s", name, result.reasons)
@@ -248,6 +318,7 @@ def _sync_commodity_source(
         count=len(merged),
         last_success_utc=as_of.isoformat(),
         last_attempt_utc=as_of.isoformat(),
+        live_nan_cell_counts=result.nan_cell_counts,
     )
 
 
@@ -339,6 +410,7 @@ def _write_log_row(
         row[f"{name}_rows_added"] = source_row.rows_added
         row[f"{name}_healed_cells"] = source_row.healed_cells
         row[f"{name}_validation"] = source_row.validation
+        row[f"{name}_hints"] = source_row.hints
 
     frame = pd.DataFrame([row])
     STORE_SYNC_LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -410,17 +482,17 @@ def main() -> int:
             continue
 
         def _refetch(
-            s: pd.Timestamp, e: pd.Timestamp, _fn: RowFetchFn = source.fetch
+            s: pd.Timestamp, e: pd.Timestamp, _fn: EntsoeFetchFn = source.fetch
         ) -> pd.DataFrame:
-            # NOTE: this still goes through cached_fetch (spec section 3.3
-            # leaves data/_entsoe_cache.py untouched) -- a true cache-bypass
-            # refetch would need a second client entry point this repo does
-            # not have. Documented gap, not a silent shortcut: flagged again
-            # in the step log for 6.7.2/a future step to close, since it
-            # means heal_recent's "refetch bypasses the cache" guarantee is
-            # only as strong as cached_fetch's own (now-fixed, 6.6) cache
-            # validity check for the trailing window.
-            return _fn(s, e)
+            # use_cache=False (6.7.1a, closes spec 6.7.1 section 2.1 finding
+            # 1): a real bypass of the cache READ, so this is no longer the
+            # same cached_fetch call `existing_frame` above already made,
+            # seconds apart, comparing nothing. The cache WRITE still
+            # happens, with fill semantics (_entsoe_cache.py::
+            # _merge_and_write) -- that write is what actually persists a
+            # healed cell to disk; see _verify_heal_persisted below for the
+            # proof that it did.
+            return _fn(s, e, use_cache=False)
 
         healed, heal_result = store.heal_recent(
             source.name, existing_frame, store.HEAL_LOOKBACK_DAYS, _refetch, as_of=as_of
@@ -430,6 +502,19 @@ def main() -> int:
             log.warnings.append(
                 f"{source.name}: {heal_result.still_missing_cells} cell(s) still missing "
                 f"after heal in the last {store.HEAL_LOOKBACK_DAYS} days"
+            )
+        if heal_result.filled_cells:
+            # `healed` is consumed here, not discarded (spec 6.7.1a section
+            # 8 acceptance criterion) -- persistence itself happens as a
+            # side effect of _refetch's use_cache=False write, so this is
+            # independent verification that the write actually landed, not
+            # a second place healed itself needs to be saved.
+            _verify_heal_persisted(
+                source.name,
+                source.cache_dir,
+                healed,
+                as_of - pd.Timedelta(days=store.HEAL_LOOKBACK_DAYS),
+                as_of,
             )
 
     run_id, run_url = run_id_and_url()

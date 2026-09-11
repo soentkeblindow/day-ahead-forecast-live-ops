@@ -17,6 +17,7 @@ import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 import pandas as pd
 
@@ -34,10 +35,22 @@ from energy_price_forecast.data.entsoe_client import (
 RowFetchFn = Callable[[pd.Timestamp, pd.Timestamp], pd.DataFrame]
 
 
+class EntsoeFetchFn(Protocol):
+    """All six data/entsoe_client.py fetch_* functions match this shape
+    (6.7.1a): two positional args plus the keyword-only ``use_cache`` every
+    one of them now carries. A plain RowFetchFn alias can't express the
+    extra keyword, and scripts/sync_store.py's heal step needs to call
+    through it with ``use_cache=False`` (spec section 5.4)."""
+
+    def __call__(
+        self, start: pd.Timestamp, end: pd.Timestamp, *, use_cache: bool = True
+    ) -> pd.DataFrame: ...
+
+
 @dataclass(frozen=True)
 class EntsoeSource:
     name: str
-    fetch: RowFetchFn
+    fetch: EntsoeFetchFn
     cache_dir: Path
 
 

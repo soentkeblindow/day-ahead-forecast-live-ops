@@ -1,5 +1,9 @@
 """Persistent raw-data store: packing, manifest, versioned publish, input
 control and the heal step (spec 6.7.1, Entscheidungen 17-19, section 5.3).
+6.7.1a (2026-09-11) reworked validate_source's live-mode gate (a fixed
+NaN window, a gross-corruption-only block, non-blocking per-column hints)
+and split EXPECTATION_TABLE into CHECKED vs. CARRIED columns -- see
+validate_source's and SourceExpectation's own docstrings.
 
 Only raw, externally-fetched data ever enters the store (section 2.2) --
 never anything derived (hourly.parquet, features.parquet,
@@ -105,6 +109,14 @@ class SourceManifestEntry:
     count: int
     last_success_utc: str | None
     last_attempt_utc: str
+    # Absolute NaN cell count per CHECKED column over validate_source's
+    # live-mode fixed window (6.7.1a, spec section 5.3) -- empty for
+    # rebuild-produced entries and for any manifest written before this
+    # field existed (from_dict tolerates a missing key, spec section 4.1
+    # point 4 / section 8). Not decoration: this is the direct input to
+    # 6.7.2's own per-column freshness check (spec section 11 point 2),
+    # which reads it rather than re-deriving it.
+    live_nan_cell_counts: dict[str, int] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -113,6 +125,7 @@ class SourceManifestEntry:
             "count": self.count,
             "last_success_utc": self.last_success_utc,
             "last_attempt_utc": self.last_attempt_utc,
+            "live_nan_cell_counts": self.live_nan_cell_counts,
         }
 
     @classmethod
@@ -123,6 +136,7 @@ class SourceManifestEntry:
             count=data["count"],
             last_success_utc=data["last_success_utc"],
             last_attempt_utc=data["last_attempt_utc"],
+            live_nan_cell_counts=data.get("live_nan_cell_counts", {}),
         )
 
 
@@ -286,6 +300,18 @@ class ValidationResult:
     source: str
     ok: bool
     reasons: tuple[str, ...] = ()
+    # Non-blocking findings (6.7.1a, spec section 3.4/5.3): a fine per-column
+    # NaN reading below LIVE_GROSS_NAN_FRACTION, a missing/extra carried
+    # column. Deliberately a SEPARATE field from `reasons`, not appended to
+    # it (spec section 4.1 point 3) -- a blocking and a non-blocking finding
+    # must never land in the same list, or some future `if result.reasons`
+    # check would start failing on a hint that was never meant to block.
+    hints: tuple[str, ...] = ()
+    # Absolute NaN cell count per CHECKED column over the live-mode fixed
+    # window (spec section 5.3) -- only populated for mode="live". The
+    # caller (scripts/sync_store.py) carries this into
+    # SourceManifestEntry.live_nan_cell_counts.
+    nan_cell_counts: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -330,6 +356,21 @@ class SourceExpectation:
     that one snapshot -- high enough variance that a short, precisely-fitted
     buffer is not defensible; see LIVE_SETTLING_BUFFER's own comment for
     the reasoning behind the chosen width.
+
+    ``carried_columns`` (6.7.1a, spec section 3.6) names columns that are
+    fetched and stored but read by NO consumer under features/, models/, or
+    evaluation/ -- derived by a real code search, not assumed, and pinned by
+    tests/test_store.py's own source-scan regression test so the split can't
+    silently go stale. ``expected_columns`` above is therefore, as of
+    6.7.1a, the CHECKED set: present-required and NaN-gated in both modes.
+    A carried column is never a blocking reason in either mode -- a missing
+    one is a hint, and its NaN fraction (measured only in "rebuild" mode,
+    for the owner's own future-development tracking; never measured at all
+    in "live" mode, since nobody reads the number there) is reported, never
+    gated. Spec section 2.4's A9 finding is the concrete trigger: a gap in
+    gen_hard_coal -- read by nothing -- froze the whole "generation" fetch
+    group, including gen_wind_onshore/_offshore/_solar, which the price
+    model actually needs (features/lags.py's forecast-error lags).
     """
 
     expected_columns: frozenset[str]
@@ -337,6 +378,7 @@ class SourceExpectation:
     grid_based: bool = True
     known_low_resolution_windows: dict[str, tuple[str, str]] = field(default_factory=dict)
     live_settling_columns: frozenset[str] = field(default_factory=frozenset)
+    carried_columns: frozenset[str] = field(default_factory=frozenset)
 
 
 # Six ENTSO-E fetch groups (data/entsoe_client.py's own _FETCH_FUNCTIONS/
@@ -378,7 +420,25 @@ EXPECTATION_TABLE: Final[dict[str, SourceExpectation]] = {
         },
     ),
     "generation": SourceExpectation(
-        expected_columns=frozenset(
+        # CHECKED (6.7.1a, spec section 3.6/4.1 point 5): a real code search
+        # over features/, models/, evaluation/ found exactly these three
+        # gen_* columns read -- features/lags.py's _ERROR_PAIRS, the
+        # realised side of the wind/solar forecast-error lags -- plus
+        # evaluation/regimes.py reading the same three for regime labeling.
+        # Nothing else under gen_* appears anywhere in that search.
+        expected_columns=frozenset({"gen_wind_onshore", "gen_wind_offshore", "gen_solar"}),
+        # CARRIED (6.7.1a): fetched (ENTSO-E returns the whole generation-by-
+        # type breakdown in one response regardless, data/entsoe_client.py's
+        # own docstring/A9 measurement -- filtering to only the 3 checked
+        # types would cost 3 API calls instead of 1, for zero benefit) and
+        # stored, but read by no consumer under features/, models/,
+        # evaluation/ as of 2026-09-11 (the code search above). Never a
+        # blocking reason in either mode (spec section 3.6) -- this is the
+        # concrete fix for the C4 finding: two real automatic maintenance
+        # runs (2026-09-11) went red on a gen_hard_coal gap the price model
+        # never reads, freezing gen_wind_onshore/_offshore/_solar along with
+        # it (spec section 2.4).
+        carried_columns=frozenset(
             {
                 "gen_nuclear",
                 "gen_lignite",
@@ -387,61 +447,39 @@ EXPECTATION_TABLE: Final[dict[str, SourceExpectation]] = {
                 "gen_oil",
                 "gen_biomass",
                 "gen_hydro",
-                "gen_wind_onshore",
-                "gen_wind_offshore",
-                "gen_solar",
                 "gen_other",
             }
         ),
         max_nan_fraction={
-            # Germany has had no operating nuclear plants since April 2023 --
-            # permanently and correctly 100% NaN, not a gap (the exact
-            # example spec section 2.4 itself names).
-            "gen_nuclear": 1.0,
-            # A9's first-ever full 2020-2026 history fetch found 3 isolated
+            # A9's first-ever full 2020-2026 history fetch found isolated
             # single-interval gaps, not reproducible as a fetch/network
             # issue (unrelated to the as_of tail, both well in the past):
-            # gen_biomass/gen_gas/gen_solar/gen_wind_onshore each missing
-            # exactly one row at 2025-07-09 18:00-18:45 UTC, gen_oil missing
-            # one row at 2026-02-20 06:30 UTC. Worst observed fraction
-            # 2/234625 ~= 0.000085 -- genuine small permanent gaps in
-            # ENTSO-E's own published generation-by-type series, the same
-            # kind of finding as 6.5.1's 4 known weather provider gaps, not
-            # a code bug. 0.001 gives ~12x headroom over the observed rate
-            # without waving through a real large-scale failure (owner
-            # decision 2026-09-10, applied to every non-exempt column since
-            # the same reporting-gap phenomenon could equally hit any of
-            # them, not just the ones observed so far).
-            "gen_lignite": 0.001,
-            "gen_hard_coal": 0.001,
-            "gen_gas": 0.001,
-            "gen_oil": 0.001,
-            "gen_biomass": 0.001,
-            "gen_hydro": 0.001,
+            # gen_solar/gen_wind_onshore missing exactly one row at
+            # 2025-07-09 18:00-18:45 UTC. 0.001 gives ~12x headroom over the
+            # observed rate without waving through a real large-scale
+            # failure (owner decision 2026-09-10). gen_wind_offshore had no
+            # observed gap in that run but gets the same tolerance, since
+            # the same reporting-gap phenomenon could equally hit it.
+            # gen_nuclear's former 1.0 entry (permanently ~100% NaN since
+            # the April 2023 phase-out -- spec section 2.4's own example) is
+            # gone: it moved to carried_columns above, where NaN is never
+            # gated in any mode, making a dedicated exemption unnecessary.
             "gen_wind_onshore": 0.001,
             "gen_wind_offshore": 0.001,
             "gen_solar": 0.001,
-            "gen_other": 0.001,
         },
-        # generation-by-type is a TSO actual, reported after the fact --
-        # gen_nuclear excluded since it is permanently ~100% NaN anyway
-        # (max_nan_fraction=1.0 above already covers it regardless of mode).
-        live_settling_columns=frozenset(
-            {
-                "gen_lignite",
-                "gen_hard_coal",
-                "gen_gas",
-                "gen_oil",
-                "gen_biomass",
-                "gen_hydro",
-                "gen_wind_onshore",
-                "gen_wind_offshore",
-                "gen_solar",
-                "gen_other",
-            }
-        ),
+        # generation-by-type is a TSO actual, reported after the fact.
+        live_settling_columns=frozenset({"gen_wind_onshore", "gen_wind_offshore", "gen_solar"}),
     ),
     "scheduled_exchanges": SourceExpectation(
+        # All 12 neighbor columns across scheduled_exchanges and
+        # cross_border_flows are CHECKED, not split (6.7.1a, spec section
+        # 3.6/4.1 point 5) -- a real code search found features/lags.py's
+        # _total_flow_lag summing EVERY column matching the
+        # scheduled_net_de_to_/physical_net_de_to_ prefix (build_cross_
+        # border_lags), not a subset. The spec's own open question ("kann
+        # dasselbe Muster [wie bei gen_*] liegen") resolves to no for this
+        # fetch group -- confirmed, not assumed.
         expected_columns=frozenset(f"scheduled_net_de_to_{n.lower()}" for n in NEIGHBORS),
         # Same 0.001 backstop tolerance as "generation", for isolated
         # settled gaps -- applied to every neighbor column since the
@@ -474,6 +512,10 @@ EXPECTATION_TABLE: Final[dict[str, SourceExpectation]] = {
         },
     ),
     "cross_border_flows": SourceExpectation(
+        # All 12 border columns (this source + scheduled_exchanges) are
+        # CHECKED -- see scheduled_exchanges' own comment for the code-
+        # search finding (features/lags.py::_total_flow_lag sums every
+        # matching column, all of them).
         expected_columns=frozenset(f"physical_net_de_to_{n.lower()}" for n in NEIGHBORS),
         # Same 0.001 backstop as scheduled_exchanges above -- A9's probe run
         # (2026-09-10, 75-day window) separately found an isolated settled
@@ -520,7 +562,7 @@ EXPECTATION_TABLE: Final[dict[str, SourceExpectation]] = {
 # there to double-check).
 _COMPLETENESS_BUFFER: Final[pd.Timedelta] = pd.Timedelta(days=1)
 
-# --- Two validation contexts, deliberately not one shared tolerance ---
+# --- Two validation contexts, deliberately not one shared mechanism ---
 #
 # A9/A10 (2026-09-10) found that a single NaN tolerance cannot serve both
 # of this store's real use cases at once:
@@ -533,20 +575,35 @@ _COMPLETENESS_BUFFER: Final[pd.Timedelta] = pd.Timedelta(days=1)
 #    needed here: even a full day of live-tail lag is a tiny fraction of a
 #    multi-year window.
 # 2. "live" -- scripts/sync_store.py, a small incremental window (often
-#    under a day). The exact same 0.001 fraction is meaningless there: one
-#    isolated permanent cell in a ~20-row window is already ~5%, and
-#    A10's first real wiring-probe run against production hit exactly
-#    this ("row count shrank"-adjacent NaN-fraction failures on load/
-#    generation from a single already-known cell, confirmed via
-#    docs/sprint6_step6_7_1_log.md). A live sync needs its own, much
-#    coarser tolerance, sized like a classic data-quality gate rather than
-#    a permanent-gap allowance.
-#
-# LIVE_MAX_NAN_FRACTION (~5%) is that live-mode default; max_nan_fraction
-# entries still act as a floor under it (a full 1.0 exemption like
-# gen_nuclear's must never be *lowered* by the live default -- see
-# validate_source's max() below).
-LIVE_MAX_NAN_FRACTION: Final[float] = 0.05
+#    under a day). A9/A10's original fix (LIVE_MAX_NAN_FRACTION, a ~5%
+#    floor) turned out to still be the wrong shape of answer: 6.7.1a
+#    (spec section 2.3, real 2026-09-11 finding) found the checked NaN
+#    window itself was unstably sized -- anywhere from a few hours to
+#    hundreds of days wide, depending on how large the current sync gap
+#    happened to be -- so a *fraction* threshold over it could never mean
+#    the same thing twice. LIVE_NAN_WINDOW_DAYS fixes the denominator
+#    instead of tuning the threshold: the NaN fraction is now always
+#    measured over the same [as_of - 7d, as_of) span regardless of the
+#    sync gap, live_settling_columns' trailing exclusion shrinks that fixed
+#    window by only a known fraction (24h of 7d) rather than shrinking an
+#    already-variable one further, and 6.7.1a's second, layered change
+#    (spec section 3.4) makes the live gate itself coarser: only gross
+#    corruption (LIVE_GROSS_NAN_FRACTION) or a structural finding blocks; a
+#    real but partial gap -- like the gen_hard_coal one that produced two
+#    real red maintenance runs on 2026-09-11 -- is recorded (manifest +
+#    log) and left for 6.7.2's own per-column freshness check to judge
+#    against the actual submission's needs, not frozen out of the store by
+#    a gate that cannot see which columns matter.
+LIVE_NAN_WINDOW_DAYS: Final[int] = 7
+
+# Only a NaN fraction at or above this, over the fixed LIVE_NAN_WINDOW_DAYS
+# window, blocks a live sync (spec section 3.4) -- gross corruption (e.g.
+# A11's 100%-NaN negative-probe month), not an ordinary partial gap.
+# Chosen, not fitted: even a multi-day full outage of one CHECKED column
+# stays well under 0.9 against a 7-day denominator, so this threshold is
+# reached only by something close to "this column is not really there this
+# run", never by the kind of gap 6.7.1a exists to stop from blocking.
+LIVE_GROSS_NAN_FRACTION: Final[float] = 0.9
 
 # LIVE_SETTLING_BUFFER only matters for live_settling_columns (TSO
 # actuals -- see SourceExpectation's own docstring for why forecasts/
@@ -602,21 +659,30 @@ def validate_source(
     only ever grow.
 
     ``mode`` picks which of this store's two real use cases is being
-    validated (A9/A10 finding, 2026-09-10 -- see LIVE_MAX_NAN_FRACTION's
-    own comment for the full reasoning): ``"rebuild"`` (the default) uses
-    ``expectation.max_nan_fraction`` as-is over the full
-    ``[period_start, period_end)`` window, sized for scripts/
-    rebuild_store.py's multi-year denominator. ``"live"`` is for scripts/
-    sync_store.py's small incremental windows: the per-column allowance
-    becomes ``max(expectation.max_nan_fraction.get(column, 0.0),
-    LIVE_MAX_NAN_FRACTION)`` (a permanent exemption like gen_nuclear's 1.0
-    is never *lowered* by the live default), and columns in
-    ``expectation.live_settling_columns`` additionally get the trailing
-    ``LIVE_SETTLING_BUFFER`` excluded from the checked window (TSO actuals
-    only -- forecasts/schedules have no live-tail dynamic to exclude).
-    ``expectation.known_low_resolution_windows`` are excluded from the NaN
-    judgment in both modes, since those are real, dated historical facts,
-    not a live-vs-rebuild distinction.
+    validated (A9/A10, 2026-09-10; reworked again 6.7.1a, 2026-09-11 -- see
+    LIVE_NAN_WINDOW_DAYS' own comment for the full reasoning):
+    ``"rebuild"`` (the default) uses ``expectation.max_nan_fraction`` as-is
+    over the full ``[period_start, period_end)`` window for CHECKED columns
+    only, sized for scripts/rebuild_store.py's multi-year denominator;
+    CARRIED columns (``expectation.carried_columns``) are measured and
+    reported as hints, never gated. ``"live"`` is for scripts/
+    sync_store.py's small incremental windows: CHECKED columns are measured
+    over a FIXED ``[as_of - LIVE_NAN_WINDOW_DAYS, as_of)`` window regardless
+    of how wide the actual sync gap is, with columns in
+    ``expectation.live_settling_columns`` additionally getting the trailing
+    ``LIVE_SETTLING_BUFFER`` excluded (TSO actuals only -- forecasts/
+    schedules have no live-tail dynamic to exclude); only a fraction at or
+    above ``LIVE_GROSS_NAN_FRACTION`` blocks, everything below is recorded
+    as a hint plus an absolute cell count in ``nan_cell_counts`` and never
+    gates. CARRIED columns are not measured at all in live mode -- nobody
+    reads the number there. ``expectation.known_low_resolution_windows``
+    are excluded from the NaN judgment in both modes and for both column
+    classes, since those are real, dated historical facts, not a
+    live-vs-rebuild or checked-vs-carried distinction. The coverage-gap
+    check (gaplessness at the inferred resolution) is unaffected by any of
+    this -- it always uses ``[period_start, period_end)``, a different
+    question ("did this sync close the gap it meant to") than the NaN
+    checks answer.
 
     Returns a result object rather than raising, so one bad source does
     not stop another source of the same run from being written (spec
@@ -624,12 +690,27 @@ def validate_source(
     decides what a failing result means for the overall run.
     """
     reasons: list[str] = []
+    hints: list[str] = []
+    nan_cell_counts: dict[str, int] = {}
 
+    checked = expectation.expected_columns
+    carried = expectation.carried_columns
     actual_columns = set(frame.columns)
-    missing = expectation.expected_columns - actual_columns
-    extra = actual_columns - expectation.expected_columns
-    if missing or extra:
-        reasons.append(f"column mismatch -- missing: {sorted(missing)}, extra: {sorted(extra)}")
+    missing_checked = checked - actual_columns
+    if missing_checked:
+        reasons.append(f"column mismatch -- missing: {sorted(missing_checked)}")
+    missing_carried = carried - actual_columns
+    if missing_carried:
+        hints.append(
+            f"missing carried column(s), not blocking (spec 6.7.1a section 3.6): "
+            f"{sorted(missing_carried)}"
+        )
+    extra = actual_columns - checked - carried
+    if extra:
+        hints.append(
+            f"unexpected extra column(s), not blocking (spec 6.7.1a section 3.6): {sorted(extra)}"
+        )
+    schema_ok = not missing_checked
 
     index_usable = isinstance(frame.index, pd.DatetimeIndex)
     index_is_utc = False
@@ -643,11 +724,12 @@ def validate_source(
         if dt_index.has_duplicates:
             reasons.append(f"index has {int(dt_index.duplicated().sum())} duplicate timestamp(s)")
 
-    # Period-bound checks need a tz-aware UTC index to compare against
-    # period_start/period_end (both always tz-aware) without raising --
-    # skipped, not silently coerced, when the index itself already failed
-    # the check above.
-    if index_usable and index_is_utc and not missing and not extra:
+    # Period-bound checks need a tz-aware UTC index and every CHECKED column
+    # present to compare against period_start/period_end without raising --
+    # skipped, not silently coerced, when either already failed above. A
+    # missing/extra CARRIED or unknown column no longer blocks this (spec
+    # 6.7.1a section 3.6) -- only schema_ok (checked columns only) gates it.
+    if index_usable and index_is_utc and schema_ok:
         dt_index = cast(pd.DatetimeIndex, frame.index)
         in_period = frame[(dt_index >= period_start) & (dt_index < period_end)]
 
@@ -672,18 +754,24 @@ def validate_source(
                             f"(inferred resolution {resolution_seconds:.0f}s)"
                         )
 
-            nan_check_period = frame[(dt_index >= period_start) & (dt_index < period_end)]
+            # Always computed (cheap, a single timestamp subtraction), not
+            # only inside `if mode == "live"` -- unused in rebuild mode, but
+            # keeping it unconditional avoids a possibly-unbound read below,
+            # since pyright cannot correlate this mode check with the
+            # separate one inside the per-column loop further down.
+            nan_window_start = as_of - pd.Timedelta(days=LIVE_NAN_WINDOW_DAYS)
+            if mode == "live":
+                nan_check_period = frame[(dt_index >= nan_window_start) & (dt_index < as_of)]
+            else:
+                nan_check_period = frame[(dt_index >= period_start) & (dt_index < period_end)]
+
             if len(nan_check_period):
-                for column in sorted(expectation.expected_columns):
-                    base_allowed = expectation.max_nan_fraction.get(column, 0.0)
-                    allowed = (
-                        max(base_allowed, LIVE_MAX_NAN_FRACTION) if mode == "live" else base_allowed
-                    )
+                for column in sorted(checked):
                     column_frame = nan_check_period
-                    column_period_end = period_end
+                    column_period_end = as_of if mode == "live" else period_end
 
                     if mode == "live" and column in expectation.live_settling_columns:
-                        column_period_end = min(period_end, as_of - LIVE_SETTLING_BUFFER)
+                        column_period_end = as_of - LIVE_SETTLING_BUFFER
                         column_index = cast(pd.DatetimeIndex, column_frame.index)
                         column_frame = column_frame[column_index < column_period_end]
 
@@ -697,13 +785,60 @@ def validate_source(
                         ]
                     if not len(column_frame):
                         continue
-                    nan_fraction = float(column_frame[column].isna().mean())
-                    if nan_fraction > allowed:
-                        reasons.append(
-                            f"column {column!r}: NaN fraction {nan_fraction:.3f} "
-                            f"exceeds allowed {allowed:.3f} in {period_start}..{column_period_end} "
-                            f"(mode={mode!r}, outside any known_low_resolution_windows exclusion)"
-                        )
+                    nan_mask = column_frame[column].isna()
+                    nan_fraction = float(nan_mask.mean())
+
+                    if mode == "live":
+                        nan_cell_counts[column] = int(nan_mask.sum())
+                        if nan_fraction >= LIVE_GROSS_NAN_FRACTION:
+                            reasons.append(
+                                f"column {column!r}: NaN fraction {nan_fraction:.3f} over the "
+                                f"live window {nan_window_start}..{column_period_end} at or "
+                                f"above the gross-corruption threshold "
+                                f"{LIVE_GROSS_NAN_FRACTION:.2f} (spec 6.7.1a section 3.4)"
+                            )
+                        elif nan_mask.any():
+                            hints.append(
+                                f"column {column!r}: {int(nan_mask.sum())} NaN cell(s) "
+                                f"({nan_fraction:.3f}) over the live window "
+                                f"{nan_window_start}..{column_period_end} -- not blocking "
+                                "(spec 6.7.1a section 3.4)"
+                            )
+                    else:
+                        allowed = expectation.max_nan_fraction.get(column, 0.0)
+                        if nan_fraction > allowed:
+                            reasons.append(
+                                f"column {column!r}: NaN fraction {nan_fraction:.3f} "
+                                f"exceeds allowed {allowed:.3f} in {period_start}..{column_period_end} "
+                                f"(mode={mode!r}, outside any known_low_resolution_windows exclusion)"
+                            )
+
+                if mode == "rebuild":
+                    # CARRIED columns are measured and reported here (spec
+                    # 6.7.1a section 5.3: "im Rebuild berichtet") -- for the
+                    # owner's own future-development tracking -- but never
+                    # gated, in either mode.
+                    for column in sorted(carried):
+                        if column not in nan_check_period.columns:
+                            continue
+                        column_frame = nan_check_period
+                        window = expectation.known_low_resolution_windows.get(column)
+                        if window is not None:
+                            win_start = pd.Timestamp(window[0], tz="UTC")
+                            win_end = pd.Timestamp(window[1], tz="UTC")
+                            column_index = cast(pd.DatetimeIndex, column_frame.index)
+                            column_frame = column_frame[
+                                (column_index < win_start) | (column_index >= win_end)
+                            ]
+                        if not len(column_frame):
+                            continue
+                        nan_fraction = float(column_frame[column].isna().mean())
+                        if nan_fraction > 0:
+                            hints.append(
+                                f"carried column {column!r}: NaN fraction {nan_fraction:.3f} "
+                                f"in {period_start}..{period_end} -- never blocking, reported "
+                                "for reference only (spec 6.7.1a section 3.6)"
+                            )
 
     if previous is not None and index_usable and index_is_utc and len(frame.index):
         if previous.covered_end_utc is not None:
@@ -714,7 +849,13 @@ def validate_source(
         if len(frame) < previous.count:
             reasons.append(f"row count shrank: {len(frame)} < previous {previous.count}")
 
-    return ValidationResult(source=name, ok=not reasons, reasons=tuple(reasons))
+    return ValidationResult(
+        source=name,
+        ok=not reasons,
+        reasons=tuple(reasons),
+        hints=tuple(hints),
+        nan_cell_counts=nan_cell_counts,
+    )
 
 
 def write_if_valid(path: Path, frame: pd.DataFrame, result: ValidationResult) -> None:
