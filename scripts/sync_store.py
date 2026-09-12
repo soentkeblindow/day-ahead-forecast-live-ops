@@ -25,6 +25,7 @@ only at the very end.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import logging
 import sys
 from dataclasses import dataclass, field
@@ -50,7 +51,7 @@ from energy_price_forecast.ops.store_sources import (
     code_sha,
     run_id_and_url,
 )
-from energy_price_forecast.ops.windows import LOCAL_TZ
+from energy_price_forecast.ops.windows import next_delivery_day
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +65,16 @@ STORE_SYNC_LOG = LOGS_DIR / "store_sync.csv"
 # cache-hitting) months of gap computation, not extra API calls.
 _ENTSOE_DEFAULT_LOOKBACK_DAYS = 400
 _COMMODITY_DEFAULT_LOOKBACK_DAYS = 400
+
+# How many delivery days behind next_delivery_day(as_of) _sync_weather also
+# checks, in addition to next_delivery_day itself (docs/sprint6_fix_weather_run_offset.md
+# section 3.1). Not just the newest run: a maintenance day that fully missed
+# its own newest-run fetch (a red validation, an outage) would otherwise
+# leave a permanent hole, since weather is immutable-per-run and heal_recent
+# explicitly skips it. Costs nothing when nothing is missing -- an
+# already-cached day is a path check, no network call (fetch_run's own
+# use_cache=True cache-hit short-circuit).
+WEATHER_BACKFILL_DAYS = 2
 
 
 @dataclass
@@ -320,49 +331,106 @@ def dataclass_replace_attempt(
 def _sync_weather(
     manifest: store.Manifest, as_of: pd.Timestamp, log: RunLog
 ) -> store.SourceManifestEntry | None:
+    """Fetch the run the NEXT submission actually needs, plus a short
+    trailing backfill (docs/sprint6_fix_weather_run_offset.md).
+
+    Before this fix, this fetched ``run_init_for_target_day(as_of's own
+    local date)`` -- the run for TODAY's (already-decided) delivery day,
+    i.e. YESTERDAY's 00Z run. The live submission job, run the same day,
+    needs ``run_init_for_target_day(next_delivery_day(as_of))`` -- TODAY's
+    own 00Z run, for TOMORROW's delivery. Those are two different runs, one
+    calendar day apart: the run this function fetched was never the one
+    the submission needed, structurally, every single day.
+
+    ``next_delivery_day(as_of)`` is now the single shared answer both this
+    function and scripts/run_daily_submission.py call, rather than each
+    re-deriving it -- the drift between them is exactly what caused the bug.
+
+    Checks WEATHER_BACKFILL_DAYS additional days behind next_delivery_day
+    too, not just the newest one: this doubles as the self-heal weather
+    never had (heal_recent explicitly skips it; the single-run version
+    before this fix asked about exactly one day, so a day this function
+    missed -- a red validation, a maintenance outage -- stayed missing
+    forever). Already-cached days cost a path check only, no network call.
+    """
     row = log.get("weather_single_runs")
     previous = manifest.sources.get("weather_single_runs")
-    target_day = as_of.tz_convert(LOCAL_TZ).date()
-    run_init_utc = run_init_for_target_day(target_day)
+    delivery_day = next_delivery_day(as_of)
 
-    try:
-        frame = fetch_run(run_init_utc, use_cache=True)
+    count = previous.count if previous is not None else 0
+    covered_start = previous.covered_start_utc if previous is not None else None
+    newest_run_init: pd.Timestamp | None = (
+        pd.Timestamp(previous.covered_end_utc)
+        if previous is not None and previous.covered_end_utc
+        else None
+    )
+    oldest_new_run_init: pd.Timestamp | None = None
+    any_new = False
+    statuses: list[str] = []
+
+    for k in range(WEATHER_BACKFILL_DAYS + 1):
+        target_day = delivery_day - dt.timedelta(days=k)
+        run_init_utc = run_init_for_target_day(target_day)
+
+        # Reine Pfadprüfung (spec section 3.1): a cache hit costs nothing,
+        # not even the call into fetch_run's own (equivalent) cache check.
+        if weather_cache_path(run_init_utc, model="ecmwf_ifs").exists():
+            continue
+
+        try:
+            frame = fetch_run(run_init_utc, use_cache=True)
+        except WeatherRunUnavailable as exc:
+            logger.info("Weather run %s not yet available: %s", run_init_utc, exc)
+            statuses.append(f"{run_init_utc.date()}: not_yet_available")
+            continue
+
+        result = store.validate_weather_run(frame)
+        if not result.ok:
+            # data/_weather_cache.py writes atomically (temp file + os.replace,
+            # spec-untouched module) -- no half-written file risk, but the
+            # write happens before this validation runs, same as ENTSO-E's
+            # cached_fetch. Unlike ENTSO-E there is no existing history to
+            # protect (one file per run, immutable, never rewritten) -- just
+            # this one newly-written bad file, which must be deleted so a
+            # later publish_store's per-source glob packing doesn't sweep it up
+            # alongside the still-valid history the manifest continues to
+            # point to below. Confirmed a real gap, not theoretical: A9's
+            # first real full-history validation (2026-09-10) found two
+            # already-cached historical runs with this exact failure pattern
+            # (near-100% NaN, HTTP 200) sitting on disk undetected until then.
+            weather_cache_path(run_init_utc, model="ecmwf_ifs").unlink(missing_ok=True)
+            logger.error(
+                "Weather run %s failed validation, cache file removed: %s",
+                run_init_utc,
+                result.reasons,
+            )
+            log.any_failure = True
+            statuses.append(f"{run_init_utc.date()}: {'; '.join(result.reasons)}")
+            continue
+
         row.fetched = True
-    except WeatherRunUnavailable as exc:
-        logger.info("Weather run %s not yet available: %s", run_init_utc, exc)
-        row.validation = "not_yet_available"
+        any_new = True
+        count += 1
+        if oldest_new_run_init is None or run_init_utc < oldest_new_run_init:
+            oldest_new_run_init = run_init_utc
+        if newest_run_init is None or run_init_utc > newest_run_init:
+            newest_run_init = run_init_utc
+        statuses.append(f"{run_init_utc.date()}: ok")
+
+    row.rows_added = count - (previous.count if previous is not None else 0)
+    row.validation = "; ".join(statuses) if statuses else "already cached"
+
+    if not any_new:
         return dataclass_replace_attempt(previous, as_of)
 
-    result = store.validate_weather_run(frame)
-    row.validation = "ok" if result.ok else "; ".join(result.reasons)
-    if not result.ok:
-        # data/_weather_cache.py writes atomically (temp file + os.replace,
-        # spec-untouched module) -- no half-written file risk, but the
-        # write happens before this validation runs, same as ENTSO-E's
-        # cached_fetch. Unlike ENTSO-E there is no existing history to
-        # protect (one file per run, immutable, never rewritten) -- just
-        # this one newly-written bad file, which must be deleted so a
-        # later publish_store's per-source glob packing doesn't sweep it up
-        # alongside the still-valid history the manifest continues to
-        # point to below. Confirmed a real gap, not theoretical: A9's
-        # first real full-history validation (2026-09-10) found two
-        # already-cached historical runs with this exact failure pattern
-        # (near-100% NaN, HTTP 200) sitting on disk undetected until then.
-        weather_cache_path(run_init_utc, model="ecmwf_ifs").unlink(missing_ok=True)
-        logger.error(
-            "Weather run %s failed validation, cache file removed: %s",
-            run_init_utc,
-            result.reasons,
-        )
-        log.any_failure = True
-        return dataclass_replace_attempt(previous, as_of)
-
-    row.rows_added = 1  # one new run file
-    covered_start = previous.covered_start_utc if previous is not None else run_init_utc.isoformat()
+    if covered_start is None:
+        assert oldest_new_run_init is not None  # any_new implies at least one new run
+        covered_start = oldest_new_run_init.isoformat()
+    assert newest_run_init is not None  # any_new implies newest_run_init was set above
     return store.SourceManifestEntry(
         covered_start_utc=covered_start,
-        covered_end_utc=run_init_utc.isoformat(),
-        count=(previous.count if previous is not None else 0) + 1,
+        covered_end_utc=newest_run_init.isoformat(),
+        count=count,
         last_success_utc=as_of.isoformat(),
         last_attempt_utc=as_of.isoformat(),
     )

@@ -66,7 +66,7 @@ from energy_price_forecast.ops.protocol import (
     read_submission_records,
 )
 from energy_price_forecast.ops.store_sources import code_sha, run_id_and_url
-from energy_price_forecast.ops.windows import LOCAL_TZ, local_day_bounds
+from energy_price_forecast.ops.windows import LOCAL_TZ, local_day_bounds, next_delivery_day
 
 logger = logging.getLogger(__name__)
 
@@ -621,7 +621,7 @@ def run_daily_submission(
     a real clock or a real store. main() is the only caller that reads the
     real clock and environment.
     """
-    target_day = (as_of.tz_convert(LOCAL_TZ) + pd.DateOffset(days=1)).date()
+    target_day = next_delivery_day(as_of)
 
     if is_past_gate_closure(target_day, as_of):
         logger.info(

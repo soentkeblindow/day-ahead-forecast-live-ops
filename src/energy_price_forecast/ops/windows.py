@@ -32,6 +32,28 @@ def local_day_bounds(date: dt.date) -> tuple[pd.Timestamp, pd.Timestamp]:
     return start, end
 
 
+def next_delivery_day(as_of: pd.Timestamp) -> dt.date:
+    """Which local delivery day the next submission, made at ``as_of``, is
+    for -- one calendar day after ``as_of``'s own local date (fix for
+    sync_store.py's weather-run offset bug, docs/sprint6_fix_weather_run_offset.md).
+
+    The single shared answer to "which delivery day does the next
+    submission build for": scripts/run_daily_submission.py (the consumer,
+    needing run_init_for_target_day(next_delivery_day(as_of))'s OWN run)
+    and scripts/sync_store.py::_sync_weather (the producer, which must
+    fetch that same run ahead of time) both call this instead of each
+    re-deriving the answer independently -- which is exactly how the two
+    drifted a full day apart before this fix.
+
+    Date-only arithmetic (``dt.timedelta`` on a bare ``date``, never
+    ``pd.Timedelta``/``pd.DateOffset`` on a tz-aware ``Timestamp``) --
+    the same "Kalender ja, Uhr nein" discipline as run_init_for_target_day
+    itself, spec 6.5.1 §11. This bug class has already struck four times
+    in Sprint 6.
+    """
+    return as_of.tz_convert(LOCAL_TZ).date() + dt.timedelta(days=1)
+
+
 def local_window_bounds(
     date: dt.date, *, days_back_start: int, days_back_end: int
 ) -> tuple[pd.Timestamp, pd.Timestamp]:

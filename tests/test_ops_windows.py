@@ -16,6 +16,7 @@ from energy_price_forecast.ops.windows import (
     expected_timestamp_count,
     local_day_bounds,
     local_window_bounds,
+    next_delivery_day,
 )
 
 # ---------------------------------------------------------------------------
@@ -120,3 +121,41 @@ def test_local_day_bounds_agrees_with_market_time_local_day(date: dt.date) -> No
         probe_utc = expected_start.tz_convert("UTC") + pd.Timedelta(hours=offset_hours)
         floored = _local_day(pd.DatetimeIndex([probe_utc]))[0]
         assert floored == expected_start
+
+
+# ---------------------------------------------------------------------------
+# next_delivery_day (docs/sprint6_fix_weather_run_offset.md) -- T6, DST
+# ---------------------------------------------------------------------------
+
+
+def test_next_delivery_day_is_the_local_day_after_as_of() -> None:
+    as_of = pd.Timestamp("2026-09-12T09:00", tz="Europe/Berlin")
+    assert next_delivery_day(as_of) == dt.date(2026, 9, 13)
+
+
+def test_next_delivery_day_uses_as_ofs_own_local_date_not_utc() -> None:
+    # 23:30 UTC on 2026-09-12 is already 2026-09-13 01:30 local (CEST) --
+    # the local calendar date must be used before adding a day, not the UTC one.
+    as_of = pd.Timestamp("2026-09-12T23:30", tz="UTC")
+    assert next_delivery_day(as_of) == dt.date(2026, 9, 14)
+
+
+@pytest.mark.parametrize(
+    "as_of_local",
+    [
+        "2026-03-28T09:00",  # day before spring-forward
+        "2026-03-29T09:00",  # spring-forward day itself (23h)
+        "2026-10-24T09:00",  # day before fall-back
+        "2026-10-25T09:00",  # fall-back day itself (25h)
+    ],
+)
+def test_next_delivery_day_across_dst_transitions_is_off_by_exactly_one_calendar_day(
+    as_of_local: str,
+) -> None:
+    """No hour-offset regardless of which side of a DST transition as_of
+    falls on -- next_delivery_day does date-only arithmetic (dt.timedelta
+    on a bare date), never pd.Timedelta/pd.DateOffset on the tz-aware
+    Timestamp itself (the bug class spec 6.5.1 §11 names, already struck
+    four times in Sprint 6)."""
+    as_of = pd.Timestamp(as_of_local, tz="Europe/Berlin")
+    assert next_delivery_day(as_of) == as_of.date() + dt.timedelta(days=1)
