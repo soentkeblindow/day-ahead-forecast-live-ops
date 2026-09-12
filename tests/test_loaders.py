@@ -8,7 +8,11 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 
-from energy_price_forecast.data.loaders import load_all_data, load_processed_features
+from energy_price_forecast.data.loaders import (
+    load_all_data,
+    load_processed_features,
+    time_limited_ffill,
+)
 
 MODULE = "energy_price_forecast.data.loaders"
 
@@ -19,11 +23,14 @@ MODULE = "energy_price_forecast.data.loaders"
 _HOURLY_3D = pd.date_range("2024-01-01", periods=72, freq="h", tz="UTC")
 _DAILY_3D = pd.date_range("2024-01-01", periods=3, freq="D", tz="UTC")
 _HOURLY_7D = pd.date_range("2024-01-01", periods=168, freq="h", tz="UTC")
+_HOURLY_10D = pd.date_range("2024-01-01", periods=240, freq="h", tz="UTC")
 
 _START = pd.Timestamp("2024-01-01", tz="UTC")
 _END = pd.Timestamp("2024-01-03 23:00", tz="UTC")
 _START_7D = pd.Timestamp("2024-01-01", tz="UTC")
 _END_7D = pd.Timestamp("2024-01-07 23:00", tz="UTC")
+_START_10D = pd.Timestamp("2024-01-01", tz="UTC")
+_END_10D = pd.Timestamp("2024-01-10 23:00", tz="UTC")
 
 
 # ---------------------------------------------------------------------------
@@ -188,28 +195,73 @@ def test_load_all_data_forward_fills_commodities_over_weekends() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Test 2b: commodity forward-fill stops after 4-day (96-hour) limit
+# Test 2b: commodity forward-fill stops after the 7-day (168-hour) limit
+# (raised from 4 days / 96 hours, spec 6.7.2 section 2.3 -- see
+# COMMODITY_FFILL_LIMIT's own docstring for the measured real-gap evidence).
 # ---------------------------------------------------------------------------
 
 
-def test_load_all_data_forward_fill_respects_4_day_limit() -> None:
-    # TTF: value at Jan 1 00:00 UTC (50.0) and Jan 7 00:00 UTC (60.0).
-    # 143 NaN slots between them; limit=96 stops after Jan 5 00:00 UTC.
+def test_load_all_data_forward_fill_respects_7_day_limit() -> None:
+    # TTF: value at Jan 1 00:00 UTC (50.0) and Jan 10 00:00 UTC (60.0).
+    # 215 NaN slots between them; limit=168 stops after Jan 8 00:00 UTC.
     ttf_idx = pd.DatetimeIndex(
-        [pd.Timestamp("2024-01-01", tz="UTC"), pd.Timestamp("2024-01-07", tz="UTC")]
+        [pd.Timestamp("2024-01-01", tz="UTC"), pd.Timestamp("2024-01-10", tz="UTC")]
     )
     ttf_df = pd.DataFrame({"ttf_gas_eur_per_mwh": [50.0, 60.0]}, index=ttf_idx)
 
-    with _patch_fetchers(hourly_idx=_HOURLY_7D, fetch_ttf_gas=ttf_df):
-        result = load_all_data(_START_7D, _END_7D)
+    with _patch_fetchers(hourly_idx=_HOURLY_10D, fetch_ttf_gas=ttf_df):
+        result = load_all_data(_START_10D, _END_10D)
 
-    # Jan 5 00:00 UTC = the 96th filled slot → still filled.
-    ts_96th = pd.Timestamp("2024-01-05 00:00", tz="UTC")
-    assert result.at[ts_96th, "ttf_gas_eur_per_mwh"] == 50.0
+    # Jan 8 00:00 UTC = the 168th filled slot → still filled.
+    ts_168th = pd.Timestamp("2024-01-08 00:00", tz="UTC")
+    assert result.at[ts_168th, "ttf_gas_eur_per_mwh"] == 50.0
 
-    # Jan 5 01:00 UTC = the 97th → limit exceeded, must be NaN.
-    ts_97th = pd.Timestamp("2024-01-05 01:00", tz="UTC")
-    assert pd.isna(result.at[ts_97th, "ttf_gas_eur_per_mwh"])
+    # Jan 8 01:00 UTC = the 169th → limit exceeded, must be NaN.
+    ts_169th = pd.Timestamp("2024-01-08 01:00", tz="UTC")
+    assert pd.isna(result.at[ts_169th, "ttf_gas_eur_per_mwh"])
+
+
+# ---------------------------------------------------------------------------
+# Test 2c: the 7-day limit is real wall-clock time, not row count -- a real
+# bug found live during the 6.7.2 wiring probe (2026-09-12): day_ahead_price
+# has been quarter-hourly since 2025-09-30, so a row-count ffill(limit=168)
+# covered only 42 real hours there, not 7 days.
+# ---------------------------------------------------------------------------
+
+
+def test_time_limited_ffill_respects_hours_not_row_count() -> None:
+    index = pd.date_range("2024-01-01", periods=4 * 24 * 10, freq="15min", tz="UTC")
+    series = pd.Series(float("nan"), index=index)
+    series.iloc[0] = 50.0  # one real value at 2024-01-01 00:00 UTC
+
+    result = time_limited_ffill(series, limit_hours=168)
+
+    still_filled = pd.Timestamp("2024-01-08 00:00", tz="UTC")  # exactly 168h later
+    now_nan = pd.Timestamp("2024-01-08 00:15", tz="UTC")  # 168h15min later
+    assert result.loc[still_filled] == 50.0
+    assert pd.isna(result.loc[now_nan])
+
+
+def test_load_all_data_forward_fill_respects_7_day_limit_at_quarter_hourly_resolution() -> None:
+    """Reproduces the real 2026-09-12 bug end to end: day_ahead_price (and
+    therefore the merged frame's own index) can be quarter-hourly, while
+    the commodity gap that must still be bridged is measured in real days."""
+    qh_idx = pd.date_range("2024-01-01", periods=4 * 24 * 10, freq="15min", tz="UTC")
+    price_df = pd.DataFrame({"day_ahead_price": 50.0}, index=qh_idx)
+    ttf_idx = pd.DatetimeIndex(
+        [pd.Timestamp("2024-01-01", tz="UTC"), pd.Timestamp("2024-01-10", tz="UTC")]
+    )
+    ttf_df = pd.DataFrame({"ttf_gas_eur_per_mwh": [50.0, 60.0]}, index=ttf_idx)
+
+    with _patch_fetchers(
+        hourly_idx=_HOURLY_10D, fetch_day_ahead_prices=price_df, fetch_ttf_gas=ttf_df
+    ):
+        result = load_all_data(_START_10D, _END_10D)
+
+    still_filled = pd.Timestamp("2024-01-08 00:00", tz="UTC")
+    now_nan = pd.Timestamp("2024-01-08 00:15", tz="UTC")
+    assert result.at[still_filled, "ttf_gas_eur_per_mwh"] == 50.0
+    assert pd.isna(result.at[now_nan, "ttf_gas_eur_per_mwh"])
 
 
 # ---------------------------------------------------------------------------

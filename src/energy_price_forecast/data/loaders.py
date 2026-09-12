@@ -18,9 +18,47 @@ from energy_price_forecast.data.quarterhourly import validate_delivery_day_slot_
 logger = logging.getLogger(__name__)
 
 _COMMODITY_COLUMNS = ["ttf_gas_eur_per_mwh", "eua_co2_eur_per_t"]
-# 4 days = 96 hours: bridges weekends (2 days) and the longest common holiday gap
-# (Good Friday to Easter Monday = 4 days). Genuine outages ≥ 5 days stay visible as NaN.
-_COMMODITY_FFILL_LIMIT = 4 * 24
+# 7 days = 168 hours (spec 6.7.2, section 2.3). Raised from the original 4-day
+# limit after measuring every real gap >4 days in the full commodity history
+# (scripts/run_daily_submission.py's caller, arena/live_inputs.py, applies the
+# same limit): TTF gas has one 5-day gap (2024-03-28 to 2024-04-02), EUA CO2
+# has ten, all 5 days (clustered around Christmas/New Year and Easter each
+# year). Confirming this from the data rather than the owner's stated
+# expectation is deliberate -- it matched exactly, but it was measured, not
+# assumed. Public (not module-private) so the live path can reuse the exact
+# same number -- a different limit between backtest and live would be the
+# train/serve skew Entscheidung 10 forbids.
+COMMODITY_FFILL_LIMIT = 7 * 24
+# Kept at the OLD 4-day limit, non-blocking: a gap this deep would have been
+# a silent day before this change. Flagged in the submission run's protocol
+# and summary (spec 6.7.2, section 2.3) so it stays visible, without
+# reintroducing a hard stop for a still-legitimate, if unusually stale, price.
+COMMODITY_STALENESS_WARN_DAYS = 4
+
+
+def time_limited_ffill(series: pd.Series, *, limit_hours: int) -> pd.Series:
+    """Forward-fill honoring a real wall-clock time limit, not a row count.
+
+    ``Series.ffill(limit=N)`` counts ROWS, which silently means a
+    different real time span depending on the index's own resolution -- a
+    real bug found live during the 6.7.2 wiring probe (2026-09-12):
+    day_ahead_price (and therefore this merged frame's own index) has
+    been quarter-hourly since 2025-09-30 (data/quarterhourly.py::
+    QUARTERHOUR_START), so ``COMMODITY_FFILL_LIMIT=168`` covered only 42
+    real hours there instead of the intended 7 days -- silently
+    contradicting this file's own COMMODITY_FFILL_LIMIT docstring
+    (Entscheidung 10: one number, meant identically by every caller,
+    including the live path in arena/live_inputs.py, which reuses this
+    function directly).
+
+    Correct regardless of the index's own resolution: every NaN is
+    filled from the most recent real (non-NaN) value, then reverted to
+    NaN wherever that value's own age exceeds ``limit_hours``.
+    """
+    filled = series.ffill()
+    last_valid_time = series.index.to_series().where(series.notna()).ffill()
+    age = series.index.to_series() - last_valid_time
+    return filled.where(age <= pd.Timedelta(hours=limit_hours))
 
 
 def _log_fetch(name: str, df: pd.DataFrame) -> pd.DataFrame:
@@ -43,9 +81,11 @@ def load_all_data(
     column is required: rows where the price is missing are dropped.
 
     Commodity prices (TTF gas, EUA CO2) come at daily granularity and are
-    forward-filled to hourly resolution with a 4-day limit. This bridges
-    weekends and typical holiday gaps (Easter, Christmas) but leaves
-    multi-day outages visible as NaN for downstream data quality analysis.
+    forward-filled to hourly resolution with a 7-day limit (raised from 4
+    days, spec 6.7.2 section 2.3 -- see COMMODITY_FFILL_LIMIT). This bridges
+    weekends and the real multi-day gaps measured in the full history but
+    leaves genuine long outages visible as NaN for downstream data quality
+    analysis.
     This is the only resampling done by the loader; all other forward-fill
     or interpolation decisions are deferred to feature engineering (Sprint 2).
 
@@ -115,7 +155,7 @@ def load_all_data(
     # All other gaps remain as NaN so EDA can see real data-quality issues.
     for col in _COMMODITY_COLUMNS:
         if col in df.columns:
-            df[col] = df[col].ffill(limit=_COMMODITY_FFILL_LIMIT)
+            df[col] = time_limited_ffill(df[col], limit_hours=COMMODITY_FFILL_LIMIT)
 
     # Rows without a target price are unusable for modelling; drop them early
     # so they don't distort predictor gap-visualisation in EDA.

@@ -32,18 +32,26 @@ fired -- the CET/CEST doubling was never actually load-bearing for that
 property. Full narrative: `docs/sprint6_step6_7_1_log.md`, step A2
 addendum.
 
-Current slot table (spec 6.7.1 section 5.1):
+Current slot table (spec 6.7.2 section 3.4 -- the transitional, 8-slot
+occupancy; `audit.yml`/`weather_availability_probe.yml` retire in 6.7.3,
+leaving five):
 
 | Local time (Europe/Berlin) | Workflow |
 |---|---|
 | 06:30 | `weather_availability_probe.yml` |
 | 09:30 | `audit.yml` |
 | 10:10 | `maintain_store.yml` |
+| 10:40 | `submit.yml` |
 | 11:05 | `maintain_store.yml` |
+| 11:25 | `submit.yml` |
 | 11:30 | `audit.yml` |
+| 11:45 | `submit.yml` |
 
-6.7.2 adds submission slots as additional rows to this table and to
-`SLOTS` -- the structure is meant to be extended, not rebuilt.
+The three submission slots are deliberately interleaved with, not appended
+after, the maintenance slots: Pflege 10:10 -> Einreichung 10:40 -> Pflege
+11:05 (a second chance for the load forecast and the weather run) ->
+Einreichung 11:25 -> Einreichung 11:45. The real day-ahead window is only
+two hours wide because the load forecast is only guaranteed at 10:00 local.
 
 ## Rollout (owner tasks, spec 6.7.1 section 3.5)
 

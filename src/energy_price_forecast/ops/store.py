@@ -295,6 +295,127 @@ def publish_store(workdir: Path, manifest: Manifest) -> AssetRef:
 
 
 # ---------------------------------------------------------------------------
+# Pure on-disk cache reader (spec 6.7.2, section 5.8)
+# ---------------------------------------------------------------------------
+
+
+def _group_frames_by_shared_columns(frames: list[pd.DataFrame]) -> list[list[pd.DataFrame]]:
+    """Partition frames into connected components where two frames are
+    connected if they share at least one column name (transitively) --
+    see read_cached_range's own docstring for why exact column-set
+    equality is too strict a grouping key.
+    """
+    n = len(frames)
+    column_sets = [set(f.columns) for f in frames]
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        root_a, root_b = find(a), find(b)
+        if root_a != root_b:
+            parent[root_a] = root_b
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if column_sets[i] & column_sets[j]:
+                union(i, j)
+
+    components: dict[int, list[pd.DataFrame]] = {}
+    for i in range(n):
+        components.setdefault(find(i), []).append(frames[i])
+    return list(components.values())
+
+
+def read_cached_range(
+    cache_dir: Path, *, start: pd.Timestamp | None = None, end: pd.Timestamp | None = None
+) -> pd.DataFrame:
+    """Read every month/neighbour parquet under cache_dir straight from
+    disk, concatenated and sorted. Pure I/O: no client, no network, no write.
+
+    Moved here from scripts/sync_store.py::_read_cache_dir (6.7.1a), where
+    it was introduced for the heal read-back verification. The submission
+    job needs exactly the same thing, and a second copy under arena/ would
+    be the duplication this project keeps refusing.
+
+    Why it must exist at all: cached_fetch() never treats the *current*
+    calendar month as a cache hit (_is_complete_month requires a closed
+    month), so reading a training window that reaches to yesterday through
+    the client triggers a live API call AND a disk write -- see spec
+    section 4, rule 4.
+
+    Deliberately glob-based: it knows neither the file prefix nor any month
+    arithmetic, so the cache layout stays owned solely by
+    data/_entsoe_cache.py.
+
+    **Files are grouped by shared columns before concatenating** (spec
+    6.7.2, found live during the wiring probe, 2026-09-12, in two stages).
+
+    Stage 1 finding: scheduled_exchanges/cross_border_flows share one
+    cache_dir across all six neighbours (ops/store_sources.py::
+    _fetch_border_flows), each neighbour's own month chunks carrying only
+    *that* neighbour's single column (e.g. ``DE_LU_AT_2020-01.parquet`` has
+    only ``scheduled_net_de_to_at``). A blind ``pd.concat(frames)``
+    (row-wise) stacked all six neighbours' same-timestamp rows on top of
+    each other instead of joining them side by side -- a duplicated index
+    with >75% NaN per column on the real store, which then made a
+    downstream ``pd.concat(..., axis=1)``
+    (arena/live_inputs.py::assemble_price_model_inputs) raise
+    ``InvalidIndexError`` outright.
+
+    Stage 2 finding, caught by the same wiring probe run: grouping by
+    *exact* column-set equality is too strict. ``generation``'s real cache
+    has two distinct column sets -- one with ``gen_nuclear``, one without
+    -- because Germany's last nuclear plants shut down in 2023, so
+    ENTSO-E's response genuinely omits the "Nuclear" generation type from
+    that month onward (entsoe_client.py::fetch_generation_by_type only
+    emits a column when the type is actually present in the response,
+    spec-legitimate, not a bug there). Exact-equality grouping treated
+    those as two disjoint "neighbours" and joined them column-wise,
+    producing duplicate column names (every shared column appearing
+    twice). The real distinguishing property isn't identical columns, it's
+    *any shared column at all*: files are grouped into connected
+    components (union-find) where two files join the same component if
+    they share at least one column name, transitively. A source with
+    genuinely disjoint per-file columns (the neighbour case) still forms
+    one component per neighbour; a source whose per-file columns merely
+    drift over time while mostly overlapping (the generation case) forms
+    one single component, exactly like a source with fully identical
+    columns everywhere (day_ahead_price/load/wind_solar) already did.
+    Frames within a component concatenate row-wise (time); components
+    concatenate column-wise (an outer join on the row-merged, sorted time
+    index of each).
+
+    ``start``/``end`` slice AFTER reading rather than filtering month files.
+    The whole ENTSO-E holding is roughly 60 MB of parquet; premature
+    filtering would buy nothing and add month-boundary arithmetic, which is
+    the exact class of bug this project has already had once.
+    """
+    if not cache_dir.exists():
+        return pd.DataFrame()
+    paths = sorted(cache_dir.glob("*.parquet"))
+    if not paths:
+        return pd.DataFrame()
+
+    frames = [pd.read_parquet(path) for path in paths]
+    groups = _group_frames_by_shared_columns(frames)
+
+    per_group = [pd.concat(group).sort_index() for group in groups]
+    combined = per_group[0] if len(per_group) == 1 else pd.concat(per_group, axis=1, join="outer")
+
+    if isinstance(combined.index, pd.DatetimeIndex) and combined.index.tz is None:
+        combined.index = combined.index.tz_localize("UTC")
+    combined = combined.sort_index()
+    if start is not None or end is not None:
+        combined = combined.loc[start:end]
+    return combined
+
+
+# ---------------------------------------------------------------------------
 # Input control (spec section 2.4) -- deliberately independent of
 # data/_entsoe_cache.py::_is_sufficiently_complete(): that function waved
 # through an incomplete August month file in 6.6 because it assumed hourly

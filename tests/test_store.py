@@ -1378,3 +1378,150 @@ def test_carried_columns_scan_negative_control_catches_a_misclassified_column() 
     meaningless (spec 6.7.1a section 7)."""
     hits = _find_consumer_hits(frozenset({"gen_solar"}))
     assert "gen_solar" in hits
+
+
+def test_read_cached_range_concatenates_and_sorts_month_files(tmp_path: Path) -> None:
+    """Moved here from scripts/sync_store.py::_read_cache_dir (spec 6.7.2,
+    section 5.8) -- pure disk read, no client, no network."""
+    cache_dir = tmp_path / "wind_solar"
+    cache_dir.mkdir()
+    later = pd.DataFrame(
+        {"wind_onshore_forecast": [3.0]},
+        index=pd.DatetimeIndex(["2026-02-01T00:00:00Z"], name="timestamp"),
+    )
+    earlier = pd.DataFrame(
+        {"wind_onshore_forecast": [1.0, 2.0]},
+        index=pd.DatetimeIndex(["2026-01-01T00:00:00Z", "2026-01-01T01:00:00Z"], name="timestamp"),
+    )
+    later.to_parquet(cache_dir / "DE_LU_2026-02.parquet")
+    earlier.to_parquet(cache_dir / "DE_LU_2026-01.parquet")
+
+    result = store.read_cached_range(cache_dir)
+
+    assert list(result["wind_onshore_forecast"]) == [1.0, 2.0, 3.0]
+    assert result.index.is_monotonic_increasing
+    assert pd.DatetimeIndex(result.index).tz is not None
+
+
+def test_read_cached_range_slices_to_start_end(tmp_path: Path) -> None:
+    cache_dir = tmp_path / "wind_solar"
+    cache_dir.mkdir()
+    df = pd.DataFrame(
+        {"wind_onshore_forecast": [1.0, 2.0, 3.0]},
+        index=pd.DatetimeIndex(
+            ["2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z", "2026-01-03T00:00:00Z"],
+            name="timestamp",
+        ),
+    )
+    df.to_parquet(cache_dir / "DE_LU_2026-01.parquet")
+
+    result = store.read_cached_range(
+        cache_dir,
+        start=pd.Timestamp("2026-01-02", tz="UTC"),
+        end=pd.Timestamp("2026-01-02T12:00:00Z"),
+    )
+
+    assert list(result["wind_onshore_forecast"]) == [2.0]
+
+
+def test_read_cached_range_missing_dir_returns_empty(tmp_path: Path) -> None:
+    result = store.read_cached_range(tmp_path / "does_not_exist")
+    assert result.empty
+
+
+def test_read_cached_range_joins_multi_neighbour_files_column_wise(tmp_path: Path) -> None:
+    """Real bug found live during the 6.7.2 wiring probe (2026-09-12):
+    scheduled_exchanges/cross_border_flows share one cache_dir across all
+    six neighbours (ops/store_sources.py::_fetch_border_flows), each
+    neighbour's own month chunks carrying only that neighbour's single
+    column. A blind row-wise concat stacked neighbours on top of each
+    other instead of joining them side by side -- >75% NaN per column and
+    a duplicated index on the real store, which then broke a downstream
+    outer-join concat outright (InvalidIndexError)."""
+    cache_dir = tmp_path / "scheduled_exchanges"
+    cache_dir.mkdir()
+    idx = pd.DatetimeIndex(["2026-01-01T00:00:00Z", "2026-01-01T01:00:00Z"], name="timestamp")
+    fr = pd.DataFrame({"scheduled_net_de_to_fr": [1.0, 2.0]}, index=idx)
+    nl = pd.DataFrame({"scheduled_net_de_to_nl": [3.0, 4.0]}, index=idx)
+    fr.to_parquet(cache_dir / "DE_LU_FR_2026-01.parquet")
+    nl.to_parquet(cache_dir / "DE_LU_NL_2026-01.parquet")
+
+    result = store.read_cached_range(cache_dir)
+
+    assert len(result) == 2  # not 4 -- neighbours join as columns, not stacked rows
+    assert not result.index.duplicated().any()
+    assert list(result["scheduled_net_de_to_fr"]) == [1.0, 2.0]
+    assert list(result["scheduled_net_de_to_nl"]) == [3.0, 4.0]
+    assert result.notna().all().all()
+
+
+def test_read_cached_range_joins_multi_neighbour_month_chunks_correctly(
+    tmp_path: Path,
+) -> None:
+    """Each neighbour's own month chunks must still merge row-wise with
+    each other (chronological history) before neighbours join column-wise
+    -- the grouping is by column set, not "one row-wise pass across
+    everything" or "one column-wise pass across everything"."""
+    cache_dir = tmp_path / "scheduled_exchanges"
+    cache_dir.mkdir()
+    fr_jan = pd.DataFrame(
+        {"scheduled_net_de_to_fr": [1.0]},
+        index=pd.DatetimeIndex(["2026-01-01T00:00:00Z"], name="timestamp"),
+    )
+    fr_feb = pd.DataFrame(
+        {"scheduled_net_de_to_fr": [2.0]},
+        index=pd.DatetimeIndex(["2026-02-01T00:00:00Z"], name="timestamp"),
+    )
+    nl_jan = pd.DataFrame(
+        {"scheduled_net_de_to_nl": [3.0]},
+        index=pd.DatetimeIndex(["2026-01-01T00:00:00Z"], name="timestamp"),
+    )
+    fr_jan.to_parquet(cache_dir / "DE_LU_FR_2026-01.parquet")
+    fr_feb.to_parquet(cache_dir / "DE_LU_FR_2026-02.parquet")
+    nl_jan.to_parquet(cache_dir / "DE_LU_NL_2026-01.parquet")
+
+    result = store.read_cached_range(cache_dir)
+
+    assert len(result) == 2
+    assert list(result["scheduled_net_de_to_fr"]) == [1.0, 2.0]
+    # NL has no February value -- outer join leaves it NaN, not fabricated.
+    assert result.loc["2026-01-01":"2026-01-01", "scheduled_net_de_to_nl"].iloc[0] == 3.0
+    assert pd.isna(result.loc["2026-02-01":"2026-02-01", "scheduled_net_de_to_nl"].iloc[0])
+
+
+def test_read_cached_range_merges_overlapping_but_unequal_column_sets_row_wise(
+    tmp_path: Path,
+) -> None:
+    """Real bug found live during the 6.7.2 wiring probe (2026-09-12),
+    caught immediately after the neighbour-join fix above: exact column-set
+    equality is too strict a grouping key. generation's real cache has two
+    distinct column sets (with/without gen_nuclear -- Germany's last
+    nuclear plants shut down in 2023, so ENTSO-E's response genuinely omits
+    that type from then on). Grouping by exact equality treated the two
+    sets as separate "neighbours" and joined them column-wise, producing
+    every shared column twice. The fix groups by *any* shared column
+    (transitively) instead -- these two month files share 10 of 11 columns
+    and must land in one row-wise-merged group, not two column-wise-joined
+    ones."""
+    cache_dir = tmp_path / "generation"
+    cache_dir.mkdir()
+    with_nuclear = pd.DataFrame(
+        {"gen_nuclear": [1.0], "gen_lignite": [2.0], "gen_solar": [3.0]},
+        index=pd.DatetimeIndex(["2022-01-01T00:00:00Z"], name="timestamp"),
+    )
+    without_nuclear = pd.DataFrame(
+        {"gen_lignite": [4.0], "gen_solar": [5.0]},
+        index=pd.DatetimeIndex(["2024-01-01T00:00:00Z"], name="timestamp"),
+    )
+    with_nuclear.to_parquet(cache_dir / "DE_LU_2022-01.parquet")
+    without_nuclear.to_parquet(cache_dir / "DE_LU_2024-01.parquet")
+
+    result = store.read_cached_range(cache_dir)
+
+    assert len(result) == 2  # row-wise merge, not a column-wise join producing 1 row x dup columns
+    assert list(result.columns) == ["gen_nuclear", "gen_lignite", "gen_solar"]
+    assert list(result["gen_lignite"]) == [2.0, 4.0]
+    assert list(result["gen_solar"]) == [3.0, 5.0]
+    assert result.loc["2022-01-01":"2022-01-01", "gen_nuclear"].iloc[0] == 1.0
+    # 2024 row has no nuclear column in its source file -- NaN, not fabricated.
+    assert pd.isna(result.loc["2024-01-01":"2024-01-01", "gen_nuclear"].iloc[0])

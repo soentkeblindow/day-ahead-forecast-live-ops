@@ -1,0 +1,122 @@
+name: Daily submission (dry run)
+
+on:
+  # workflow_dispatch only (spec 6.7.2, section 3.2) -- ops/trigger/'s
+  # Cloudflare Worker is the sole timekeeper (three slots: 10:40, 11:25,
+  # 11:45 Europe/Berlin, spec section 3.4), same pattern as
+  # maintain_store.yml/audit.yml. No inputs: the dispatch call passes none
+  # (ops/trigger/src/index.ts::dispatchWorkflow), so this workflow derives
+  # its own nominal slot and last-slot-of-day status from wall-clock time
+  # below, rather than trusting a caller-supplied label.
+  workflow_dispatch: {}
+
+concurrency:
+  # Shares maintain_store.yml's own group (spec section 3.2: "gemeinsame
+  # concurrency-Gruppe mit dem Pflege-Workflow") -- a submission run must
+  # never read the store while a maintenance run is mid-write, and the
+  # slot order (Pflege 10:10 -> Einreichung 10:40 -> ...) already relies on
+  # runs never overlapping. cancel-in-progress: false, not true: a
+  # cancelled-mid-run submission would leave the protocol/payload write
+  # half done.
+  group: maintain-store
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  submit:
+    runs-on: ubuntu-latest
+    # The renewables walk-forward alone is measured at ~2.5 minutes (spec
+    # section 2.9); generous headroom above that plus the feature build,
+    # price fit, and store download, without audit.yml's old 360-min
+    # default (CLAUDE.md "Provenance" section).
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --all-extras --dev
+
+      # No timing input is passed by the dispatch call (see the on: block above),
+      # so the run derives its own nominal slot and last-slot-of-day status from
+      # the current Europe/Berlin wall-clock time, matching ops/trigger/'s own
+      # SLOTS table (10:40, 11:25, 11:45). is_last_slot uses a midpoint threshold
+      # (11:35, between the last two slots) rather than exact-time matching, to
+      # tolerate a dispatch running a few minutes late without misclassifying
+      # which slot it is (spec section 2.7: red is a property of the day's LAST
+      # slot only).
+      - name: Determine nominal slot
+        id: slot
+        run: |
+          set -euo pipefail
+          LOCAL_TIME=$(TZ=Europe/Berlin date +%H:%M)
+          if [[ "$LOCAL_TIME" < "11:00" ]]; then
+            NOMINAL_SLOT="10:40"
+          elif [[ "$LOCAL_TIME" < "11:35" ]]; then
+            NOMINAL_SLOT="11:25"
+          else
+            NOMINAL_SLOT="11:45"
+          fi
+          IS_LAST_SLOT=$([[ "$LOCAL_TIME" > "11:35" || "$LOCAL_TIME" == "11:35" ]] && echo true || echo false)
+          echo "nominal_slot=$NOMINAL_SLOT" >> "$GITHUB_OUTPUT"
+          echo "is_last_slot=$IS_LAST_SLOT" >> "$GITHUB_OUTPUT"
+          echo "Local time $LOCAL_TIME -> nominal_slot=$NOMINAL_SLOT is_last_slot=$IS_LAST_SLOT"
+
+      # No ENTSOE_API_KEY (spec section 3.4 -- a property this job's own "no
+      # fetch client" test enforces, not just an omission here): the job reads
+      # the store and the on-disk weather/commodity caches only. GITHUB_TOKEN
+      # downloads the store release asset (ops/release_assets.py) and pushes
+      # the protocol/payload commit below. ARENA_API_KEY/ARENA_API_BASE_URL are
+      # for the one read-only catalog call (arena/catalog.py::get_challenge) --
+      # the POST itself stays off in this step (submit() is never called with
+      # live=True).
+      - name: Run the daily submission job
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARENA_API_KEY: ${{ secrets.ARENA_API_KEY }}
+          ARENA_API_BASE_URL: ${{ vars.ARENA_API_BASE_URL }}
+          NOMINAL_SLOT: ${{ steps.slot.outputs.nominal_slot }}
+          IS_LAST_SLOT_OF_DAY: ${{ steps.slot.outputs.is_last_slot }}
+        run: uv run python scripts/run_daily_submission.py
+
+      # Same push discipline as maintain_store.yml/audit.yml (spec section
+      # 3.1 point 4): a run that measured and then discarded its own
+      # protocol line and payload would defeat the point of this step
+      # (spec section 5.7 -- logs/submissions.jsonl is 6.8's own input
+      # artefact).
+      - name: Commit and push the submission protocol and payload
+        if: always()
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add logs/submissions.jsonl logs/submission_payloads/
+
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "data: submission run $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          for attempt in 1 2 3; do
+            if git push; then
+              echo "Push succeeded on attempt $attempt."
+              exit 0
+            fi
+            echo "Push failed (attempt $attempt/3); pulling --rebase and retrying."
+            git pull --rebase
+          done
+
+          echo "::error::Push failed after 3 attempts -- protocol/payload were computed but not saved."
+          exit 1

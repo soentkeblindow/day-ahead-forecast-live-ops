@@ -110,27 +110,6 @@ def _restore_dir(cache_dir: Path, backup: dict[Path, bytes]) -> None:
         path.unlink()
 
 
-def _read_cache_dir(cache_dir: Path) -> pd.DataFrame:
-    """Direct on-disk read of every month/neighbor file under cache_dir,
-    concatenated (6.7.1a, spec section 5.4) -- used only for the heal
-    read-back verification below. Must not go through cached_fetch: that
-    would risk triggering yet another live API call for the still-open
-    month (data/_entsoe_cache.py::_is_complete_month gates the cache READ,
-    not just the write), on top of the two the heal step already makes.
-    "Rücklesen der betroffenen Monatsdateien" (spec section 3.1) means
-    reading the files, not re-fetching through the client.
-    """
-    if not cache_dir.exists():
-        return pd.DataFrame()
-    frames = [pd.read_parquet(p) for p in sorted(cache_dir.glob("*.parquet"))]
-    if not frames:
-        return pd.DataFrame()
-    combined = pd.concat(frames)
-    if isinstance(combined.index, pd.DatetimeIndex) and combined.index.tz is None:
-        combined.index = combined.index.tz_localize("UTC")
-    return combined.sort_index()
-
-
 def _verify_heal_persisted(
     source_name: str,
     cache_dir: Path,
@@ -144,7 +123,7 @@ def _verify_heal_persisted(
     the exact discipline heal_recent's own rule 4 already applies to the
     in-memory result, now extended to what's actually written).
     """
-    on_disk = _read_cache_dir(cache_dir)
+    on_disk = store.read_cached_range(cache_dir)
     healed_window = healed[(healed.index >= window_start) & (healed.index < as_of)]
     on_disk_window = (
         on_disk[(on_disk.index >= window_start) & (on_disk.index < as_of)]
