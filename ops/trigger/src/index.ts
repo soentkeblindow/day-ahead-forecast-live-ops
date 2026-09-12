@@ -54,15 +54,17 @@ const SLOTS: Slot[] = [
   // Submission slots (spec 6.7.2, section 3.4) -- deliberately interleaved
   // with the maintenance/audit slots, not appended after them: Pflege 10:10
   // -> Einreichung 10:40 -> Pflege 11:05 (a second chance for the load
-  // forecast and the weather run) -> Einreichung 11:25 -> Einreichung
-  // 11:45. The real day-ahead window is only two hours wide because the
-  // load forecast is only guaranteed at 10:00 local. Transitional 8-slot
+  // forecast and the weather run) -> Einreichung 11:25 -> Pflege 11:40 (a
+  // third chance, right before the final submission attempt) -> Einreichung
+  // 11:50. The real day-ahead window is only two hours wide because the
+  // load forecast is only guaranteed at 10:00 local. Transitional 9-slot
   // day (audit.yml/weather_availability_probe.yml retire in 6.7.3).
   { localTime: "10:40", workflow: "submit.yml" },
   { localTime: "11:05", workflow: "maintain_store.yml" },
   { localTime: "11:25", workflow: "submit.yml" },
   { localTime: "11:30", workflow: "audit.yml" },
-  { localTime: "11:45", workflow: "submit.yml" },
+  { localTime: "11:40", workflow: "maintain_store.yml" },
+  { localTime: "11:50", workflow: "submit.yml" },
 ];
 
 function localHHMM(utcMillis: number): string {

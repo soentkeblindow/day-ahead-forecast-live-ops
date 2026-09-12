@@ -15,7 +15,7 @@ third-party account.
 One UTC cron trigger, polling every 5 minutes (see `wrangler.toml` and
 `src/index.ts::POLL_INTERVAL_MINUTES`). On each tick, the worker re-derives
 the actual Europe/Berlin local time from the event's own timestamp and
-checks it against all five slots in `src/index.ts::SLOTS`, dispatching a
+checks it against all slots in `src/index.ts::SLOTS`, dispatching a
 `workflow_dispatch` for any slot whose half-open time window
 `[intended, intended + 5min)` contains the current tick. Almost every tick
 matches no slot and silently no-ops -- this is expected, not a bug (see the
@@ -32,9 +32,9 @@ fired -- the CET/CEST doubling was never actually load-bearing for that
 property. Full narrative: `docs/sprint6_step6_7_1_log.md`, step A2
 addendum.
 
-Current slot table (spec 6.7.2 section 3.4 -- the transitional, 8-slot
+Current slot table (spec 6.7.2 section 3.4 -- the transitional, 9-slot
 occupancy; `audit.yml`/`weather_availability_probe.yml` retire in 6.7.3,
-leaving five):
+leaving six):
 
 | Local time (Europe/Berlin) | Workflow |
 |---|---|
@@ -45,12 +45,14 @@ leaving five):
 | 11:05 | `maintain_store.yml` |
 | 11:25 | `submit.yml` |
 | 11:30 | `audit.yml` |
-| 11:45 | `submit.yml` |
+| 11:40 | `maintain_store.yml` |
+| 11:50 | `submit.yml` |
 
 The three submission slots are deliberately interleaved with, not appended
 after, the maintenance slots: Pflege 10:10 -> Einreichung 10:40 -> Pflege
 11:05 (a second chance for the load forecast and the weather run) ->
-Einreichung 11:25 -> Einreichung 11:45. The real day-ahead window is only
+Einreichung 11:25 -> Pflege 11:40 (a third chance, right before the final
+submission attempt) -> Einreichung 11:50. The real day-ahead window is only
 two hours wide because the load forecast is only guaranteed at 10:00 local.
 
 ## Rollout (owner tasks, spec 6.7.1 section 3.5)

@@ -11,7 +11,7 @@ compatibility_date = "2026-09-08"
 # 10072). A poll-and-check design needs only one entry regardless of how
 # many local slots exist, because src/index.ts::SLOTS re-derives the actual
 # Europe/Berlin local time from event.scheduledTime on every tick and
-# checks it against all five slots itself -- the CET/CEST doubling served
+# checks it against every slot in that list -- the CET/CEST doubling served
 # no purpose once local time is recomputed per tick rather than encoded as
 # a fixed UTC cron string. 288 invocations/day, far under the separate
 # 100k/day Workers Free invocation quota.
