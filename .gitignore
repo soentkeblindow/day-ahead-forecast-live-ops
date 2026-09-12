@@ -229,6 +229,7 @@ data/cache/*
 
 # specs
 docs/
+Claude outputs/
 
 # MLflow Artefakte
 mlruns/
