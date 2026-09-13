@@ -20,6 +20,7 @@ one target's coverage does not affect the other two.
 
 from __future__ import annotations
 
+import datetime as dt
 import logging
 from typing import Literal
 
@@ -87,21 +88,47 @@ def _build_target_table(
     *,
     source: CapacitySource,
     method: CapacityExtrapolation,
+    keep_rows_for: dt.date | None = None,
 ) -> pd.DataFrame:
     """Feature columns for ``target`` plus its capacity-factor label, for
     exactly the rows where the raw ENTSO-E target value actually exists
     (gaps are dropped here, never interpolated -- capacity_factor_label
     itself guards against being handed an *unexpected* gap in an
     already-filtered batch, not routine sparse coverage in the raw series).
+
+    ``keep_rows_for`` (docs/sprint6_fix_future_target_day.md section 3.3):
+    a genuine future delivery day has no real label yet (14.1.D publishes at
+    18:00 on D-1, after gate closure) -- without this, this function's own
+    availability filter drops it entirely, features and all, before
+    run_renewables_backtest's caller ever gets a chance to predict it. Only
+    that one day's rows are exempted from the drop; its label stays NaN
+    (never fabricated, spec 6.7.1a section 2.6 rule 1) rather than being run
+    through capacity_factor_label, which is not designed to receive a gap it
+    wasn't told about. For a day that already has a real label, passing it
+    here changes nothing -- bit-identical to omitting the argument.
     """
     raw = target_hourly[TARGET_COLUMNS[target]].reindex(valid_time)
-    available = raw.notna().to_numpy()
+    has_label: np.ndarray = raw.notna().to_numpy()
+    keep: np.ndarray
+    if keep_rows_for is not None:
+        is_kept_day = valid_time.tz_convert(_TZ).date == keep_rows_for
+        keep = has_label | is_kept_day
+    else:
+        keep = has_label
 
-    table = features.loc[available, columns_for(target)].copy()
-    label = capacity_factor_label(
-        raw[available], valid_time[available], target, source=source, method=method
-    )
-    table[f"{target.value}_cf_actual"] = label.to_numpy()
+    table: pd.DataFrame = features.loc[keep, columns_for(target)].copy()
+    label_values = np.full(int(keep.sum()), np.nan)
+    has_label_within_kept = has_label[keep]
+    if has_label_within_kept.any():
+        real_label = capacity_factor_label(
+            raw[keep][has_label_within_kept],
+            valid_time[keep][has_label_within_kept],
+            target,
+            source=source,
+            method=method,
+        )
+        label_values[has_label_within_kept] = real_label.to_numpy()
+    table[f"{target.value}_cf_actual"] = label_values
     return table
 
 
@@ -117,6 +144,7 @@ def run_renewables_backtest(
     seed: int = 0,
     source: CapacitySource = CapacitySource.PUBLIC_REGISTRY,
     method: CapacityExtrapolation = CapacityExtrapolation.LAST_INCREMENT,
+    keep_rows_for: dt.date | None = None,
 ) -> pd.DataFrame:
     """Run the rolling (or expanding) walk-forward for all three targets.
 
@@ -129,6 +157,18 @@ def run_renewables_backtest(
     that many days after the series start, so both variants start on the
     same first evaluable day even though only ``rolling`` needs the floor
     structurally.
+
+    ``keep_rows_for`` (docs/sprint6_fix_future_target_day.md section 3.3):
+    a genuine future delivery day has real weather but no real 14.1.D label
+    yet (it publishes at 18:00 on D-1, after gate closure) -- without this,
+    _build_target_table's own availability filter drops that day entirely,
+    so it never gets a prediction, silently, no error or warning (the real
+    2026-09-12 finding: 90 folds instead of the expected 91). Only that
+    day's rows are exempted from the drop; the evaluation itself (a real
+    label to score against) is never fabricated for it -- a fold without a
+    label still yields a prediction, just no actual/error columns to match
+    it against. For a day that already has a real label, passing it here
+    changes nothing (bit-identical to omitting the argument).
 
     Returns one tidy DataFrame indexed by (run_init_utc, valid_time_utc)
     with columns {target}_cf_pred, {target}_cf_actual, {target}_mw_pred,
@@ -190,7 +230,13 @@ def run_renewables_backtest(
     target_valid_time: dict[ProductionType, pd.DatetimeIndex] = {}
     for target in ProductionType:
         table = _build_target_table(
-            target_hourly, target, features, valid_time, source=source, method=method
+            target_hourly,
+            target,
+            features,
+            valid_time,
+            source=source,
+            method=method,
+            keep_rows_for=keep_rows_for,
         )
         target_tables[target] = table
         vt = pd.DatetimeIndex(table.index.get_level_values("valid_time_utc"))
@@ -253,6 +299,14 @@ def run_renewables_backtest(
                 train_mask = (vt >= train_lo) & (vt <= train_hi)
                 x_train = table.loc[train_mask, columns_for(target)]
                 y_train = table.loc[train_mask, f"{target.value}_cf_actual"]
+                # Defensive, not load-bearing for the default (no
+                # keep_rows_for) path: a row kept without a real label must
+                # never enter training, wherever it happens to fall relative
+                # to train_lo/train_hi (docs/sprint6_fix_future_target_day.md
+                # section 4.3, "kein Label-Leck").
+                has_label = y_train.notna()
+                x_train = x_train.loc[has_label]
+                y_train = y_train.loc[has_label]
                 if target == ProductionType.SOLAR:
                     daylight = daylight_mask_for_training(
                         pd.DatetimeIndex(x_train.index.get_level_values("valid_time_utc"))

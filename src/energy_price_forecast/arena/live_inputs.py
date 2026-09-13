@@ -71,9 +71,8 @@ def assemble_price_model_inputs(
     purely from the store's on-disk raw cache (spec section 4, rule 4).
 
     Replicates data/loaders.py::load_all_data's body (outer join of all
-    six ENTSO-E sources plus both commodities, commodity forward-fill,
-    drop rows without day_ahead_price) followed by
-    data/normalize.py::to_hourly -- exactly the two steps
+    six ENTSO-E sources plus both commodities, commodity forward-fill)
+    followed by data/normalize.py::to_hourly -- exactly the two steps
     build_interim_hourly chains, so this function's output has the same
     shape load_interim_hourly() returns. Neither data/loaders.py nor
     data/normalize.py is modified; both are imported and called unchanged
@@ -88,6 +87,37 @@ def assemble_price_model_inputs(
     unlike the ENTSO-E sources' month-chunked cache. A missing commodity
     file contributes an empty, correctly-named column, mirroring
     load_all_data's own fetch-failure fallback shape.
+
+    Unlike load_all_data, this function does **not** drop rows without a
+    real day_ahead_price (docs/sprint6_fix_partial_today.md section 3.1,
+    superseding the narrower, single-day ``keep_rows_for`` exemption from
+    docs/sprint6_fix_future_target_day.md). That drop exists in
+    load_all_data because the historical backtest always needs a real
+    price label; this live assembly step feeds more than one consumer
+    (the renewables reconstruction reads its own forecast columns off the
+    very same frame, via scripts/run_daily_submission.py::run_renewables_step),
+    and completeness is a per-consumer question, not a per-row one. A row
+    missing only its price still carries perfectly real
+    load_forecast_day_ahead/wind/solar-forecast/scheduled-flow values that
+    a price-blind drop would needlessly take down with it -- observed live
+    2026-09-13 for both a genuine future delivery day (no price yet, by
+    design) and, on the same real day, an unrelated one-off gap in
+    *today's own* published price (confirmed a one-off against
+    logs/availability.csv: 63 prior daily audit runs all had it, this is
+    the first miss). Each consumer now decides for itself what it needs:
+    the renewables step reads its own forecast columns regardless of
+    price; the price model's own training step
+    (scripts/run_daily_submission.py::fit_predict_expand) drops any
+    training-window row whose own price is still missing right before fit,
+    the same defensive placement already used for renewables labels
+    (evaluation/renewables_walkforward.py's own dropna-before-fit).
+
+    For a PAST target day this is bit-identical to the old drop-then-keep
+    behaviour: historically every row with any real column value also has
+    a real price, so no row this function would have kept before is newly
+    dropped, and no row it would have dropped before (all-NaN across every
+    source) is newly kept, since pd.concat's outer join never invents an
+    index entry with zero source data.
     """
     frames = [store.read_cached_range(source.cache_dir) for source in entsoe_sources]
 
@@ -113,7 +143,6 @@ def assemble_price_model_inputs(
     for _name, _fetch, column in commodity_sources:
         merged[column] = time_limited_ffill(merged[column], limit_hours=COMMODITY_FFILL_LIMIT)
 
-    merged = merged[merged["day_ahead_price"].notna()]
     return to_hourly(merged)
 
 

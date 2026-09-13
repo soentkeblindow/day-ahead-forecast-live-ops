@@ -175,6 +175,86 @@ def test_rolling_and_expanding_start_on_the_same_first_day(monkeypatch: pytest.M
 
 
 # ---------------------------------------------------------------------------
+# A day with real weather but no real label (docs/sprint6_fix_future_target_day.md)
+# ---------------------------------------------------------------------------
+
+
+def test_predicts_the_newest_day_even_though_it_has_no_real_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ebene 2 of the future-target-day finding: a genuine future delivery
+    day has real weather (the reconstruction input) but no real TSO
+    generation label yet -- 14.1.D publishes at 18:00 on D-1, after gate
+    closure (spec 6.5.1 section 2.4), so for a live prediction it never
+    exists. run_renewables_backtest must still produce a prediction for
+    that day instead of silently excluding it the way a label-driven day
+    enumeration would (the real 2026-09-12 finding: 90 folds instead of the
+    expected 91, with no error or warning)."""
+    _patch_capacity_anchors(monkeypatch)
+    days = _consecutive_days("2025-06-01", 15)
+    weather = _weather_for_days(days)
+    target_hourly = _target_hourly_for_days(days)
+
+    future_day = days[-1]
+    future_hours = _target_hours_for_day(future_day)
+    target_hourly.loc[target_hourly.index.isin(future_hours), :] = float("nan")
+
+    result = run_renewables_backtest(
+        target_hourly,
+        weather,
+        window="rolling",
+        train_span_days=6,
+        refit_every=1,
+        keep_rows_for=future_day,
+    )
+
+    result_local_days = (
+        pd.DatetimeIndex(result.index.get_level_values("valid_time_utc"))
+        .tz_convert("Europe/Berlin")
+        .date
+    )
+    assert future_day in result_local_days
+
+    future_rows = result[result_local_days == future_day]
+    assert len(future_rows) == len(future_hours)
+    for target in ("wind_onshore", "wind_offshore", "solar"):
+        assert future_rows[f"{target}_cf_pred"].notna().all()
+        # Not invented: the label the row carries through is still exactly
+        # what was given -- NaN, never a fabricated actual (spec 6.7.1a
+        # section 2.6 rule 1).
+        assert future_rows[f"{target}_cf_actual"].isna().all()
+
+
+def test_keep_rows_for_a_day_with_a_real_label_is_bit_identical_to_omitting_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """docs/sprint6_fix_future_target_day.md section 4.2's safety proof, one
+    level deeper: keep_rows_for only ever ADDS rows that would otherwise be
+    dropped. For a day whose label already exists, nothing changes -- this
+    is what keeps the parameter from ever touching 6.6's measured backtest
+    numbers for a historical run."""
+    _patch_capacity_anchors(monkeypatch)
+    days = _consecutive_days("2025-06-01", 15)
+    weather = _weather_for_days(days)
+    target_hourly = _target_hourly_for_days(days)
+    past_day_with_a_real_label = days[-1]
+
+    without_param = run_renewables_backtest(
+        target_hourly, weather, window="rolling", train_span_days=6, refit_every=1
+    )
+    with_param = run_renewables_backtest(
+        target_hourly,
+        weather,
+        window="rolling",
+        train_span_days=6,
+        refit_every=1,
+        keep_rows_for=past_day_with_a_real_label,
+    )
+
+    pd.testing.assert_frame_equal(without_param, with_param)
+
+
+# ---------------------------------------------------------------------------
 # DST persistence-baseline skip
 # ---------------------------------------------------------------------------
 

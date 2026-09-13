@@ -21,6 +21,7 @@ from energy_price_forecast.data._weather_cache import cache_path, write_cached_r
 from energy_price_forecast.data.weather_client import run_init_for_target_day
 from energy_price_forecast.data.weather_grid import expected_columns
 from energy_price_forecast.ops.store_sources import EntsoeSource
+from energy_price_forecast.ops.windows import local_day_bounds
 
 
 def _entsoe_source(name: str, cache_dir: Path) -> EntsoeSource:
@@ -141,7 +142,15 @@ def test_assemble_price_model_inputs_forward_fill_respects_7_real_days_at_quarte
     assert result.loc[still_within_7_days, "ttf_gas_eur_per_mwh"] == 50.0
 
 
-def test_assemble_price_model_inputs_drops_rows_without_a_price(tmp_path: Path) -> None:
+def test_assemble_price_model_inputs_keeps_a_row_missing_only_price(tmp_path: Path) -> None:
+    """docs/sprint6_fix_partial_today.md section 3.1: a row is no longer
+    dropped from the merged frame just because day_ahead_price is missing --
+    completeness is a per-consumer question (the renewables reconstruction
+    reads its own forecast columns off this same frame, regardless of
+    price), not a per-row one decided here. Real 2026-09-13 finding: this
+    is what happens to every genuine future delivery day (no price yet, by
+    design) and, that same day, to an unrelated one-off gap in *today's*
+    own price."""
     price_dir = tmp_path / "day_ahead_price"
     load_dir = tmp_path / "load"
     price_dir.mkdir()
@@ -171,8 +180,65 @@ def test_assemble_price_model_inputs_drops_rows_without_a_price(tmp_path: Path) 
         commodities_dir=commodities_dir,
     )
 
-    assert len(result) == 2
-    assert result["day_ahead_price"].notna().all()
+    assert len(result) == 4
+    assert result["day_ahead_price"].iloc[:2].notna().all()
+    assert result["day_ahead_price"].iloc[2:].isna().all()  # not invented
+    assert result["load_forecast_day_ahead"].notna().all()  # real column survives throughout
+
+
+def test_assemble_price_model_inputs_priceless_days_keep_other_real_data(
+    tmp_path: Path,
+) -> None:
+    """The multi-day shape: local 2024-01-01 has a real price all day;
+    2024-01-02/03 have none at all, but real load data throughout -- all
+    three now survive identically (no day needs naming, unlike the old
+    keep_rows_for exemption this fix replaces). Boundaries come from
+    local_day_bounds, not a naive UTC date_range slice, so they align with
+    what the SUT itself means by "day" (Europe/Berlin, not UTC)."""
+    price_dir = tmp_path / "day_ahead_price"
+    load_dir = tmp_path / "load"
+    price_dir.mkdir()
+    load_dir.mkdir()
+
+    day1_start, _ = local_day_bounds(dt.date(2024, 1, 1))
+    _, day3_end = local_day_bounds(dt.date(2024, 1, 3))
+    full_idx = pd.date_range(
+        day1_start.tz_convert("UTC"), day3_end.tz_convert("UTC"), freq="h", inclusive="left"
+    )
+    day2_start, _ = local_day_bounds(dt.date(2024, 1, 2))
+    priced_idx = full_idx[full_idx < day2_start.tz_convert("UTC")]  # only local 2024-01-01
+    pd.DataFrame({"day_ahead_price": 50.0}, index=priced_idx).to_parquet(
+        price_dir / "DE_LU_2024-01.parquet"
+    )
+    pd.DataFrame({"load_actual": 1.0, "load_forecast_day_ahead": 1.0}, index=full_idx).to_parquet(
+        load_dir / "DE_LU_2024-01.parquet"
+    )
+    commodities_dir = tmp_path / "commodities"
+    commodities_dir.mkdir()
+
+    result = assemble_price_model_inputs(
+        entsoe_sources=(
+            _entsoe_source("day_ahead_price", price_dir),
+            _entsoe_source("load", load_dir),
+        ),
+        commodity_sources=(
+            ("ttf_gas", _never_call_row_fetch, "ttf_gas_eur_per_mwh"),
+            ("eua_co2", _never_call_row_fetch, "eua_co2_eur_per_t"),
+        ),
+        commodities_dir=commodities_dir,
+    )
+
+    # Local (Europe/Berlin) calendar date, not the raw UTC one: local
+    # midnight on 2024-01-03 is 2024-01-02T23:00 UTC (CET, UTC+1), so a
+    # UTC-only .date comparison would misplace an hour across the boundary.
+    result_local_dates = pd.DatetimeIndex(result.index).tz_convert("Europe/Berlin").date
+    day1 = result[result_local_dates == dt.date(2024, 1, 1)]
+    day2 = result[result_local_dates == dt.date(2024, 1, 2)]
+    day3 = result[result_local_dates == dt.date(2024, 1, 3)]
+    assert len(day1) == len(day2) == len(day3) == 24
+    assert day1["day_ahead_price"].notna().all()
+    assert day2["day_ahead_price"].isna().all() and day2["load_forecast_day_ahead"].notna().all()
+    assert day3["day_ahead_price"].isna().all() and day3["load_forecast_day_ahead"].notna().all()
 
 
 # ---------------------------------------------------------------------------

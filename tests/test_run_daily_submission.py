@@ -248,6 +248,45 @@ def test_fit_predict_expand_returns_a_full_quarterhourly_day() -> None:
     assert pd.DatetimeIndex(result.index).tz is not None
 
 
+def test_fit_predict_expand_drops_a_training_day_with_missing_price() -> None:
+    """docs/sprint6_fix_partial_today.md section 3.1: assemble_price_model_inputs
+    no longer drops a row missing only its price (a genuine real gap, or a
+    genuine future target day), so a training-window day without a real
+    price can now reach fit_predict_expand -- must not crash or fabricate a
+    value. Confirmed (2026-09-13) that models/lgbm.py::LGBMForecaster.fit
+    already masks out any NaN-target row before calling LightGBM, so no
+    change to fit_predict_expand itself was needed; this test locks in that
+    existing protection now that a NaN-price row can actually reach it."""
+    df = _hourly_price_df("2026-01-01", pd.Timestamp(_TARGET_DAY, tz="UTC") + pd.Timedelta(days=1))
+    gap_day = _TARGET_DAY - dt.timedelta(days=10)
+    gap_start = pd.Timestamp(gap_day, tz=LOCAL_TZ).tz_convert("UTC")
+    gap_end = gap_start + pd.Timedelta(hours=24)
+    df.loc[(df.index >= gap_start) & (df.index < gap_end), "day_ahead_price"] = float("nan")
+    renewables_predictions = pd.DataFrame()
+
+    with patch(
+        "scripts.run_daily_submission.build_feature_set_for_day", side_effect=_fake_feature_row
+    ):
+        matrix, fold, _excluded = build_price_feature_matrix(
+            df, renewables_predictions, _TARGET_DAY
+        )
+
+    qh_start = pd.Timestamp(_TARGET_DAY, tz="UTC") - pd.Timedelta(days=30)
+    qh_end = pd.Timestamp(_TARGET_DAY, tz="UTC")
+    qh_index = pd.date_range(qh_start, qh_end, freq="15min", inclusive="left")
+    prices_qh = pd.DataFrame(
+        {"day_ahead_price": 50.0 + (qh_index.hour % 4).astype(float)}, index=qh_index
+    )
+
+    # Must not raise (LightGBM rejects a NaN target) and must still produce
+    # a complete day -- the gap day is silently excluded from training, not
+    # fabricated and not allowed to crash the fit.
+    result = fit_predict_expand(df, matrix, fold, prices_qh)
+
+    assert len(result) == 96
+    assert result.notna().all()
+
+
 # ---------------------------------------------------------------------------
 # build_arena_payload
 # ---------------------------------------------------------------------------

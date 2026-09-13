@@ -160,6 +160,7 @@ def run_renewables_step(
         objective="l2",
         source=CapacitySource.PUBLIC_REGISTRY,
         method=CapacityExtrapolation.LAST_INCREMENT,
+        keep_rows_for=target_day,
     )
     runtime_seconds = time.monotonic() - t0
     return predictions, runtime_seconds
@@ -244,6 +245,16 @@ def fit_predict_expand(
     filling incomplete NWP reconstruction, matching
     evaluation/arena_walkforward.py::run_live_gate_backtest's identical
     handling.
+
+    A training-window hour whose own price is missing (docs/sprint6_fix_partial_today.md
+    section 3.1: arena/live_inputs.py::assemble_price_model_inputs no longer
+    drops such rows upstream, since other consumers may still need them) can
+    now reach this function -- handled without any change needed here:
+    models/lgbm.py::LGBMForecaster.fit already masks out any row with a
+    NaN target before ever calling LightGBM (its own "missing features are
+    LightGBM's job" comment), so a priceless training hour is silently
+    excluded from training, never fabricated, never forward-filled, and
+    never fed to LightGBM as a NaN target.
     """
     y_hourly = df["day_ahead_price"]
     x_train = matrix.reindex(fold.train_index).dropna()
