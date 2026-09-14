@@ -56,13 +56,38 @@ def _infer_resolution_seconds(df: pd.DataFrame) -> float:
     return df.index.to_series().diff().dropna().median().total_seconds()
 
 
-def _is_sufficiently_complete(df: pd.DataFrame, year: int, month: int) -> bool:
+def _is_sufficiently_complete(
+    df: pd.DataFrame,
+    year: int,
+    month: int,
+    *,
+    known_low_resolution_window: tuple[str, str] | None = None,
+) -> bool:
     # Resolution is inferred from the cached data itself, not hardcoded to
     # hourly -- day_ahead_price has been 15-minute resolution since the
     # 2025-09-30 ENTSO-E switch, and a hardcoded hourly expected-count let a
     # stale, ~4x-too-short quarter-hourly cache file pass this check silently
     # (root cause of the 2026-09-06 late-August NaN gap).
     first, last = _month_bounds(year, month)
+
+    # known_low_resolution_window (2026-09-14, additive, default None):
+    # ops/store.py's own known_low_resolution_windows already knows some
+    # ENTSO-E cross-border columns genuinely reported hourly, not
+    # quarter-hourly, during specific past windows -- a real transition
+    # month has a MIXED resolution (part hourly, part quarter-hourly), so
+    # the median-inferred resolution above still expects the finer grid and
+    # the row count falls short of 90% of it, even though nothing is
+    # actually missing. Re-fetching never recovers a row ENTSO-E's own
+    # archive doesn't have for that period, so once a month inside a known
+    # window is cached, trust it outright -- same full-exemption semantics
+    # known_low_resolution_windows already has in ops/store.py::validate_source,
+    # not a relaxed threshold.
+    if known_low_resolution_window is not None:
+        window_start = pd.Timestamp(known_low_resolution_window[0], tz="UTC")
+        window_end = pd.Timestamp(known_low_resolution_window[1], tz="UTC")
+        if first < window_end and last >= window_start:
+            return True
+
     resolution_seconds = _infer_resolution_seconds(df)
     expected_periods = int((last - first).total_seconds() / resolution_seconds) + 1
     return len(df) >= 0.9 * expected_periods
@@ -126,6 +151,7 @@ def cached_fetch(
     fetch_fn: Callable[[pd.Timestamp, pd.Timestamp], pd.DataFrame],
     *,
     use_cache: bool = True,
+    known_low_resolution_window: tuple[str, str] | None = None,
 ) -> pd.DataFrame:
     """...
 
@@ -134,6 +160,10 @@ def cached_fetch(
     semantics (see _merge_and_write) -- that is what makes
     ops/store.py::heal_recent's refetch actually persist instead of living
     only in the frame it returns (6.7.1a, spec section 5.2).
+
+    ``known_low_resolution_window`` (2026-09-14, additive, default None):
+    threaded straight through to _is_sufficiently_complete -- see that
+    function's own comment.
     """
     start = _to_utc(start)
     end = _to_utc(end)
@@ -145,7 +175,12 @@ def cached_fetch(
         cached_df: pd.DataFrame | None = None
         if use_cache and path.exists() and _is_complete_month(year, month):
             candidate = _read_parquet(path)
-            if _is_sufficiently_complete(candidate, year, month):
+            if _is_sufficiently_complete(
+                candidate,
+                year,
+                month,
+                known_low_resolution_window=known_low_resolution_window,
+            ):
                 logger.info("Cache hit: %s", path.name)
                 cached_df = candidate
             else:

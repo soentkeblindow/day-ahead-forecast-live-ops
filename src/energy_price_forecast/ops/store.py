@@ -52,6 +52,10 @@ from typing import Any, Final, Literal, cast
 import pandas as pd
 
 from energy_price_forecast.data.entsoe_client import NEIGHBORS
+from energy_price_forecast.data.entsoe_resolution_windows import (
+    CROSS_BORDER_FLOWS_LOW_RESOLUTION_WINDOWS,
+    SCHEDULED_EXCHANGES_LOW_RESOLUTION_WINDOWS,
+)
 from energy_price_forecast.data.weather_grid import (
     HOURLY_VARIABLES,
     KNOWN_WEATHER_DEFECTS,
@@ -632,13 +636,11 @@ EXPECTATION_TABLE: Final[dict[str, SourceExpectation]] = {
         # 2024-06 and 53.0% in 2025-07, both transition months, both fully
         # inside the window below) rather than cut exactly at the observed
         # fraction.
-        known_low_resolution_windows={
-            "scheduled_net_de_to_at": ("2024-06-01", "2025-08-01"),
-            "scheduled_net_de_to_ch": ("2024-06-01", "2025-07-01"),
-            "scheduled_net_de_to_nl": ("2024-06-01", "2025-07-01"),
-            "scheduled_net_de_to_pl": ("2024-06-01", "2025-04-01"),
-            "scheduled_net_de_to_dk_1": ("2024-06-01", "2025-04-01"),
-        },
+        # Moved to data/entsoe_resolution_windows.py (2026-09-14) so
+        # data/_entsoe_cache.py's cache-hit heuristic can reference the exact
+        # same values without duplicating them or importing this module
+        # (which would be circular) -- see that module's own docstring.
+        known_low_resolution_windows=SCHEDULED_EXCHANGES_LOW_RESOLUTION_WINDOWS,
     ),
     "cross_border_flows": SourceExpectation(
         # All 12 border columns (this source + scheduled_exchanges) are
@@ -668,13 +670,9 @@ EXPECTATION_TABLE: Final[dict[str, SourceExpectation]] = {
         # settlement rollout, just already complete for these three borders
         # within that one month. Windows again generous to the calendar
         # month, not fitted to the exact observed fraction.
-        known_low_resolution_windows={
-            "physical_net_de_to_fr": ("2021-08-01", "2025-05-01"),
-            "physical_net_de_to_pl": ("2021-08-01", "2024-07-01"),
-            "physical_net_de_to_nl": ("2021-08-01", "2021-09-01"),
-            "physical_net_de_to_at": ("2021-08-01", "2021-09-01"),
-            "physical_net_de_to_ch": ("2021-08-01", "2021-09-01"),
-        },
+        # Moved to data/entsoe_resolution_windows.py (2026-09-14) -- see the
+        # scheduled_exchanges entry above for why.
+        known_low_resolution_windows=CROSS_BORDER_FLOWS_LOW_RESOLUTION_WINDOWS,
     ),
     "ttf_gas": SourceExpectation(
         expected_columns=frozenset({"ttf_gas_eur_per_mwh"}), grid_based=False

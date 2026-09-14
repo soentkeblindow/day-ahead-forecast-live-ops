@@ -876,6 +876,103 @@ def test_cross_border_flows_computes_net_flow(client_mock: MagicMock, cache_root
 
 
 # ---------------------------------------------------------------------------
+# known_low_resolution_window (2026-09-14): cache-hit heuristic exemption for
+# genuine, permanent hourly-vs-quarter-hourly ENTSO-E transition months
+# (session 10 finding — see data/entsoe_resolution_windows.py)
+# ---------------------------------------------------------------------------
+
+
+def _write_border_flow_month_cache(
+    root: Path,
+    cache_subdir: str,
+    area_neighbor: str,
+    col_name: str,
+    filename: str,
+    series: pd.Series,
+) -> None:
+    cache_dir = root / "entsoe" / cache_subdir
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    series.to_frame(col_name).to_parquet(cache_dir / filename, compression="snappy")
+
+
+def test_low_resolution_window_prevents_needless_refetch(
+    client_mock: MagicMock, cache_root: Path
+) -> None:
+    """DE_LU_NL genuinely reported hourly for part of 2025-06 (a known,
+    permanent ENTSO-E resolution transition inside scheduled_net_de_to_nl's
+    window in data/entsoe_resolution_windows.py) -- a cached month with
+    fewer rows than a full quarter-hourly month must not trigger a re-fetch
+    that can never recover rows ENTSO-E's own archive doesn't have for that
+    period. The other five neighbors get a full, ordinary cache so any call
+    to query_scheduled_exchanges below can only come from NL."""
+    full_month = pd.date_range("2025-06-01", "2025-06-30 23:45", freq="15min", tz="UTC")
+    for neighbor in ["FR", "AT", "PL", "CH", "DK_1"]:
+        _write_border_flow_month_cache(
+            cache_root,
+            "scheduled_exchanges",
+            f"DE_LU_{neighbor}",
+            f"scheduled_net_de_to_{neighbor.lower()}",
+            f"DE_LU_{neighbor}_2025-06.parquet",
+            pd.Series(100.0, index=full_month),
+        )
+    # 2094 of 2880 quarter-hours -- matches the real observed transition-month
+    # row count that triggered this fix (docs/sprint6_step6_7_2_dryrunphase_log.md).
+    _write_border_flow_month_cache(
+        cache_root,
+        "scheduled_exchanges",
+        "DE_LU_NL",
+        "scheduled_net_de_to_nl",
+        "DE_LU_NL_2025-06.parquet",
+        pd.Series(100.0, index=full_month[:2094]),
+    )
+
+    with freeze_time("2025-07-05"):
+        fetch_scheduled_exchanges(
+            pd.Timestamp("2025-06-01", tz="UTC"),
+            pd.Timestamp("2025-06-30 23:45", tz="UTC"),
+        )
+
+    client_mock.query_scheduled_exchanges.assert_not_called()
+
+
+def test_low_resolution_window_does_not_exempt_a_column_outside_it(
+    client_mock: MagicMock, cache_root: Path
+) -> None:
+    """Negative control: scheduled_net_de_to_fr has no known_low_resolution_
+    window entry (it stayed quarter-hourly throughout, per that module's own
+    comment) -- an equally incomplete cache file for it must still trigger
+    the ordinary re-fetch, proving the exemption above is genuinely scoped
+    to the specific column/window and not a blanket relaxation."""
+    full_month = pd.date_range("2025-06-01", "2025-06-30 23:45", freq="15min", tz="UTC")
+    for neighbor in ["NL", "AT", "PL", "CH", "DK_1"]:
+        _write_border_flow_month_cache(
+            cache_root,
+            "scheduled_exchanges",
+            f"DE_LU_{neighbor}",
+            f"scheduled_net_de_to_{neighbor.lower()}",
+            f"DE_LU_{neighbor}_2025-06.parquet",
+            pd.Series(100.0, index=full_month),
+        )
+    _write_border_flow_month_cache(
+        cache_root,
+        "scheduled_exchanges",
+        "DE_LU_FR",
+        "scheduled_net_de_to_fr",
+        "DE_LU_FR_2025-06.parquet",
+        pd.Series(100.0, index=full_month[:2094]),
+    )
+    client_mock.query_scheduled_exchanges.return_value = pd.Series(100.0, index=full_month)
+
+    with freeze_time("2025-07-05"):
+        fetch_scheduled_exchanges(
+            pd.Timestamp("2025-06-01", tz="UTC"),
+            pd.Timestamp("2025-06-30 23:45", tz="UTC"),
+        )
+
+    client_mock.query_scheduled_exchanges.assert_called()
+
+
+# ---------------------------------------------------------------------------
 # Integration test — real API call, excluded from CI by default
 # ---------------------------------------------------------------------------
 

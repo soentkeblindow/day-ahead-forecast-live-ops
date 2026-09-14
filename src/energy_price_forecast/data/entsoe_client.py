@@ -9,6 +9,10 @@ from entsoe.exceptions import NoMatchingDataError
 from energy_price_forecast.config import DATA_RAW, get_entsoe_token
 from energy_price_forecast.data._entsoe_cache import cached_fetch
 from energy_price_forecast.data._entsoe_retry import call_with_retry
+from energy_price_forecast.data.entsoe_resolution_windows import (
+    CROSS_BORDER_FLOWS_LOW_RESOLUTION_WINDOWS,
+    SCHEDULED_EXCHANGES_LOW_RESOLUTION_WINDOWS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -294,6 +298,7 @@ def _fetch_border_flows(
     query_fn: Callable[[str, str, pd.Timestamp, pd.Timestamp], pd.Series],
     *,
     use_cache: bool = True,
+    low_resolution_windows: dict[str, tuple[str, str]] | None = None,
 ) -> pd.DataFrame:
     """Shared loop logic for scheduled_exchanges and cross_border_flows.
 
@@ -303,6 +308,14 @@ def _fetch_border_flows(
 
     ``use_cache`` is threaded through to every per-neighbor cached_fetch call
     (6.7.1a) -- see fetch_day_ahead_prices for the contract.
+
+    ``low_resolution_windows`` (2026-09-14, additive, default None): the
+    same column -> (start, end) mapping ops/store.py's own
+    known_low_resolution_windows already carries for this source (imported
+    from data/entsoe_resolution_windows.py, not duplicated). Per neighbor,
+    the matching window (if any) is passed to cached_fetch so its cache-hit
+    check stops needlessly re-fetching a genuinely, permanently
+    lower-resolution month -- see _entsoe_cache.py::_is_sufficiently_complete.
     """
     cache_dir = DATA_RAW / "entsoe" / cache_subdir
     neighbor_frames: list[pd.DataFrame] = []
@@ -311,8 +324,17 @@ def _fetch_border_flows(
         col_name = f"{col_prefix}_de_to_{neighbor.lower()}"
         file_prefix = f"{area}_{neighbor}"
         fetch_fn = _build_neighbor_fetch_fn(area, neighbor, col_name, cache_subdir, query_fn)
+        window = (low_resolution_windows or {}).get(col_name)
         neighbor_frames.append(
-            cached_fetch(start, end, cache_dir, file_prefix, fetch_fn, use_cache=use_cache)
+            cached_fetch(
+                start,
+                end,
+                cache_dir,
+                file_prefix,
+                fetch_fn,
+                use_cache=use_cache,
+                known_low_resolution_window=window,
+            )
         )
 
     if not neighbor_frames:
@@ -333,7 +355,14 @@ def fetch_scheduled_exchanges(
         return _get_client().query_scheduled_exchanges(from_a, to_a, start=s, end=e, dayahead=True)
 
     return _fetch_border_flows(
-        start, end, area, "scheduled_exchanges", "scheduled_net", query_pair, use_cache=use_cache
+        start,
+        end,
+        area,
+        "scheduled_exchanges",
+        "scheduled_net",
+        query_pair,
+        use_cache=use_cache,
+        low_resolution_windows=SCHEDULED_EXCHANGES_LOW_RESOLUTION_WINDOWS,
     )
 
 
@@ -350,5 +379,12 @@ def fetch_cross_border_flows(
         return _get_client().query_crossborder_flows(from_a, to_a, start=s, end=e)
 
     return _fetch_border_flows(
-        start, end, area, "cross_border_flows", "physical_net", query_pair, use_cache=use_cache
+        start,
+        end,
+        area,
+        "cross_border_flows",
+        "physical_net",
+        query_pair,
+        use_cache=use_cache,
+        low_resolution_windows=CROSS_BORDER_FLOWS_LOW_RESOLUTION_WINDOWS,
     )
