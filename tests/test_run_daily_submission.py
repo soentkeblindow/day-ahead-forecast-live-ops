@@ -841,6 +841,16 @@ def test_run_submission_for_day_includes_the_real_morning_state_of_today() -> No
             "scripts.run_daily_submission.run_renewables_step",
             return_value=(renewables_predictions, 1.5),
         ),
+        # get_challenge is a real, read-only Arena API call in production
+        # (build_arena_payload's own docstring) -- mocked here the same way
+        # test_build_arena_payload_fetches_challenge_and_builds_a_valid_payload
+        # already does, so this test doesn't depend on network access or
+        # ARENA_API_BASE_URL being set (a real regression: this call was left
+        # unmocked in the first version of this test, which passed locally
+        # only because this machine happens to have that env var set, then
+        # failed in CI where it doesn't -- build_payload/validate_payload
+        # below still run for real).
+        patch("scripts.run_daily_submission.get_challenge", return_value=CHALLENGE),
     ):
         outcome = run_submission_for_day(
             df, pd.DataFrame(), prices_qh, _TARGET_DAY, as_of=as_of.tz_convert("UTC")
