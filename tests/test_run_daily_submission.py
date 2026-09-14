@@ -42,6 +42,7 @@ from scripts.run_daily_submission import (
     PRICE_TRAIN_SPAN_DAYS,
     RENEWABLES_TRAIN_SPAN_DAYS,
     SubmissionOutcome,
+    _silence_turns_run_red,
     already_submitted,
     build_arena_payload,
     build_price_feature_matrix,
@@ -901,6 +902,43 @@ def test_todays_feature_row_is_unaffected_by_todays_own_actuals_being_empty() ->
     pd.testing.assert_frame_equal(baseline_row, emptied_row)
 
 
+def test_run_submission_for_day_is_deterministic_on_identical_inputs() -> None:
+    """Restarbeit Teil C.2 -- spec section 4 rule 2: two runs over the exact
+    same store state and the exact same as_of produce a bit-identical
+    payload. This is what makes the three-submission-slot schedule safe (a
+    later slot only ever overwrites an earlier one's payload with something
+    different if the underlying data actually changed, per
+    write_payload_to_repo's own docstring) -- LGBMForecaster's own
+    deterministic=True/force_col_wise=True/fixed random_state (models/lgbm.py,
+    unchanged) is what this test actually exercises, not just asserts."""
+    df, renewables_predictions, _today = _build_partial_today_fixture()
+    as_of = pd.Timestamp(_TARGET_DAY - dt.timedelta(days=1), tz=LOCAL_TZ).replace(
+        hour=10, minute=40
+    )
+    prices_qh = df["day_ahead_price"].resample("15min").ffill().to_frame()
+
+    with (
+        patch("scripts.run_daily_submission.PRICE_TRAIN_SPAN_DAYS", _SMALL_PRICE_TRAIN_SPAN_DAYS),
+        patch("scripts.run_daily_submission.check_a_inputs", return_value=PreflightResult(ok=True)),
+        patch(
+            "scripts.run_daily_submission.run_renewables_step",
+            return_value=(renewables_predictions, 1.5),
+        ),
+        patch("scripts.run_daily_submission.get_challenge", return_value=CHALLENGE),
+    ):
+        outcome_1 = run_submission_for_day(
+            df, pd.DataFrame(), prices_qh, _TARGET_DAY, as_of=as_of.tz_convert("UTC")
+        )
+        outcome_2 = run_submission_for_day(
+            df, pd.DataFrame(), prices_qh, _TARGET_DAY, as_of=as_of.tz_convert("UTC")
+        )
+
+    assert outcome_1.skip_reason is None
+    assert outcome_1.payload == outcome_2.payload
+    assert outcome_1.n_training_rows == outcome_2.n_training_rows
+    assert outcome_1.n_training_labels == outcome_2.n_training_labels
+
+
 # ---------------------------------------------------------------------------
 # is_past_gate_closure
 # ---------------------------------------------------------------------------
@@ -1176,6 +1214,87 @@ def test_run_daily_submission_silent_run_is_red_only_on_the_last_slot(tmp_path: 
 
     assert _run_once(is_last_slot=False) == 0
     assert _run_once(is_last_slot=True) == 1
+
+
+# ---------------------------------------------------------------------------
+# Restarbeit Teil C.3: SILENCE_STREAK_THRESHOLD must genuinely decide the
+# outcome, not just document one -- proven by patching it to a different
+# value and observing the behavior actually change.
+# ---------------------------------------------------------------------------
+
+
+def test_silence_turns_run_red_default_threshold_matches_is_last_slot_of_day() -> None:
+    assert _silence_turns_run_red(is_last_slot_of_day=False) is False
+    assert _silence_turns_run_red(is_last_slot_of_day=True) is True
+
+
+def test_silence_streak_threshold_of_two_turns_every_silent_run_red(tmp_path: Path) -> None:
+    """The actual proof Teil C.3 asks for: with SILENCE_STREAK_THRESHOLD=2,
+    even the maximum 1 remaining attempt this schedule can ever report is
+    < 2, so *every* silent run -- including a non-last one, which the
+    default threshold=1 explicitly tolerates -- turns red. If this constant
+    were decorative (read by nothing), patching it could not change this
+    test's outcome."""
+    as_of = _GATE_CLOSURE_UTC - pd.Timedelta(hours=1)
+    log_path = tmp_path / "submissions.jsonl"
+    fake_outcome = SubmissionOutcome(candidate_selected=None, skip_reason="Check A: no weather run")
+    fake_manifest = _manifest({})
+
+    with (
+        patch("scripts.run_daily_submission.SILENCE_STREAK_THRESHOLD", 2),
+        patch("scripts.run_daily_submission.SUBMISSIONS_LOG", log_path),
+        patch("scripts.run_daily_submission.PAYLOADS_DIR", tmp_path / "payloads"),
+        patch("scripts.run_daily_submission.store") as mock_store,
+        patch(
+            "scripts.run_daily_submission.assemble_price_model_inputs", return_value=pd.DataFrame()
+        ),
+        patch("scripts.run_daily_submission.read_weather_runs", return_value=pd.DataFrame()),
+        patch(
+            "scripts.run_daily_submission.read_quarterhourly_prices", return_value=pd.DataFrame()
+        ),
+        patch("scripts.run_daily_submission.run_submission_for_day", return_value=fake_outcome),
+    ):
+        mock_store.load_store.return_value.manifest = fake_manifest
+        exit_code = run_daily_submission(as_of, nominal_slot="10:40", is_last_slot_of_day=False)
+
+    assert exit_code == 1
+
+
+# ---------------------------------------------------------------------------
+# Restarbeit Teil C.4: an unexpected exception (spec section 2.7's second
+# red condition) must print a summary line distinguishable from
+# "SILENT -- ..." without reading the full traceback, and must still
+# propagate (never silently swallowed).
+# ---------------------------------------------------------------------------
+
+
+def test_run_daily_submission_prints_a_distinguishable_line_on_an_unexpected_exception(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    as_of = _GATE_CLOSURE_UTC - pd.Timedelta(hours=1)
+
+    with (
+        patch("scripts.run_daily_submission.SUBMISSIONS_LOG", tmp_path / "submissions.jsonl"),
+        patch("scripts.run_daily_submission.store") as mock_store,
+        patch(
+            "scripts.run_daily_submission.assemble_price_model_inputs", return_value=pd.DataFrame()
+        ),
+        patch("scripts.run_daily_submission.read_weather_runs", return_value=pd.DataFrame()),
+        patch(
+            "scripts.run_daily_submission.read_quarterhourly_prices", return_value=pd.DataFrame()
+        ),
+        patch(
+            "scripts.run_daily_submission.run_submission_for_day",
+            side_effect=RuntimeError("synthetic failure for this test"),
+        ),
+        pytest.raises(RuntimeError, match="synthetic failure"),
+    ):
+        mock_store.load_store.return_value.manifest = _manifest({})
+        run_daily_submission(as_of, nominal_slot="10:40", is_last_slot_of_day=False)
+
+    captured = capsys.readouterr()
+    assert "EXCEPTION — RuntimeError: synthetic failure for this test" in captured.out
+    assert "SILENT" not in captured.out
 
 
 # ---------------------------------------------------------------------------

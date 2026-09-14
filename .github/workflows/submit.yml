@@ -3,7 +3,7 @@ name: Daily submission (dry run)
 on:
   # workflow_dispatch only (spec 6.7.2, section 3.2) -- ops/trigger/'s
   # Cloudflare Worker is the sole timekeeper (three slots: 10:40, 11:25,
-  # 11:45 Europe/Berlin, spec section 3.4), same pattern as
+  # 11:50 Europe/Berlin, spec section 3.4), same pattern as
   # maintain_store.yml/audit.yml. No inputs: the dispatch call passes none
   # (ops/trigger/src/index.ts::dispatchWorkflow), so this workflow derives
   # its own nominal slot and last-slot-of-day status from wall-clock time
@@ -50,7 +50,7 @@ jobs:
       # No timing input is passed by the dispatch call (see the on: block above),
       # so the run derives its own nominal slot and last-slot-of-day status from
       # the current Europe/Berlin wall-clock time, matching ops/trigger/'s own
-      # SLOTS table (10:40, 11:25, 11:45). is_last_slot uses a midpoint threshold
+      # SLOTS table (10:40, 11:25, 11:50). is_last_slot uses a midpoint threshold
       # (11:35, between the last two slots) rather than exact-time matching, to
       # tolerate a dispatch running a few minutes late without misclassifying
       # which slot it is (spec section 2.7: red is a property of the day's LAST
@@ -65,7 +65,7 @@ jobs:
           elif [[ "$LOCAL_TIME" < "11:35" ]]; then
             NOMINAL_SLOT="11:25"
           else
-            NOMINAL_SLOT="11:45"
+            NOMINAL_SLOT="11:50"
           fi
           IS_LAST_SLOT=$([[ "$LOCAL_TIME" > "11:35" || "$LOCAL_TIME" == "11:35" ]] && echo true || echo false)
           echo "nominal_slot=$NOMINAL_SLOT" >> "$GITHUB_OUTPUT"

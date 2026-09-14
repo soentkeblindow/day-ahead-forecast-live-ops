@@ -18,7 +18,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
 import holidays
 import pandas as pd
@@ -88,6 +88,17 @@ RENEWABLES_TRAIN_SPAN_DAYS = 365
 # caller (scripts/backtest_arena.py's --shape-window-days has no default), so this is the one
 # place the live path pins it, rather than inventing a new default elsewhere.
 SHAPE_WINDOW_DAYS = 28
+
+# Restarbeit Teil C.3: named so a future policy change is a config/date
+# change (spec section 2.7), not a silent code edit. Today's schedule only
+# ever has at most one submission attempt remaining after "now" (0 once
+# is_last_slot_of_day is True, 1 otherwise -- there is no real cross-run
+# streak counter, spec section 2.7 doesn't ask for one). threshold=1 means
+# that single remaining attempt is what turns a silent run red: an earlier
+# silent slot still has a later slot that might recover, so it must not.
+# _silence_turns_run_red reads this constant rather than the raw 1, so the
+# constant genuinely decides the outcome.
+SILENCE_STREAK_THRESHOLD: Final[int] = 1
 
 
 def renewables_window(target_day: dt.date) -> tuple[pd.Timestamp, pd.Timestamp]:
@@ -646,6 +657,22 @@ def write_payload_to_repo(payload: dict[str, Any], target_day: dt.date) -> Path:
     return path
 
 
+def _silence_turns_run_red(*, is_last_slot_of_day: bool) -> bool:
+    """Whether a silent outcome should turn the whole workflow run red
+    (spec section 2.7) -- reads SILENCE_STREAK_THRESHOLD rather than
+    returning is_last_slot_of_day directly, so the constant is what
+    genuinely decides this, not documentation next to an unrelated check.
+    remaining_attempts is 0 on the day's last slot, 1 otherwise. threshold=1
+    (default) reddens exactly the last slot's own silence, as before this
+    was named; threshold=2 (>= the max remaining_attempts this schedule can
+    ever report) would redden EVERY silent run, including non-final ones;
+    threshold<=0 would never redden any silent run at all -- both directions
+    provable by patching the module constant in a test, not just asserted.
+    """
+    remaining_attempts = 0 if is_last_slot_of_day else 1
+    return remaining_attempts < SILENCE_STREAK_THRESHOLD
+
+
 def run_daily_submission(
     as_of: pd.Timestamp, *, nominal_slot: str, is_last_slot_of_day: bool
 ) -> int:
@@ -684,7 +711,20 @@ def run_daily_submission(
     weather = read_weather_runs([d.date() for d in local_days])
     prices_qh = read_quarterhourly_prices()
 
-    outcome = run_submission_for_day(df, weather, prices_qh, target_day, as_of=as_of)
+    # Restarbeit Teil C.4: an unexpected exception here (spec section 2.7's
+    # second red condition, distinct from silence) is deliberately NOT
+    # swallowed -- run_submission_for_day's own docstring already commits to
+    # letting it propagate, since that's where a genuine bug belongs, not a
+    # handled outcome. This only adds a summary line distinguishable from
+    # "SILENT -- ..." (a config/coding-not-input-state failure looks
+    # different in the Actions log without reading the full traceback) and
+    # re-raises unchanged -- exit code, traceback, and CI redness are
+    # exactly as before this addition.
+    try:
+        outcome = run_submission_for_day(df, weather, prices_qh, target_day, as_of=as_of)
+    except Exception as exc:  # noqa: BLE001 -- deliberately broad, re-raised unchanged below
+        print(f"EXCEPTION — {type(exc).__name__}: {exc}")
+        raise
     runtime_seconds = time.monotonic() - t0
 
     record = build_submission_record(
@@ -720,7 +760,7 @@ def run_daily_submission(
         print(f"SILENT — {outcome.skip_reason}")
         # Red only on the day's last slot (spec section 2.7): an earlier run without
         # complete data is an expected operating state, not a failure.
-        return 1 if is_last_slot_of_day else 0
+        return 1 if _silence_turns_run_red(is_last_slot_of_day=is_last_slot_of_day) else 0
 
     print(f"submitted (dry-run): candidate={outcome.candidate_selected}, target_day={target_day}")
     return 0
