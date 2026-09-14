@@ -203,7 +203,17 @@ def _sync_entsoe_source(
 
     backup = _backup_dir(source.cache_dir)
     try:
-        frame = source.fetch(fetch_start, as_of)
+        # period_end (midnight after today), not as_of (the real wall clock)
+        # -- day_ahead_price/load_forecast_day_ahead/wind_solar/
+        # scheduled_exchanges are all published D-1, so as_of's own "now"
+        # artificially truncated an already-public window on every
+        # incremental sync, which the shrink-protection then (correctly)
+        # rejected as apparent data loss every time a wider previous existed
+        # (session 2026-09-13, misdiagnosed then as an ENTSO-E-side
+        # regression -- it was this line). Harmless no-op for actual-only
+        # sources (generation, cross_border_flows): ENTSO-E simply returns
+        # nothing for the still-future portion of the window regardless.
+        frame = source.fetch(fetch_start, period_end)
         row.fetched = True
     except Exception as exc:  # noqa: BLE001 -- an unreachable source is a green outcome (spec 2.7)
         logger.warning("Source %r unreachable this run: %s", source.name, exc)
