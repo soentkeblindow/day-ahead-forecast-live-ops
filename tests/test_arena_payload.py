@@ -97,6 +97,27 @@ def test_validate_payload_accepts_a_valid_payload() -> None:
     validate_payload(_valid_payload(), CHALLENGE)  # must not raise
 
 
+@pytest.mark.parametrize(
+    ("target_start", "n"),
+    [
+        ("2026-08-20T00:00:00+02:00", 96),  # normal day
+        ("2026-03-29T00:00:00+01:00", 92),  # DE/LU DST start -- spring forward, 23h day
+        ("2026-10-25T00:00:00+02:00", 100),  # DE/LU DST end -- fall back, 25h day
+    ],
+)
+def test_validate_payload_accepts_the_real_count_for_each_day_type(
+    target_start: str, n: int
+) -> None:
+    """Restarbeit 6.7.2, Teil C.1, level 3 -- a full build_payload +
+    validate_payload accept-path for each day type, not just
+    expected_value_count's own arithmetic (test_expected_value_count_
+    spring_forward_dst/test_expected_value_count_fall_back_dst above,
+    already at these exact dates) -- the count a genuinely 92/100-value day
+    actually produces must be *accepted*, not just correctly computed."""
+    payload = build_payload(CHALLENGE, _ts(target_start), [1.0] * n)
+    validate_payload(payload, CHALLENGE)  # must not raise
+
+
 def test_validate_payload_rejects_too_few_values() -> None:
     with pytest.raises(PayloadValidationError, match="95.*expected 96"):
         validate_payload(_valid_payload(95), CHALLENGE)

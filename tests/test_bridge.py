@@ -193,14 +193,29 @@ def test_shaped_expansion_applies_the_profile_deltas() -> None:
     np.testing.assert_allclose(shaped.iloc[:4].to_numpy(), 100.0 + _KNOWN_SHAPE, atol=1e-9)
 
 
-def test_output_length_matches_dst_day_type() -> None:
-    prices = _synthetic_prices(dt.date(2026, 3, 1), 28)
-    profile = fit_shape_profile(prices, end_day=pd.Timestamp("2026-03-28"), n_days=28)
+@pytest.mark.parametrize(
+    ("target_day", "profile_end_day", "expected_len"),
+    [
+        (dt.date(2026, 3, 29), "2026-03-28", 92),  # DE/LU DST start -- spring forward, 23h day
+        (dt.date(2026, 10, 25), "2026-10-24", 100),  # DE/LU DST end -- fall back, 25h day
+    ],
+)
+def test_output_length_matches_dst_day_type(
+    target_day: dt.date, profile_end_day: str, expected_len: int
+) -> None:
+    """Restarbeit 6.7.2, Teil C.1, level 2 -- the more important of the two
+    C.1 tests (the component, not the guard rail): nothing in this path may
+    silently assume 96. The fall-back (25h -> 100) side was previously
+    untested; the spring-forward (23h -> 92) side already was. Confirmed
+    (a scratch check before writing this) that expand_to_quarterhour already
+    produces the right count on the real 2026-10-25 fall-back day -- this
+    pins that as a regression test, not a fix."""
+    prices = _synthetic_prices(target_day - dt.timedelta(days=28), 28)
+    profile = fit_shape_profile(prices, end_day=pd.Timestamp(profile_end_day), n_days=28)
 
-    spring_day = dt.date(2026, 3, 29)
-    hourly = _hourly_forecast_for(spring_day)
-    result = expand_to_quarterhour(hourly, profile, target_day=pd.Timestamp(spring_day))
-    assert len(result) == 92
+    hourly = _hourly_forecast_for(target_day)
+    result = expand_to_quarterhour(hourly, profile, target_day=pd.Timestamp(target_day))
+    assert len(result) == expected_len
 
 
 def test_mismatched_hourly_index_raises() -> None:

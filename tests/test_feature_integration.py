@@ -301,6 +301,35 @@ def test_dst_days_correct_row_count_and_single_run_init(
         assert kt.iloc[0] == run_init, name
 
 
+@pytest.mark.parametrize(
+    ("target_day", "expected_rows"),
+    [
+        (dt.date(2026, 3, 29), 23),  # DE/LU DST start 2026 -- spring forward
+        (dt.date(2026, 10, 25), 25),  # DE/LU DST end 2026 -- fall back
+    ],
+)
+def test_build_feature_set_for_day_correct_row_count_on_a_dst_transition_day(
+    target_day: dt.date, expected_rows: int
+) -> None:
+    """Restarbeit 6.7.2, Teil C.1, level 1 -- the FULL live-path builder
+    (build_feature_set_for_day), not just build_nwp_forecast_fundamentals's
+    own narrower row count (test_dst_days_correct_row_count_and_single_run_init
+    above, at last year's 2025 transition dates). Confirmed the mechanism
+    itself already works before writing this (a scratch check against these
+    exact two 2026 dates); this pins it as a real, committed regression
+    test rather than leaving it as a one-off observation."""
+    df = _make_full_df_with_lags(
+        periods=30 * 24, start=(target_day - dt.timedelta(days=20)).isoformat()
+    )
+    target_index = _local_hourly_index(target_day)
+    run_init = run_init_for_target_day(target_day)
+    predictions = _synthetic_predictions(target_index, run_init)
+
+    matrix = build_feature_set_for_day(target_day, df, predictions)
+
+    assert len(matrix) == expected_rows
+
+
 def test_incomplete_reconstruction_raises_on_a_single_nan_value() -> None:
     """One NaN hour in a required reconstruction series is enough to reject
     the whole target day (spec 6.5.3 section 3.3) -- never filled."""
