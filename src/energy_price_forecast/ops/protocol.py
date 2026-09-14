@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
 
-PROTOCOL_VERSION: Final[int] = 1
+PROTOCOL_VERSION: Final[int] = 2
 
 # Fixed so every appended line writes its keys in the same order (spec
 # section 2.8: "sonst sind die Git-Diffs verrauscht"). New fields are
@@ -59,6 +59,8 @@ _KEY_ORDER: Final[tuple[str, ...]] = (
     "api_status",
     "api_message",
     "runtime_seconds",
+    "n_training_rows",
+    "n_training_labels",
 )
 
 
@@ -88,6 +90,22 @@ class SubmissionRecord:
     ``submitted``/``api_status``/``api_message`` stay ``False``/``"dry_run"``/
     ``None`` throughout 6.7.2 -- ``live=True`` is never passed to
     ``arena.submit.submit()`` in this step.
+
+    ``n_training_rows``/``n_training_labels`` (protocol_version 2, Restarbeit
+    Teil A): the size of the training matrix actually passed to
+    ``LGBMForecaster.fit()`` and how many of those rows had a real,
+    non-NaN ``day_ahead_price`` label -- read off the exact ``x_train``/
+    ``y_train`` objects the fit call itself receives
+    (``scripts/run_daily_submission.py::fit_predict_expand``), never a
+    separately re-derived count. Observability only, never a gate (Restarbeit
+    Teil A.4): a row-present-but-label-missing training day silently
+    shrinks the effective training window since
+    ``docs/sprint6_fix_partial_today.md`` stopped dropping such rows
+    upstream, and 6.8 needs to tell "the model was worse" apart from "the
+    model had less data" -- but this repo sets no guessed thresholds, so
+    whether a gap here should ever block a run is a decision for 6.8, made
+    from real logged numbers, not this step. Both ``None`` for any run that
+    never reached the fit step (Check A/extent/Check B skip).
     """
 
     run_timestamp_utc: str
@@ -109,6 +127,8 @@ class SubmissionRecord:
     api_status: str | None = None
     api_message: str | None = None
     runtime_seconds: float | None = None
+    n_training_rows: int | None = None
+    n_training_labels: int | None = None
     protocol_version: int = PROTOCOL_VERSION
 
     def to_dict(self) -> dict[str, Any]:

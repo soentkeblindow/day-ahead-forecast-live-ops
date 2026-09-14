@@ -50,6 +50,8 @@ _EXPECTED_KEY_ORDER = [
     "api_status",
     "api_message",
     "runtime_seconds",
+    "n_training_rows",
+    "n_training_labels",
 ]
 
 
@@ -109,6 +111,28 @@ def test_reader_tolerates_an_old_line_missing_a_newer_field(tmp_path: Path) -> N
     assert "missing_features" not in records[0]
 
 
+def test_reader_tolerates_a_real_protocol_version_1_line_without_training_label_fields(
+    tmp_path: Path,
+) -> None:
+    """Restarbeit Teil A.5: the first real, not synthetic, practical case of
+    the compatibility guarantee above -- protocol_version 2 (Restarbeit
+    Teil A) added n_training_rows/n_training_labels; every line written
+    under protocol_version 1 genuinely lacks them, not just as a test
+    fixture but as a real fact about logs/submissions.jsonl's own history."""
+    path = tmp_path / "submissions.jsonl"
+    v1_line = _sample_record().to_dict()
+    v1_line["protocol_version"] = 1
+    del v1_line["n_training_rows"]
+    del v1_line["n_training_labels"]
+    path.write_text(json.dumps(v1_line) + "\n", encoding="utf-8")
+
+    records = read_submission_records(path)
+    assert len(records) == 1
+    assert records[0]["protocol_version"] == 1
+    assert records[0].get("n_training_rows") is None
+    assert records[0].get("n_training_labels") is None
+
+
 def test_missing_features_names_each_feature_individually() -> None:
     record = _sample_record(
         candidate_selected=None,
@@ -138,3 +162,18 @@ def test_submitted_defaults_false_and_api_fields_default_none() -> None:
     assert record.submitted is False
     assert record.api_status is None
     assert record.api_message is None
+
+
+def test_training_label_fields_default_none_and_round_trip(tmp_path: Path) -> None:
+    """Restarbeit Teil A: both None for a run that never reached the fit
+    step; both real ints round-trip through a written-then-read line
+    unchanged when a run did."""
+    default_record = _sample_record()
+    assert default_record.n_training_rows is None
+    assert default_record.n_training_labels is None
+
+    path = tmp_path / "submissions.jsonl"
+    append_submission_record(path, _sample_record(n_training_rows=2160, n_training_labels=2136))
+    records = read_submission_records(path)
+    assert records[0]["n_training_rows"] == 2160
+    assert records[0]["n_training_labels"] == 2136

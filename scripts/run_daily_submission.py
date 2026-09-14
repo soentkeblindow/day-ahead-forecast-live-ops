@@ -228,10 +228,16 @@ def build_price_feature_matrix(
 
 def fit_predict_expand(
     df: pd.DataFrame, matrix: pd.DataFrame, fold: Fold, prices_qh: pd.DataFrame
-) -> pd.Series:
+) -> tuple[pd.Series, int, int]:
     """Fit the price model on fold.train_index, predict fold.test_index's 24
     hourly values, then expand to quarter-hourly via the shape profile (spec
     section 5.6).
+
+    Returns the quarter-hourly forecast plus ``(n_training_rows,
+    n_training_labels)`` (Restarbeit Teil A) -- read off the exact
+    ``x_train``/``y_train`` objects passed to ``model.fit()`` below, not a
+    separately re-derived count, so the protocol can never report a number
+    other than what was actually fitted (Restarbeit Teil A, P1).
 
     objective="quantile"/alpha=0.5 (the conditional median) stays the
     default per the 6.3 finding (CLAUDE.md: no robust case for switching);
@@ -259,6 +265,8 @@ def fit_predict_expand(
     y_hourly = df["day_ahead_price"]
     x_train = matrix.reindex(fold.train_index).dropna()
     y_train = y_hourly.reindex(fold.train_index).loc[x_train.index]
+    n_training_rows = len(x_train)
+    n_training_labels = int(y_train.notna().sum())
 
     model = LGBMForecaster(objective="quantile", alpha=0.5, random_state=0, n_jobs=1)
     model.fit(y_train, x_train)
@@ -274,7 +282,10 @@ def fit_predict_expand(
         n_days=SHAPE_WINDOW_DAYS,
         tz=LOCAL_TZ,
     )
-    return expand_to_quarterhour(pred_hourly, profile, target_day=fold.delivery_day, tz=LOCAL_TZ)
+    forecast = expand_to_quarterhour(
+        pred_hourly, profile, target_day=fold.delivery_day, tz=LOCAL_TZ
+    )
+    return forecast, n_training_rows, n_training_labels
 
 
 def build_arena_payload(
@@ -387,6 +398,11 @@ class SubmissionOutcome:
     renewables_runtime_seconds: float | None = None
     excluded_training_days: frozenset[dt.date] = field(default_factory=frozenset)
     commodity_staleness_warnings: dict[str, float] = field(default_factory=dict)
+    # Restarbeit Teil A: both None for any outcome returned before
+    # fit_predict_expand runs (Check A/extent/Check B skip) -- fitting never
+    # happened, so there is nothing real to report yet.
+    n_training_rows: int | None = None
+    n_training_labels: int | None = None
 
 
 def run_submission_for_day(
@@ -474,7 +490,9 @@ def run_submission_for_day(
             commodity_staleness_warnings=commodity_staleness_warnings,
         )
 
-    quarterhourly_forecast = fit_predict_expand(df, matrix, fold, prices_qh)
+    quarterhourly_forecast, n_training_rows, n_training_labels = fit_predict_expand(
+        df, matrix, fold, prices_qh
+    )
     payload, challenge = build_arena_payload(quarterhourly_forecast, target_day)
 
     plausibility = check_payload_plausibility(
@@ -489,6 +507,8 @@ def run_submission_for_day(
             renewables_runtime_seconds=renewables_runtime_seconds,
             excluded_training_days=frozenset(excluded),
             commodity_staleness_warnings=commodity_staleness_warnings,
+            n_training_rows=n_training_rows,
+            n_training_labels=n_training_labels,
         )
 
     # live=False always in 6.7.2 -- structurally never reaches submit.py's transport
@@ -503,6 +523,8 @@ def run_submission_for_day(
         renewables_runtime_seconds=renewables_runtime_seconds,
         excluded_training_days=frozenset(excluded),
         commodity_staleness_warnings=commodity_staleness_warnings,
+        n_training_rows=n_training_rows,
+        n_training_labels=n_training_labels,
     )
 
 
@@ -606,6 +628,8 @@ def build_submission_record(
         api_status="dry_run" if outcome.payload is not None else None,
         api_message=None,
         runtime_seconds=runtime_seconds,
+        n_training_rows=outcome.n_training_rows,
+        n_training_labels=outcome.n_training_labels,
     )
 
 
@@ -676,6 +700,21 @@ def run_daily_submission(
 
     if outcome.payload is not None:
         write_payload_to_repo(outcome.payload, target_day)
+
+    # Restarbeit Teil A.4: only surface this when it's actually nonzero -- a
+    # "0 missing labels" line every single day is noise nobody reads after a
+    # week, and the full numbers are already in logs/submissions.jsonl for
+    # 6.8 regardless of whether this line printed.
+    if (
+        outcome.n_training_rows is not None
+        and outcome.n_training_labels is not None
+        and outcome.n_training_rows > outcome.n_training_labels
+    ):
+        missing = outcome.n_training_rows - outcome.n_training_labels
+        print(
+            f"training labels: {missing} of {outcome.n_training_rows} "
+            "training row(s) have no real day_ahead_price label"
+        )
 
     if outcome.skip_reason is not None:
         print(f"SILENT — {outcome.skip_reason}")

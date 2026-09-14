@@ -14,6 +14,7 @@ from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import patch
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -32,6 +33,7 @@ from energy_price_forecast.data.capacity import CapacitySource
 from energy_price_forecast.data.weather_client import run_init_for_target_day
 from energy_price_forecast.data.weather_grid import expected_columns
 from energy_price_forecast.evaluation.walkforward import Fold
+from energy_price_forecast.features.build import build_feature_set_for_day
 from energy_price_forecast.features.nwp_fundamentals import IncompleteReconstructionError
 from energy_price_forecast.ops import protocol, store
 from energy_price_forecast.ops.store_sources import EntsoeSource
@@ -241,11 +243,14 @@ def test_fit_predict_expand_returns_a_full_quarterhourly_day() -> None:
         {"day_ahead_price": 50.0 + (qh_index.hour % 4).astype(float)}, index=qh_index
     )
 
-    result = fit_predict_expand(df, matrix, fold, prices_qh)
+    result, n_training_rows, n_training_labels = fit_predict_expand(df, matrix, fold, prices_qh)
 
     assert len(result) == 96  # DST-free day
     assert result.notna().all()
     assert pd.DatetimeIndex(result.index).tz is not None
+    # Restarbeit Teil A.5: complete data -> both counters equal.
+    assert n_training_rows == n_training_labels
+    assert n_training_rows == len(matrix.reindex(fold.train_index).dropna())
 
 
 def test_fit_predict_expand_drops_a_training_day_with_missing_price() -> None:
@@ -281,10 +286,16 @@ def test_fit_predict_expand_drops_a_training_day_with_missing_price() -> None:
     # Must not raise (LightGBM rejects a NaN target) and must still produce
     # a complete day -- the gap day is silently excluded from training, not
     # fabricated and not allowed to crash the fit.
-    result = fit_predict_expand(df, matrix, fold, prices_qh)
+    result, n_training_rows, n_training_labels = fit_predict_expand(df, matrix, fold, prices_qh)
 
     assert len(result) == 96
     assert result.notna().all()
+    # Restarbeit Teil A.5: the gap day's 24 hours stay in the feature matrix
+    # (features unaffected by the price gap) but lose their label -- checked
+    # on both sides, not just the difference, so the counter can't be
+    # accidentally len(matrix) computed twice.
+    assert n_training_rows == len(matrix.reindex(fold.train_index).dropna())
+    assert n_training_labels == n_training_rows - 24
 
 
 # ---------------------------------------------------------------------------
@@ -481,7 +492,9 @@ def test_run_submission_for_day_tolerates_a_known_defect_gap_in_training_window(
             "scripts.run_daily_submission.build_price_feature_matrix",
             return_value=(matrix, fold, gap_days),
         ),
-        patch("scripts.run_daily_submission.fit_predict_expand", return_value=forecast),
+        patch(
+            "scripts.run_daily_submission.fit_predict_expand", return_value=(forecast, 2160, 2160)
+        ),
         patch(
             "scripts.run_daily_submission.build_arena_payload", return_value=(payload, CHALLENGE)
         ),
@@ -551,7 +564,10 @@ def test_run_submission_for_day_stops_at_payload_plausibility() -> None:
             "scripts.run_daily_submission.build_price_feature_matrix",
             return_value=(matrix, fold, set()),
         ),
-        patch("scripts.run_daily_submission.fit_predict_expand", return_value=absurd_forecast),
+        patch(
+            "scripts.run_daily_submission.fit_predict_expand",
+            return_value=(absurd_forecast, 2160, 2160),
+        ),
         patch(
             "scripts.run_daily_submission.build_arena_payload",
             return_value=(absurd_payload, CHALLENGE),
@@ -593,7 +609,9 @@ def test_run_submission_for_day_happy_path_submits_dry_run() -> None:
             "scripts.run_daily_submission.build_price_feature_matrix",
             return_value=(matrix, fold, {dt.date(2026, 4, 20)}),
         ),
-        patch("scripts.run_daily_submission.fit_predict_expand", return_value=forecast),
+        patch(
+            "scripts.run_daily_submission.fit_predict_expand", return_value=(forecast, 2160, 2160)
+        ),
         patch(
             "scripts.run_daily_submission.build_arena_payload", return_value=(payload, CHALLENGE)
         ),
@@ -645,7 +663,9 @@ def test_run_submission_for_day_carries_commodity_staleness_warnings_through() -
             "scripts.run_daily_submission.build_price_feature_matrix",
             return_value=(matrix, fold, set()),
         ),
-        patch("scripts.run_daily_submission.fit_predict_expand", return_value=forecast),
+        patch(
+            "scripts.run_daily_submission.fit_predict_expand", return_value=(forecast, 2160, 2160)
+        ),
         patch(
             "scripts.run_daily_submission.build_arena_payload", return_value=(payload, CHALLENGE)
         ),
@@ -660,6 +680,215 @@ def test_run_submission_for_day_carries_commodity_staleness_warnings_through() -
 
     assert "ttf_gas_eur_per_mwh" in outcome.commodity_staleness_warnings
     assert outcome.commodity_staleness_warnings["ttf_gas_eur_per_mwh"] == pytest.approx(5.0)
+
+
+# ---------------------------------------------------------------------------
+# Restarbeit Teil B.2 (docs/sprint6_fix_partial_today.md section 4.1): the
+# real morning state -- "today" (the training window's own last day) has a
+# complete day_ahead_price/14.1.D forecast, but its own actuals/physical-flow
+# columns only reach ~11:00 local. A full run_submission_for_day over this
+# must produce a payload with today inside the training window. Unlike the
+# other run_submission_for_day tests in this file, build_price_feature_matrix
+# and fit_predict_expand run for REAL here (not mocked) -- that is the whole
+# point: only the real features/build.py + check_training_extent + LightGBM
+# fit path can prove today's row survives.
+#
+# Deliberately does NOT re-derive df via the real assemble_price_model_inputs
+# (df is built directly, already in the shape a correctly-fixed
+# assemble_price_model_inputs produces) -- that function's own row-keeping
+# fix already has its own direct test
+# (tests/test_live_inputs.py::test_assemble_price_model_inputs_keeps_a_row_missing_only_price).
+# run_renewables_step stays mocked, returning today's renewables prediction
+# directly, per this file's own stated convention -- and confirmed while
+# building this test (evaluation/renewables_walkforward.py::_build_target_table
+# already judges completeness against `raw = target_hourly[TARGET_COLUMNS[target]]`,
+# its own single target column, never the whole row -- section 3.2's "falls
+# P2 zeigt, dass die Strenge in der Zieltabelle sitzt" branch was not taken;
+# the actual bug lived entirely in assemble_price_model_inputs).
+# ---------------------------------------------------------------------------
+
+# Small, not the real 90/365 -- comfortably more than FeatureConfig's own
+# 191h/~8-day max lookback (section 4.1: "wenige Tage Historie").
+_SMALL_PRICE_TRAIN_SPAN_DAYS = 15
+_HISTORY_DAYS = 40  # >= SHAPE_WINDOW_DAYS (28) + _SMALL_PRICE_TRAIN_SPAN_DAYS margin
+
+
+def _build_partial_today_fixture() -> tuple[pd.DataFrame, pd.DataFrame, dt.date]:
+    """The section 4.1 table, literally: today's day_ahead_price/14.1.D-style
+    forecast columns are complete; today's actuals/physical-flow columns are
+    NaN from 11:00 local onward. target_day's own day_ahead_price is NaN
+    (the real future-price state), everything else about target_day is
+    normal. Returns (df, renewables_predictions, today)."""
+    target_day = _TARGET_DAY
+    today = target_day - dt.timedelta(days=1)
+    history_start = target_day - dt.timedelta(days=_HISTORY_DAYS - 1)
+    idx = pd.date_range(
+        pd.Timestamp(history_start, tz=LOCAL_TZ),
+        pd.Timestamp(target_day + dt.timedelta(days=1), tz=LOCAL_TZ),
+        freq="h",
+        inclusive="left",
+    ).tz_convert("UTC")
+
+    # Same raw-column shape as tests/test_arena_walkforward.py's own
+    # _build_full_hourly_df -- every column build_feature_set_for_day needs,
+    # constant-filled.
+    df = pd.DataFrame(
+        {
+            # A real hour-of-day pattern, not a flat constant -- a constant
+            # target gives LightGBM nothing to learn from, which trips
+            # check_payload_plausibility's own degenerate-payload guard
+            # ("all values identical") for the wrong reason (no signal to
+            # fit, not a wiring fault). Structural realism only, per this
+            # test's own point (section 4.1: "prueft die Struktur, nicht die
+            # Zahlenqualitaet").
+            "day_ahead_price": 50.0 + 10.0 * np.sin(2 * np.pi * idx.hour / 24),
+            "load_actual": np.full(len(idx), 40000.0),
+            "load_forecast_day_ahead": np.full(len(idx), 40000.0),
+            "gen_wind_onshore": np.full(len(idx), 8000.0),
+            "wind_onshore_forecast": np.full(len(idx), 8000.0),
+            "gen_wind_offshore": np.full(len(idx), 2000.0),
+            "wind_offshore_forecast": np.full(len(idx), 2000.0),
+            "gen_solar": np.full(len(idx), 5000.0),
+            "solar_forecast": np.full(len(idx), 5000.0),
+            "scheduled_net_de_to_AT": np.full(len(idx), 1000.0),
+            "scheduled_net_de_to_BE": np.full(len(idx), 500.0),
+            "physical_net_de_to_AT": np.full(len(idx), 1200.0),
+            "physical_net_de_to_BE": np.full(len(idx), 600.0),
+            "ttf_gas_eur_per_mwh": np.full(len(idx), 30.0),
+            "eua_co2_eur_per_t": np.full(len(idx), 70.0),
+        },
+        index=idx,
+    )
+
+    # target_day's own price genuinely doesn't exist yet (that's the whole
+    # point of forecasting it) -- never a feature, only ever a label for
+    # some future training window, so NaN-ing it out cannot itself affect
+    # target_day's own feature row.
+    target_day_mask = pd.DatetimeIndex(df.index).tz_convert(LOCAL_TZ).normalize() == pd.Timestamp(
+        target_day, tz=LOCAL_TZ
+    )
+    df.loc[target_day_mask, "day_ahead_price"] = float("nan")
+
+    # today's actuals/physical-flow columns: real only through ~11:00 local
+    # (section 4.1's table row 5) -- day_ahead_price/14.1.D-style forecast
+    # columns above are deliberately left untouched for today (rows 1-2 of
+    # the same table: both are already fully published by now).
+    today_local = pd.DatetimeIndex(df.index).tz_convert(LOCAL_TZ)
+    today_after_11 = (today_local.normalize() == pd.Timestamp(today, tz=LOCAL_TZ)) & (
+        today_local.hour >= 11
+    )
+    actuals_columns = [
+        "load_actual",
+        "gen_wind_onshore",
+        "gen_wind_offshore",
+        "gen_solar",
+        "physical_net_de_to_AT",
+        "physical_net_de_to_BE",
+    ]
+    df.loc[today_after_11, actuals_columns] = float("nan")
+
+    # renewables_predictions covers the whole history through target_day,
+    # INCLUDING today -- section 3.2's fix (the renewables target table
+    # judges completeness by its own 3 target columns, not the whole row)
+    # is what makes this real in production; here it is the mocked
+    # run_renewables_step's return value, since that fix's own correctness
+    # is evaluation/renewables_walkforward.py's test suite's job, not this
+    # file's (see this file's own module docstring).
+    frames = []
+    for day_offset in range(_HISTORY_DAYS + 1):
+        day = history_start + dt.timedelta(days=day_offset)
+        day_start = pd.Timestamp(day, tz=LOCAL_TZ)
+        day_end = pd.Timestamp(day + dt.timedelta(days=1), tz=LOCAL_TZ)
+        target_index = pd.date_range(day_start, day_end, freq="h", inclusive="left").tz_convert(
+            "UTC"
+        )
+        run_init = run_init_for_target_day(day)
+        pred_index = pd.MultiIndex.from_arrays(
+            [pd.DatetimeIndex([run_init] * len(target_index), tz="UTC"), target_index],
+            names=["run_init_utc", "valid_time_utc"],
+        )
+        frames.append(
+            pd.DataFrame(
+                {
+                    "wind_onshore_mw_pred": np.full(len(target_index), 8000.0),
+                    "wind_offshore_mw_pred": np.full(len(target_index), 2000.0),
+                    "solar_mw_pred": np.full(len(target_index), 5000.0),
+                },
+                index=pred_index,
+            )
+        )
+    renewables_predictions = pd.concat(frames)
+
+    return df, renewables_predictions, today
+
+
+def test_run_submission_for_day_includes_the_real_morning_state_of_today() -> None:
+    """docs/sprint6_fix_partial_today.md section 4.1 -- the fixture that
+    would have caught this a third time. as_of pinned to a real submission
+    slot (section 3.4 / this project's own convention against reading the
+    wall clock in any probe or test)."""
+    df, renewables_predictions, today = _build_partial_today_fixture()
+    as_of = pd.Timestamp(_TARGET_DAY - dt.timedelta(days=1), tz=LOCAL_TZ).replace(
+        hour=10, minute=40
+    )
+
+    prices_qh = df["day_ahead_price"].resample("15min").ffill().to_frame()
+
+    with (
+        patch("scripts.run_daily_submission.PRICE_TRAIN_SPAN_DAYS", _SMALL_PRICE_TRAIN_SPAN_DAYS),
+        patch("scripts.run_daily_submission.check_a_inputs", return_value=PreflightResult(ok=True)),
+        patch(
+            "scripts.run_daily_submission.run_renewables_step",
+            return_value=(renewables_predictions, 1.5),
+        ),
+    ):
+        outcome = run_submission_for_day(
+            df, pd.DataFrame(), prices_qh, _TARGET_DAY, as_of=as_of.tz_convert("UTC")
+        )
+
+    assert outcome.skip_reason is None, outcome.skip_reason
+    assert outcome.candidate_selected == "full_live_set"
+    assert outcome.payload is not None
+    assert len(outcome.payload["values"]) == 96
+    # The actual point: today is NOT excluded from the training window,
+    # despite its own actuals/flow columns being NaN from 11:00 local
+    # onward.
+    assert today not in outcome.excluded_training_days
+    # And today's label really was fitted, not silently masked out --
+    # cross-checks Restarbeit Teil A's own counters against this fixture.
+    assert outcome.n_training_rows is not None
+    assert outcome.n_training_labels == outcome.n_training_rows
+
+
+def test_todays_feature_row_is_unaffected_by_todays_own_actuals_being_empty() -> None:
+    """docs/sprint6_fix_partial_today.md section 4.3, point 4 -- the
+    empirical 48-hour-lag proof, not just an argument. Every lag on a
+    lagging-actuals series (load_actual, gen_*, physical_net_*) is >=48h
+    (features/config.py::FeatureConfig.max_lookback_hours's own inputs),
+    reaching back past today entirely -- so emptying ALL 24 of today's own
+    hours in those columns (not just from 11:00 onward, unlike the section
+    4.1 fixture above) must leave today's own feature row bit-identical.
+    A future feature rebuild that introduces a shorter lag on one of these
+    series would make this test fail, by design."""
+    df, renewables_predictions, today = _build_partial_today_fixture()
+    baseline_row = build_feature_set_for_day(today, df, renewables_predictions)
+
+    actuals_columns = [
+        "load_actual",
+        "gen_wind_onshore",
+        "gen_wind_offshore",
+        "gen_solar",
+        "physical_net_de_to_AT",
+        "physical_net_de_to_BE",
+    ]
+    df_emptied = df.copy()
+    today_local = pd.DatetimeIndex(df_emptied.index).tz_convert(LOCAL_TZ)
+    today_all_hours = today_local.normalize() == pd.Timestamp(today, tz=LOCAL_TZ)
+    df_emptied.loc[today_all_hours, actuals_columns] = float("nan")
+
+    emptied_row = build_feature_set_for_day(today, df_emptied, renewables_predictions)
+
+    pd.testing.assert_frame_equal(baseline_row, emptied_row)
 
 
 # ---------------------------------------------------------------------------
@@ -1054,7 +1283,10 @@ def test_run_submission_for_day_completes_without_calling_any_fetch_client(
                 "scripts.run_daily_submission.build_price_feature_matrix",
                 return_value=(matrix, fold, set()),
             ),
-            patch("scripts.run_daily_submission.fit_predict_expand", return_value=forecast),
+            patch(
+                "scripts.run_daily_submission.fit_predict_expand",
+                return_value=(forecast, 2160, 2160),
+            ),
             patch(
                 "scripts.run_daily_submission.build_arena_payload",
                 return_value=(payload, CHALLENGE),
@@ -1107,7 +1339,9 @@ def test_run_submission_for_day_never_passes_live_true_to_submit() -> None:
             "scripts.run_daily_submission.build_price_feature_matrix",
             return_value=(matrix, fold, set()),
         ),
-        patch("scripts.run_daily_submission.fit_predict_expand", return_value=forecast),
+        patch(
+            "scripts.run_daily_submission.fit_predict_expand", return_value=(forecast, 2160, 2160)
+        ),
         patch(
             "scripts.run_daily_submission.build_arena_payload", return_value=(payload, CHALLENGE)
         ),
