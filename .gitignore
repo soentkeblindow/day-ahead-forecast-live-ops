@@ -263,7 +263,8 @@ ops/trigger/.dev.vars.*
 # (test/lint/typecheck permission allowlist), settings.local.json is
 # personal and can reference session-specific paths (e.g. a scratchpad
 # script under a session temp dir) that won't exist in a future session.
-.claude/settings.local.json
+.claude
+
 
 # store.load_store() unpacks the published store's manifest.json directly
 # at the repo root (root == workdir, ops/store.py's own convention) -- a
