@@ -249,7 +249,12 @@ def test_append_probe_row_migrates_header_on_new_column(tmp_path: Path) -> None:
     assert "a_future_column" in df.columns
     assert len(df) == 2
     assert df.loc[0, "production_type"] == "load"
-    assert pd.isna(df.loc[0, "a_future_column"])
+    # pd.isna(df.loc[0, "a_future_column"]) triggers a spurious mypy
+    # "Statement is unreachable" on the NEXT line, reproduced in isolation --
+    # a pandas-stubs 3.0.5 vs. pandas 2.3.3 version-mismatch quirk, not a
+    # real code issue. df["col"].isna().iloc[0] checks the identical value
+    # without it.
+    assert df["a_future_column"].isna().iloc[0]
     assert df.loc[1, "a_future_column"] == "new"
 
 
