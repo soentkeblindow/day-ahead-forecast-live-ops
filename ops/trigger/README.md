@@ -32,21 +32,36 @@ fired -- the CET/CEST doubling was never actually load-bearing for that
 property. Full narrative: `docs/sprint6_step6_7_1_log.md`, step A2
 addendum.
 
-Current slot table (spec 6.7.2 section 3.4 -- the transitional, 9-slot
-occupancy; `audit.yml`/`weather_availability_probe.yml` retire in 6.7.3,
-leaving six):
+Current slot table (spec 6.7.2 section 3.4, the transitional 9-slot
+occupancy for the maintenance/audit/submission workflows -- `audit.yml`
+retires in 6.7.3, leaving six of those -- plus `weather_availability_probe.yml`'s
+own five slots, replaced 2026-09-15 from a single 06:30 slot,
+docs/sprint6_auftrag_energy_charts_backup.md section 4):
 
 | Local time (Europe/Berlin) | Workflow |
 |---|---|
-| 06:30 | `weather_availability_probe.yml` |
+| 08:30 | `weather_availability_probe.yml` |
+| 09:30 | `weather_availability_probe.yml` |
 | 09:30 | `audit.yml` |
 | 10:10 | `maintain_store.yml` |
+| 10:30 | `weather_availability_probe.yml` |
 | 10:40 | `submit.yml` |
 | 11:05 | `maintain_store.yml` |
 | 11:25 | `submit.yml` |
+| 11:30 | `weather_availability_probe.yml` |
 | 11:30 | `audit.yml` |
 | 11:40 | `maintain_store.yml` |
 | 11:50 | `submit.yml` |
+| 18:30 | `weather_availability_probe.yml` |
+
+The five `weather_availability_probe.yml` slots (owner-specified
+2026-09-15, replacing the original single 06:30 slot) exist for the
+Energy-Charts knowledge-time probe now riding along in the same workflow
+(`scripts/probe_energy_charts_forecast.py`), not for the weather probe
+itself -- weather's own run has historically been available well before
+any of these times. Four samples spread across the pre-gate-closure (12:00
+local) morning, plus one past 18:00 (an independent timing check, not
+useful for a submission itself).
 
 The three submission slots are deliberately interleaved with, not appended
 after, the maintenance slots: Pflege 10:10 -> Einreichung 10:40 -> Pflege

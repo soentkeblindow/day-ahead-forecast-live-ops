@@ -47,10 +47,25 @@ const REPO_NAME = "sbl-energy-forecast";
 // -- see that function's comment.
 const POLL_INTERVAL_MINUTES = 5;
 
+// weather_availability_probe.yml's own five slots (08:30/09:30/10:30/11:30/
+// 18:30, owner-specified 2026-09-15, replacing the original single 06:30
+// slot entirely) exist for the Energy-Charts knowledge-time probe now
+// riding along in the same workflow (scripts/probe_energy_charts_forecast.py,
+// docs/sprint6_auftrag_energy_charts_backup.md section 4): four spread
+// across the pre-gate-closure (12:00 local) morning -- a single very-early
+// check only shows whether a forecast published overnight, never whether
+// one published later in the morning would still land in time -- plus the
+// section-4-mandated post-18:00 check (independent confirmation that a
+// late-arriving series really is 14.1.D-timed, not useful for a submission
+// itself). Same local time as an existing audit.yml slot (09:30, 11:30) is
+// not a conflict -- SLOTS supports several workflows per tick, each
+// dispatched independently.
 const SLOTS: Slot[] = [
-  { localTime: "06:30", workflow: "weather_availability_probe.yml" },
+  { localTime: "08:30", workflow: "weather_availability_probe.yml" },
+  { localTime: "09:30", workflow: "weather_availability_probe.yml" },
   { localTime: "09:30", workflow: "audit.yml" },
   { localTime: "10:10", workflow: "maintain_store.yml" },
+  { localTime: "10:30", workflow: "weather_availability_probe.yml" },
   // Submission slots (spec 6.7.2, section 3.4) -- deliberately interleaved
   // with the maintenance/audit slots, not appended after them: Pflege 10:10
   // -> Einreichung 10:40 -> Pflege 11:05 (a second chance for the load
@@ -62,9 +77,11 @@ const SLOTS: Slot[] = [
   { localTime: "10:40", workflow: "submit.yml" },
   { localTime: "11:05", workflow: "maintain_store.yml" },
   { localTime: "11:25", workflow: "submit.yml" },
+  { localTime: "11:30", workflow: "weather_availability_probe.yml" },
   { localTime: "11:30", workflow: "audit.yml" },
   { localTime: "11:40", workflow: "maintain_store.yml" },
   { localTime: "11:50", workflow: "submit.yml" },
+  { localTime: "18:30", workflow: "weather_availability_probe.yml" },
 ];
 
 function localHHMM(utcMillis: number): string {
