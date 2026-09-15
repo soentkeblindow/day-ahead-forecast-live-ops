@@ -21,9 +21,11 @@ permissions:
 jobs:
   probe:
     runs-on: ubuntu-latest
-    # A single HTTP call plus at most two transport retries -- generous but
-    # much smaller than audit.yml's 20 min, which exists for a six-series
-    # ENTSO-E fetch this job doesn't do.
+    # Weather (one HTTP call) plus the Energy-Charts knowledge-time probe
+    # (docs/sprint6_auftrag_energy_charts_backup.md -- four series, paced
+    # 30s apart against the 2 req/min default rate limit, ~90s minimum) --
+    # still generous against audit.yml's 20 min for a six-series ENTSO-E
+    # fetch this job doesn't do.
     timeout-minutes: 10
     steps:
       - name: Checkout repository
@@ -45,18 +47,24 @@ jobs:
       - name: Probe weather run availability
         run: uv run python scripts/probe_weather_availability.py
 
+      # No secret: Energy-Charts' public tier needs no API key either.
+      # Collects only (docs/sprint6_auftrag_energy_charts_backup.md section
+      # 6) -- never touches the store, a feature, or the submission path.
+      - name: Probe Energy-Charts forecast knowledge time
+        run: uv run python scripts/probe_energy_charts_forecast.py
+
       # A probe that measures and then discards its result is worse than
       # none (same argument as audit.yml) -- a push failure here must
       # redden the job, not be swallowed. Same retry/conflict mechanics as
       # audit.yml (spec §3.1, point 7): git pull --rebase covers overlapping
       # runs, the empty-diff guard covers the should-never-happen case of no
       # new row.
-      - name: Commit and push the availability log
+      - name: Commit and push the availability logs
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add logs/weather_availability_probe.csv
+          git add logs/weather_availability_probe.csv logs/energy_charts_forecast_probe.csv
 
           if git diff --staged --quiet; then
             echo "No changes to commit."

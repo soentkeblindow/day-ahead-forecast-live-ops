@@ -1,0 +1,5 @@
+probe_timestamp_utc,run_id,target_day,minutes_to_gate_closure,production_type,forecast_type,echoed_production_type,echoed_forecast_type,n_values,coverage_ratio,first_ts,last_ts,http_status,error_kind,deprecated
+2026-09-15T16:15:15.900830+00:00,local,2026-09-16,-375.3,load,day-ahead,load,day-ahead,96,1.0,2026-09-15T22:00:00+00:00,2026-09-16T21:45:00+00:00,200,,False
+2026-09-15T16:15:46.180851+00:00,local,2026-09-16,-375.8,solar,day-ahead,,,0,0.0,,,404,not_available,
+2026-09-15T16:16:16.731552+00:00,local,2026-09-16,-376.3,wind_onshore,day-ahead,,,0,0.0,,,404,not_available,
+2026-09-15T16:16:46.945627+00:00,local,2026-09-16,-376.8,wind_offshore,day-ahead,,,0,0.0,,,404,not_available,
