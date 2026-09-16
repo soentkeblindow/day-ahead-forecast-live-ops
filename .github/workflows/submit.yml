@@ -1,14 +1,29 @@
 name: Daily submission (dry run)
 
 on:
-  # workflow_dispatch only (spec 6.7.2, section 3.2) -- ops/trigger/'s
-  # Cloudflare Worker is the sole timekeeper (three slots: 10:40, 11:25,
-  # 11:50 Europe/Berlin, spec section 3.4), same pattern as
-  # maintain_store.yml/audit.yml. No inputs: the dispatch call passes none
-  # (ops/trigger/src/index.ts::dispatchWorkflow), so this workflow derives
-  # its own nominal slot and last-slot-of-day status from wall-clock time
-  # below, rather than trusting a caller-supplied label.
-  workflow_dispatch: {}
+  # workflow_dispatch only -- ops/trigger/'s Cloudflare Worker is the sole
+  # timekeeper (three slots: 10:40, 11:15, 11:40 Europe/Berlin, spec 6.7.3
+  # section 2.2), same pattern as maintain_store.yml. The trigger passes
+  # nominal_slot/is_last_slot_of_day as dispatch inputs (ops/trigger/src/
+  # index.ts::SLOTS) -- it already knows which slot it meant to fire, so
+  # this workflow no longer re-derives that from its own wall-clock start
+  # time (spec 6.7.2's derivation trusted the job to still be running
+  # inside its intended slot's window, which a run queued behind a slow
+  # maintain_store.yml -- the whole reason for section 2.1's soft budget --
+  # is no longer guaranteed to do). Defaults cover a manual dispatch with
+  # no inputs (e.g. an ad-hoc debug run): a generic, never-red label,
+  # matching scripts/run_daily_submission.py::main()'s own pre-existing
+  # environment-variable defaults.
+  workflow_dispatch:
+    inputs:
+      nominal_slot:
+        description: "Which of today's submission slots this run represents (spec 6.7.3 section 2.2)."
+        required: false
+        default: "manual"
+      is_last_slot_of_day:
+        description: "Whether this is the day's last submission attempt -- only the last slot's own silence turns the run red (spec 6.7.2 section 2.7). 'true' or 'false'."
+        required: false
+        default: "false"
 
 concurrency:
   # Shares maintain_store.yml's own group (spec section 3.2: "gemeinsame
@@ -47,31 +62,6 @@ jobs:
       - name: Install dependencies
         run: uv sync --all-extras --dev
 
-      # No timing input is passed by the dispatch call (see the on: block above),
-      # so the run derives its own nominal slot and last-slot-of-day status from
-      # the current Europe/Berlin wall-clock time, matching ops/trigger/'s own
-      # SLOTS table (10:40, 11:25, 11:50). is_last_slot uses a midpoint threshold
-      # (11:35, between the last two slots) rather than exact-time matching, to
-      # tolerate a dispatch running a few minutes late without misclassifying
-      # which slot it is (spec section 2.7: red is a property of the day's LAST
-      # slot only).
-      - name: Determine nominal slot
-        id: slot
-        run: |
-          set -euo pipefail
-          LOCAL_TIME=$(TZ=Europe/Berlin date +%H:%M)
-          if [[ "$LOCAL_TIME" < "11:00" ]]; then
-            NOMINAL_SLOT="10:40"
-          elif [[ "$LOCAL_TIME" < "11:35" ]]; then
-            NOMINAL_SLOT="11:25"
-          else
-            NOMINAL_SLOT="11:50"
-          fi
-          IS_LAST_SLOT=$([[ "$LOCAL_TIME" > "11:35" || "$LOCAL_TIME" == "11:35" ]] && echo true || echo false)
-          echo "nominal_slot=$NOMINAL_SLOT" >> "$GITHUB_OUTPUT"
-          echo "is_last_slot=$IS_LAST_SLOT" >> "$GITHUB_OUTPUT"
-          echo "Local time $LOCAL_TIME -> nominal_slot=$NOMINAL_SLOT is_last_slot=$IS_LAST_SLOT"
-
       # No ENTSOE_API_KEY (spec section 3.4 -- a property this job's own "no
       # fetch client" test enforces, not just an omission here): the job reads
       # the store and the on-disk weather/commodity caches only. GITHUB_TOKEN
@@ -85,8 +75,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ARENA_API_KEY: ${{ secrets.ARENA_API_KEY }}
           ARENA_API_BASE_URL: ${{ vars.ARENA_API_BASE_URL }}
-          NOMINAL_SLOT: ${{ steps.slot.outputs.nominal_slot }}
-          IS_LAST_SLOT_OF_DAY: ${{ steps.slot.outputs.is_last_slot }}
+          NOMINAL_SLOT: ${{ inputs.nominal_slot }}
+          IS_LAST_SLOT_OF_DAY: ${{ inputs.is_last_slot_of_day }}
         run: uv run python scripts/run_daily_submission.py
 
       # Same push discipline as maintain_store.yml/audit.yml (spec section

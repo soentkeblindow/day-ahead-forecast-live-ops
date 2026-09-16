@@ -35,6 +35,17 @@ interface Slot {
   /** HH:MM in Europe/Berlin, the intended local fire time. */
   localTime: string;
   workflow: string;
+  /** Extra workflow_dispatch inputs to send with this slot's dispatch
+   * (spec 6.7.3 section 2.2) -- submit.yml reads nominal_slot/
+   * is_last_slot_of_day from these instead of deriving them from wall-clock
+   * time at execution. The old derivation trusted the job's own start time
+   * to still fall in the intended slot's window, which a run queued behind
+   * a slow maintain_store.yml run (the whole reason for section 2.1's soft
+   * budget) is no longer guaranteed to do -- this worker already knows
+   * which slot it meant to fire, no need to re-guess it downstream. Omitted
+   * for slots that need no inputs (maintain_store.yml/
+   * weather_availability_probe.yml). */
+  inputs?: Record<string, string>;
 }
 
 const REPO_OWNER = "soentkeblindow";
@@ -47,40 +58,46 @@ const REPO_NAME = "sbl-energy-forecast";
 // -- see that function's comment.
 const POLL_INTERVAL_MINUTES = 5;
 
-// weather_availability_probe.yml's own five slots (08:30/09:30/10:30/11:30/
-// 18:30, owner-specified 2026-09-15, replacing the original single 06:30
-// slot entirely) exist for the Energy-Charts knowledge-time probe now
-// riding along in the same workflow (scripts/probe_energy_charts_forecast.py,
-// docs/sprint6_auftrag_energy_charts_backup.md section 4): four spread
-// across the pre-gate-closure (12:00 local) morning -- a single very-early
-// check only shows whether a forecast published overnight, never whether
-// one published later in the morning would still land in time -- plus the
-// section-4-mandated post-18:00 check (independent confirmation that a
-// late-arriving series really is 14.1.D-timed, not useful for a submission
-// itself). Same local time as an existing audit.yml slot (09:30, 11:30) is
-// not a conflict -- SLOTS supports several workflows per tick, each
-// dispatched independently.
+// Rebuilt for spec 6.7.3 section 2.2 (owner-confirmed 2026-09-16, an
+// addition to the spec's own baseline three-maintenance-pass schedule --
+// see docs/sprint6_step6_7_3.md section 2.2 for the full worst-case-timing
+// derivation): audit.yml's slots are gone entirely (workflow_dispatch-only
+// from here on, manual diagnosis only -- the workflow file itself already
+// dropped its schedule: trigger back in 6.7.1); weather_availability_probe.yml
+// keeps its pre-gate-closure morning slots (08:30/09:30) and its post-18:00
+// confirmation slot (18:30), but loses 10:30/11:30 -- section 2.2 requires
+// it out of the 10:00-12:00 window entirely, since it must never take
+// priority over maintenance/submission (it is deliberately NOT in the
+// maintain-store concurrency group either, see submit.yml's own comment).
 const SLOTS: Slot[] = [
   { localTime: "08:30", workflow: "weather_availability_probe.yml" },
   { localTime: "09:30", workflow: "weather_availability_probe.yml" },
-  { localTime: "09:30", workflow: "audit.yml" },
+  // Maintenance/submission window (spec 6.7.3 section 2.2): three passes of
+  // each, interleaved -- Pflege 10:10 -> Einreichung 10:40 -> Pflege 10:55
+  // (a second chance for the load forecast and the weather run) ->
+  // Einreichung 11:15 -> Pflege 11:25 (a third chance) -> Einreichung 11:40
+  // (the day's last submission attempt, ~20 minutes clear of the 12:00 gate
+  // closure even in the worst case). submit.yml's own nominal_slot/
+  // is_last_slot_of_day inputs replace its former wall-clock derivation --
+  // this worker already knows which slot it meant to fire.
   { localTime: "10:10", workflow: "maintain_store.yml" },
-  { localTime: "10:30", workflow: "weather_availability_probe.yml" },
-  // Submission slots (spec 6.7.2, section 3.4) -- deliberately interleaved
-  // with the maintenance/audit slots, not appended after them: Pflege 10:10
-  // -> Einreichung 10:40 -> Pflege 11:05 (a second chance for the load
-  // forecast and the weather run) -> Einreichung 11:25 -> Pflege 11:40 (a
-  // third chance, right before the final submission attempt) -> Einreichung
-  // 11:50. The real day-ahead window is only two hours wide because the
-  // load forecast is only guaranteed at 10:00 local. Transitional 9-slot
-  // day (audit.yml/weather_availability_probe.yml retire in 6.7.3).
-  { localTime: "10:40", workflow: "submit.yml" },
-  { localTime: "11:05", workflow: "maintain_store.yml" },
-  { localTime: "11:25", workflow: "submit.yml" },
-  { localTime: "11:30", workflow: "weather_availability_probe.yml" },
-  { localTime: "11:30", workflow: "audit.yml" },
-  { localTime: "11:40", workflow: "maintain_store.yml" },
-  { localTime: "11:50", workflow: "submit.yml" },
+  {
+    localTime: "10:40",
+    workflow: "submit.yml",
+    inputs: { nominal_slot: "10:40", is_last_slot_of_day: "false" },
+  },
+  { localTime: "10:55", workflow: "maintain_store.yml" },
+  {
+    localTime: "11:15",
+    workflow: "submit.yml",
+    inputs: { nominal_slot: "11:15", is_last_slot_of_day: "false" },
+  },
+  { localTime: "11:25", workflow: "maintain_store.yml" },
+  {
+    localTime: "11:40",
+    workflow: "submit.yml",
+    inputs: { nominal_slot: "11:40", is_last_slot_of_day: "true" },
+  },
   { localTime: "18:30", workflow: "weather_availability_probe.yml" },
 ];
 
@@ -127,8 +144,21 @@ function inSlotWindow(actualLocal: string, intendedLocal: string): boolean {
   return delta < POLL_INTERVAL_MINUTES;
 }
 
-async function dispatchWorkflow(workflow: string, token: string): Promise<Response> {
+async function dispatchWorkflow(
+  workflow: string,
+  token: string,
+  inputs?: Record<string, string>
+): Promise<Response> {
   const url = `https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/actions/workflows/${workflow}/dispatches`;
+  // GitHub Actions workflow_dispatch inputs are always strings regardless of
+  // their declared `type:` in the workflow YAML (a `type: boolean` input
+  // still arrives in ${{ inputs.x }} as the literal string "true"/"false")
+  // -- Slot.inputs' Record<string, string> type matches that directly, no
+  // JSON boolean/number encoding to get right here.
+  const body: { ref: string; inputs?: Record<string, string> } = { ref: "main" };
+  if (inputs) {
+    body.inputs = inputs;
+  }
   return fetch(url, {
     method: "POST",
     headers: {
@@ -138,7 +168,7 @@ async function dispatchWorkflow(workflow: string, token: string): Promise<Respon
       "User-Agent": "sbl-energy-forecast-trigger",
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ ref: "main" }),
+    body: JSON.stringify(body),
   });
 }
 
@@ -159,7 +189,7 @@ export default {
       // the process's (spec section 5.1: "Kein Retry auf Zeitbasis"). Same
       // argument as weather_client.py's WeatherRunUnavailable: one attempt,
       // no waiting -- the next slot tries again tomorrow.
-      const response = await dispatchWorkflow(slot.workflow, env.GITHUB_DISPATCH_TOKEN);
+      const response = await dispatchWorkflow(slot.workflow, env.GITHUB_DISPATCH_TOKEN, slot.inputs);
       if (!response.ok) {
         console.error(
           `Dispatch failed for ${slot.workflow}: HTTP ${response.status} ${await response.text()}`

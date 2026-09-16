@@ -28,8 +28,11 @@ import argparse
 import datetime as dt
 import logging
 import sys
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Final
 
 import pandas as pd
 
@@ -75,6 +78,32 @@ _COMMODITY_DEFAULT_LOOKBACK_DAYS = 400
 # already-cached day is a path check, no network call (fetch_run's own
 # use_cache=True cache-hit short-circuit).
 WEATHER_BACKFILL_DAYS = 2
+
+# Spec 6.7.3 section 2.1: a soft internal deadline so a degraded ENTSO-E
+# can no longer make the whole run miss store.publish_store() entirely (the
+# 2026-09-16 incident -- the job was killed by the external 20-minute
+# GitHub Actions timeout mid heal-loop, discarding a run whose weather sync
+# had, as far as the log could show, already succeeded). Derived from 12
+# real successful runs (docs/sprint6_step6_7_3_log.md section 3.1 point 2):
+# worst observed successful "Sync the data store" step was 715s (11.9 min),
+# median 143s. 900s leaves that worst case comfortable headroom without
+# eating into the margin the hard 1200s (20 min) kill needs for one more
+# slow step plus publish_store() plus the commit step -- see the log for
+# the full derivation.
+SYNC_SOFT_BUDGET_SECONDS: Final[int] = 900
+
+
+def _budget_exhausted(started_at: float, clock: Callable[[], float]) -> bool:
+    """True once the soft budget is used up (spec 2.1).
+
+    Checked before starting each new unit of work (every ENTSO-E source in
+    the main loop, every heal step). It never interrupts a running call, so
+    the budget must leave room for the longest single step, publish_store()
+    and the commit step -- see the derivation in the step log.
+
+    ``clock`` is injectable so tests never wait in real time.
+    """
+    return (clock() - started_at) >= SYNC_SOFT_BUDGET_SECONDS
 
 
 @dataclass
@@ -496,22 +525,22 @@ def _write_log_row(
     pd.concat([existing, frame], ignore_index=True).to_csv(STORE_SYNC_LOG, index=False)
 
 
-def main() -> int:
+def run_sync(
+    *,
+    only: set[str] | None,
+    dry_run: bool,
+    clock: Callable[[], float] = time.monotonic,
+) -> int:
+    """The maintenance run itself (spec 6.7.3 section 2.1/5.2), taking the
+    soft-budget clock as an explicit argument -- same testability principle
+    as ``as_of`` elsewhere in this codebase, so a test can simulate a slow
+    run without waiting in real time or patching the global clock. ``main()``
+    is the only caller that uses the real ``time.monotonic``.
+    """
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--dry-run", action="store_true", help="Compute everything, upload nothing."
-    )
-    parser.add_argument(
-        "--sources",
-        default=None,
-        help="Comma-separated subset of source names, for manual debugging.",
-    )
-    args = parser.parse_args()
-
+    started_at = clock()
     as_of = pd.Timestamp.now(tz="UTC")
     log = RunLog()
-    only = set(args.sources.split(",")) if args.sources else None
 
     try:
         state = store.load_store(PROJECT_ROOT)
@@ -522,12 +551,30 @@ def main() -> int:
 
     new_sources = dict(manifest.sources)
 
+    # Budget guard is not optional here (spec 2.1): on 2026-09-16 the main
+    # loop alone came close to exhausting the whole 20-minute hard timeout.
+    # A skipped source simply never gets a new entry written below, so it
+    # keeps whatever new_sources already inherited from the previous
+    # manifest above -- the same "previous state survives" semantics the
+    # existing failed-validation revert already has, no separate revert
+    # needed here.
+    skipped_main: list[str] = []
     for source in ENTSOE_SOURCES:
         if only and source.name not in only:
+            continue
+        if _budget_exhausted(started_at, clock):
+            skipped_main.append(source.name)
             continue
         entry = _sync_entsoe_source(source, manifest, as_of, log)
         if entry is not None:
             new_sources[source.name] = entry
+    if skipped_main:
+        log.any_failure = True
+        log.warnings.append(
+            f"sync budget ({SYNC_SOFT_BUDGET_SECONDS}s) exhausted -- "
+            f"{len(skipped_main)} source(s) skipped in the main fetch loop: "
+            f"{', '.join(skipped_main)}"
+        )
 
     for name, fetch, column in COMMODITY_SOURCES:
         if only and name not in only:
@@ -545,8 +592,21 @@ def main() -> int:
     # (spec section 2.6). Skipped for weather (immutable per-run files, no
     # "gap inside an already-written range" concept) and commodities
     # (handled by their own combine_first merge above already).
+    #
+    # Budget guard here too (spec 2.1) -- this is the loop that actually
+    # exhausted the job on 2026-09-16 (each iteration's own existing_frame
+    # fetch can itself hit a live, retry-heavy ENTSO-E call, e.g.
+    # cross_border_flows' multi-neighbour cache-miss cascade). A skipped
+    # source keeps whatever entry the main loop above already gave it (or
+    # the inherited previous-manifest entry if the main loop skipped it
+    # too) -- never healed this run, not reverted, exactly the same
+    # "previous state survives" semantics as the main loop's own skip.
+    skipped_heal: list[str] = []
     for source in ENTSOE_SOURCES:
         if only and source.name not in only:
+            continue
+        if _budget_exhausted(started_at, clock):
+            skipped_heal.append(source.name)
             continue
         current_entry = new_sources.get(source.name)
         if current_entry is None or current_entry.covered_end_utc is None:
@@ -594,6 +654,13 @@ def main() -> int:
                 as_of - pd.Timedelta(days=store.HEAL_LOOKBACK_DAYS),
                 as_of,
             )
+    if skipped_heal:
+        log.any_failure = True
+        log.warnings.append(
+            f"sync budget ({SYNC_SOFT_BUDGET_SECONDS}s) exhausted -- "
+            f"{len(skipped_heal)} source(s) skipped in the heal loop: "
+            f"{', '.join(skipped_heal)}"
+        )
 
     run_id, run_url = run_id_and_url()
     sha = code_sha()
@@ -606,8 +673,13 @@ def main() -> int:
         sources=new_sources,
     )
 
+    # Runs regardless of a budget skip above (spec 2.1: "Der Lauf läuft
+    # regulär bis publish_store() durch") -- the whole point of the guard
+    # is that a slow ENTSO-E can only ever cost the skipped sources their
+    # own freshness this run, never the already-successful work (weather
+    # included) that a hard external kill used to discard entirely.
     store_bytes: int | None = None
-    if not args.dry_run:
+    if not dry_run:
         asset = store.publish_store(PROJECT_ROOT, manifest)
         store_bytes = asset.size_bytes
         size_warning = store.check_store_size(asset.size_bytes)
@@ -634,6 +706,21 @@ def main() -> int:
     # (spec section 2.7, "der rote Lauf ... ist der Ersatz [für
     # Melde-Infrastruktur]").
     return 1 if log.any_failure else 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Compute everything, upload nothing."
+    )
+    parser.add_argument(
+        "--sources",
+        default=None,
+        help="Comma-separated subset of source names, for manual debugging.",
+    )
+    args = parser.parse_args()
+    only = set(args.sources.split(",")) if args.sources else None
+    return run_sync(only=only, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":
