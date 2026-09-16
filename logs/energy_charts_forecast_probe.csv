@@ -15,3 +15,7 @@ probe_timestamp_utc,run_id,target_day,minutes_to_gate_closure,production_type,fo
 2026-09-16T07:32:08.860657+00:00,35068930984,2026-09-17,147.9,solar,day-ahead,,,0,0.0,,,404,not_available,
 2026-09-16T07:32:39.472975+00:00,35068930984,2026-09-17,147.3,wind_onshore,day-ahead,,,0,0.0,,,404,not_available,
 2026-09-16T07:33:10.089291+00:00,35068930984,2026-09-17,146.8,wind_offshore,day-ahead,,,0,0.0,,,404,not_available,
+2026-09-16T08:31:49.862186+00:00,35074225209,2026-09-17,88.2,load,day-ahead,,,0,0.0,,,404,not_available,
+2026-09-16T08:32:21.503463+00:00,35074225209,2026-09-17,87.6,solar,day-ahead,,,0,0.0,,,404,not_available,
+2026-09-16T08:32:52.154861+00:00,35074225209,2026-09-17,87.1,wind_onshore,day-ahead,,,0,0.0,,,404,not_available,
+2026-09-16T08:33:22.811947+00:00,35074225209,2026-09-17,86.6,wind_offshore,day-ahead,,,0,0.0,,,404,not_available,
