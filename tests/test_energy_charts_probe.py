@@ -10,11 +10,14 @@ from typing import Any
 
 import pandas as pd
 import pytest
+import requests
 
 from energy_price_forecast.data.energy_charts_probe import (
     SERIES,
     EnergyChartsProbeAnomalyError,
+    EnergyChartsRateLimitedError,
     append_probe_row,
+    fetch_series_range,
     probe_series,
 )
 from energy_price_forecast.ops.windows import local_day_bounds, next_delivery_day
@@ -24,15 +27,27 @@ _RUN_ID = "test-run"
 
 
 class _FakeResponse:
-    def __init__(self, status_code: int, body: Any = None, *, not_json: bool = False) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        body: Any = None,
+        *,
+        not_json: bool = False,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self.status_code = status_code
         self._body = body
         self._not_json = not_json
+        self.headers = headers or {}
 
     def json(self) -> Any:
         if self._not_json:
             raise ValueError("mock: not JSON")
         return self._body
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"mock: {self.status_code} error")
 
 
 def _full_payload(
@@ -45,6 +60,31 @@ def _full_payload(
     return {
         "unix_seconds": [int(ts.timestamp()) for ts in index],
         "forecast_values": [1.0 + i for i in range(len(index))],
+        "production_type": production_type,
+        "forecast_type": forecast_type,
+        "deprecated": False,
+    }
+
+
+def _range_payload(
+    start: dt.date,
+    end: dt.date,
+    production_type: str,
+    *,
+    forecast_type: str = "day-ahead",
+    null_at: list[int] | None = None,
+) -> dict[str, Any]:
+    day_start, _ = local_day_bounds(start)
+    _, day_end = local_day_bounds(end)
+    index = pd.date_range(
+        day_start.tz_convert("UTC"), day_end.tz_convert("UTC"), freq="15min", inclusive="left"
+    )
+    values: list[float | None] = [1.0 + i for i in range(len(index))]
+    for i in null_at or []:
+        values[i] = None
+    return {
+        "unix_seconds": [int(ts.timestamp()) for ts in index],
+        "forecast_values": values,
         "production_type": production_type,
         "forecast_type": forecast_type,
         "deprecated": False,
@@ -256,6 +296,92 @@ def test_append_probe_row_migrates_header_on_new_column(tmp_path: Path) -> None:
     # without it.
     assert df["a_future_column"].isna().iloc[0]
     assert df.loc[1, "a_future_column"] == "new"
+
+
+# ---------------------------------------------------------------------------
+# fetch_series_range: the historical bulk-fetch entry point
+# (docs/sprint6_auftrag_energy_charts_backup_2.md, Teil 1)
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_series_range_returns_utc_indexed_series(monkeypatch: pytest.MonkeyPatch) -> None:
+    start, end = dt.date(2024, 6, 1), dt.date(2024, 6, 2)
+    calls = _install_fake_get(monkeypatch, _FakeResponse(200, _range_payload(start, end, "load")))
+
+    series = fetch_series_range("load", start, end)
+
+    assert len(calls) == 1
+    assert calls[0]["start"] == start.isoformat()
+    assert calls[0]["end"] == end.isoformat()
+    assert series.name == "load"
+    assert isinstance(series.index, pd.DatetimeIndex)
+    assert str(series.index.tz) == "UTC"
+    assert len(series) == 96 * 2
+
+
+def test_fetch_series_range_keeps_null_values_as_nan(monkeypatch: pytest.MonkeyPatch) -> None:
+    start = end = dt.date(2024, 6, 1)
+    payload = _range_payload(start, end, "solar", null_at=[5, 6])
+    _install_fake_get(monkeypatch, _FakeResponse(200, payload))
+
+    series = fetch_series_range("solar", start, end)
+
+    assert series.isna().sum() == 2
+    assert series.notna().sum() == 94
+
+
+def test_fetch_series_range_raises_rate_limited_with_header_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    start = end = dt.date(2024, 6, 1)
+    _install_fake_get(monkeypatch, _FakeResponse(429, {}, headers={"Retry-After": "12"}))
+
+    with pytest.raises(EnergyChartsRateLimitedError) as exc_info:
+        fetch_series_range("wind_onshore", start, end)
+    assert exc_info.value.retry_after_s == 12.0
+
+
+def test_fetch_series_range_rate_limited_falls_back_without_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    start = end = dt.date(2024, 6, 1)
+    _install_fake_get(monkeypatch, _FakeResponse(429, {}))
+
+    with pytest.raises(EnergyChartsRateLimitedError) as exc_info:
+        fetch_series_range("wind_onshore", start, end)
+    assert exc_info.value.retry_after_s == 30.0
+
+
+def test_fetch_series_range_raises_http_error_on_server_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    start = end = dt.date(2024, 6, 1)
+    _install_fake_get(monkeypatch, _FakeResponse(500, {}))
+
+    with pytest.raises(requests.HTTPError):
+        fetch_series_range("wind_offshore", start, end)
+
+
+def test_fetch_series_range_raises_anomaly_on_deprecated(monkeypatch: pytest.MonkeyPatch) -> None:
+    start = end = dt.date(2024, 6, 1)
+    payload = _range_payload(start, end, "load")
+    payload["deprecated"] = True
+    _install_fake_get(monkeypatch, _FakeResponse(200, payload))
+
+    with pytest.raises(EnergyChartsProbeAnomalyError):
+        fetch_series_range("load", start, end)
+
+
+def test_fetch_series_range_raises_anomaly_on_echo_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    start = end = dt.date(2024, 6, 1)
+    payload = _range_payload(start, end, "load")
+    payload["production_type"] = "solar"
+    _install_fake_get(monkeypatch, _FakeResponse(200, payload))
+
+    with pytest.raises(EnergyChartsProbeAnomalyError):
+        fetch_series_range("load", start, end)
 
 
 # ---------------------------------------------------------------------------

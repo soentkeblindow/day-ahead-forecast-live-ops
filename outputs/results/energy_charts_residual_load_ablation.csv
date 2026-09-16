@@ -1,0 +1,26 @@
+# UPPER BOUND: these numbers use Energy-Charts values whose availability before gate closure is NOT measured (see docs/sprint6_auftrag_energy_charts_backup_2.md section 4 and the separate knowledge-time probe, scripts/probe_energy_charts_forecast.py). Reachable only if a later knowledge-time measurement confirms timely availability. mean_loss_diff_sq = loss(candidate) - loss(reference); negative means the candidate is better.
+row_type,candidate,reference,convention,rmse,mae,mean_loss_diff_sq,p_value,n_obs,hac_lag,horizon
+metric,core_ec_load,,,28.67987025820113,17.28401072152817,,,,,
+metric,core_ec_renewables,,,28.25965429967268,16.780931128320024,,,,,
+metric,core_ec_full,,,27.928296219377646,16.77299636437781,,,,,
+metric,core_no_commodities,,,28.899256150590336,17.40859420441043,,,,,
+metric,no_fundamentals,,,42.279181730285465,28.071641611748475,,,,,
+metric,baseline,,,45.27491471584702,28.36035757494287,,,,,
+dm_test,core_ec_load,baseline,native,,,-1227.2829444999716,0.0,29756,192,96
+dm_test,core_ec_load,baseline,daily,,,-1227.3903745837536,3.538502824085299e-12,310,7,1
+dm_test,core_ec_load,core_no_commodities,native,,,-12.632048030183439,0.24757663646826011,29756,192,96
+dm_test,core_ec_load,core_no_commodities,daily,,,-12.627188291454752,0.28084086338496483,310,7,1
+dm_test,core_ec_load,no_fundamentals,native,,,-964.9942497552544,0.0,29756,192,96
+dm_test,core_ec_load,no_fundamentals,daily,,,-965.0312628343908,3.8191672047105385e-14,310,7,1
+dm_test,core_ec_renewables,baseline,native,,,-1251.2098413902127,0.0,29756,192,96
+dm_test,core_ec_renewables,baseline,daily,,,-1251.3150727166174,3.510969293074595e-12,310,7,1
+dm_test,core_ec_renewables,core_no_commodities,native,,,-36.55894492042464,0.07030913369273661,29756,192,96
+dm_test,core_ec_renewables,core_no_commodities,daily,,,-36.5518864243186,0.1322428453434854,310,7,1
+dm_test,core_ec_renewables,no_fundamentals,native,,,-988.9211466454955,0.0,29756,192,96
+dm_test,core_ec_renewables,no_fundamentals,daily,,,-988.9559609672547,1.199040866595169e-13,310,7,1
+dm_test,core_ec_full,baseline,native,,,-1269.8281728099178,0.0,29756,192,96
+dm_test,core_ec_full,baseline,daily,,,-1269.9301086591959,7.265299473147024e-13,310,7,1
+dm_test,core_ec_full,core_no_commodities,native,,,-55.17727634012966,0.005544275541203625,29756,192,96
+dm_test,core_ec_full,core_no_commodities,daily,,,-55.16692236689715,0.006074309934835709,310,7,1
+dm_test,core_ec_full,no_fundamentals,native,,,-1007.5394780652007,0.0,29756,192,96
+dm_test,core_ec_full,no_fundamentals,daily,,,-1007.5709969098331,2.220446049250313e-14,310,7,1

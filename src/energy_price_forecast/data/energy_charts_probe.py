@@ -1,22 +1,29 @@
-"""Knowledge-time probe for the Energy-Charts ``public_power_forecast``
-endpoint (docs/sprint6_auftrag_energy_charts_backup.md).
+"""Client for the Energy-Charts ``public_power_forecast`` endpoint
+(docs/sprint6_auftrag_energy_charts_backup.md and its _backup_2.md follow-up).
 
-Measures, once per call, whether a day-ahead forecast series (load, solar,
-wind_onshore, wind_offshore) is fully available for a given delivery day at
-the moment of the probe -- never writes to the store, never feeds a
-feature, never touches the submission path (spec section 6). The question
-this answers: is ``public_power_forecast(forecast_type=day-ahead)``
-available before gate closure (12:00 Europe/Berlin on D-1), per series?
-Without this measurement, any live use of this endpoint would be an
-unchecked leakage assumption.
+Two consumers share this one module rather than each owning a separate
+client for the same endpoint (backup_2.md section 2's explicit rule):
 
-Every outcome except a genuine API-behavior anomaly is logged and treated
-as a successful measurement (spec section 5): a forecast that is not yet
-published, a rate limit, or a transport error are exactly what this probe
-exists to observe, not failures of the probe itself. Only a response that
-claims to be deprecated, or echoes back a different production_type /
-forecast_type than requested, is a structural anomaly worth reddening a
-workflow run over -- see ``EnergyChartsProbeAnomalyError``.
+- The knowledge-time probe (``probe_series``, ``scripts/probe_energy_charts_
+  forecast.py``): measures, once per call, whether a day-ahead forecast
+  series (load, solar, wind_onshore, wind_offshore) is fully available for a
+  given delivery day at the moment of the probe -- never writes to the
+  store, never feeds a feature, never touches the submission path. The
+  question it answers: is ``public_power_forecast(forecast_type=day-ahead)``
+  available before gate closure (12:00 Europe/Berlin on D-1), per series?
+  Every outcome except a genuine API-behavior anomaly is logged and treated
+  as a successful measurement: a forecast that is not yet published, a rate
+  limit, or a transport error are exactly what this probe exists to
+  observe, not failures of the probe itself.
+- The historical bulk fetch (``fetch_series_range``,
+  ``scripts/fetch_energy_charts_forecast_history.py``): pulls the same four
+  series over an arbitrary past date range for the backup_2.md Teil 1/2/3
+  measurement. Past history has no "not yet published" outcome, so this
+  raises (fail-fast) on any non-200 status instead of logging a row.
+
+Both raise ``EnergyChartsProbeAnomalyError`` for the same structural
+anomaly: a response claiming ``deprecated=true``, or one that echoes back a
+different ``production_type``/``forecast_type`` than requested.
 """
 
 from __future__ import annotations
@@ -70,6 +77,92 @@ class EnergyChartsProbeAnomalyError(RuntimeError):
     the workflow run reddens, the same red-vs-green split
     scripts/probe_weather_availability.py already applies to
     WeatherRunUnavailable vs. any other exception."""
+
+
+class EnergyChartsRateLimitedError(RuntimeError):
+    """The endpoint returned HTTP 429. ``retry_after_s`` is the server's own
+    ``Retry-After`` value (backup_2.md section 2, obligation 2: honour the
+    header, never assume a fixed wait -- falls back to
+    ``_DEFAULT_RETRY_AFTER_S`` only if the header is absent or unparseable,
+    which the docs don't rule out). Callers of ``fetch_series_range`` decide
+    whether and how long to wait; this module never sleeps on its own."""
+
+    def __init__(self, retry_after_s: float) -> None:
+        self.retry_after_s = retry_after_s
+        super().__init__(f"rate limited by {_ENDPOINT}, Retry-After={retry_after_s}s")
+
+
+_DEFAULT_RETRY_AFTER_S: Final = 30.0
+
+
+def _parse_retry_after(response: requests.Response) -> float:
+    header = response.headers.get("Retry-After")
+    if header is None:
+        return _DEFAULT_RETRY_AFTER_S
+    try:
+        return float(header)
+    except ValueError:
+        return _DEFAULT_RETRY_AFTER_S
+
+
+def fetch_series_range(production_type: str, start: dt.date, end: dt.date) -> pd.Series:
+    """Raw day-ahead forecast values for ``production_type`` over the local
+    calendar-date range [start, end] (both ends inclusive, per the
+    endpoint's own daily-format start/end convention), as a UTC-indexed
+    ``pd.Series`` -- ``None`` values kept as NaN, not dropped or clipped to
+    any expected grid. Grid measurement (backup_2.md section 2, obligation
+    4) is the caller's job, on the raw data this returns.
+
+    Raises ``EnergyChartsRateLimitedError`` on HTTP 429 (caller decides how
+    long to wait), ``requests.HTTPError`` on any other non-200 status
+    (fail-fast: unlike the probe, a gap in already-past history is not a
+    valid "not yet published" outcome), and ``EnergyChartsProbeAnomalyError``
+    on ``deprecated=true`` or a mismatched echoed production_type/
+    forecast_type -- the same anomaly class ``probe_series`` raises, same
+    endpoint, same failure semantics.
+    """
+    if production_type not in SERIES:
+        raise ValueError(f"production_type must be one of {SERIES}, got {production_type!r}")
+
+    params = {
+        "country": _COUNTRY,
+        "production_type": production_type,
+        "forecast_type": _FORECAST_TYPE,
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+    }
+    response = requests.get(_ENDPOINT, params=params, timeout=_TIMEOUT_S)
+
+    if response.status_code == 429:
+        raise EnergyChartsRateLimitedError(_parse_retry_after(response))
+    response.raise_for_status()
+
+    payload: dict[str, Any] = response.json()
+    echoed_production_type = payload.get("production_type", "")
+    echoed_forecast_type = payload.get("forecast_type", "")
+
+    if payload.get("deprecated"):
+        raise EnergyChartsProbeAnomalyError(
+            f"{production_type} [{start}..{end}]: endpoint reports deprecated=true"
+        )
+    if echoed_production_type != production_type or echoed_forecast_type != _FORECAST_TYPE:
+        raise EnergyChartsProbeAnomalyError(
+            f"{production_type} [{start}..{end}]: response echoes production_type="
+            f"{echoed_production_type!r} forecast_type={echoed_forecast_type!r}, requested "
+            f"production_type={production_type!r} forecast_type={_FORECAST_TYPE!r}"
+        )
+
+    unix_seconds = payload.get("unix_seconds", [])
+    forecast_values = payload.get("forecast_values", [])
+    if len(unix_seconds) != len(forecast_values):
+        raise EnergyChartsProbeAnomalyError(
+            f"{production_type} [{start}..{end}]: unix_seconds length {len(unix_seconds)} != "
+            f"forecast_values length {len(forecast_values)}"
+        )
+
+    index = pd.DatetimeIndex(pd.to_datetime(unix_seconds, unit="s", utc=True), name="timestamp")
+    values = [float(v) if v is not None else float("nan") for v in forecast_values]
+    return pd.Series(values, index=index, name=production_type, dtype="float64")
 
 
 def _request_params(production_type: str, target_day: dt.date) -> dict[str, str]:
