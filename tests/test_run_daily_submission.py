@@ -12,6 +12,7 @@ import datetime as dt
 import json
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import numpy as np
@@ -43,7 +44,7 @@ from scripts.run_daily_submission import (
     RENEWABLES_TRAIN_SPAN_DAYS,
     SubmissionOutcome,
     _silence_turns_run_red,
-    already_submitted,
+    accepted_earlier_today,
     build_arena_payload,
     build_price_feature_matrix,
     build_submission_record,
@@ -53,8 +54,11 @@ from scripts.run_daily_submission import (
     is_past_gate_closure,
     renewables_window,
     run_daily_submission,
+    run_daily_submission_smoke,
     run_renewables_step,
+    run_smoke_submission_for_day,
     run_submission_for_day,
+    smoke_target_day,
     source_ages_from_manifest,
     write_payload_to_repo,
 )
@@ -159,6 +163,13 @@ def test_run_renewables_step_slices_to_the_window_and_measures_runtime() -> None
 # evaluation/walkforward.py's and models/bridge.py's own test suites' job.
 _TARGET_DAY = dt.date(2026, 7, 15)
 _AS_OF = pd.Timestamp("2026-07-14T10:00", tz="UTC")
+# _AS_OF is exactly _TARGET_DAY's own gate closure moment (see _GATE_CLOSURE_UTC
+# below -- same value). spec 6.7.3 section 2.4's second, pre-POST gate check reads a
+# SEPARATE, later wall-clock moment (``now``) -- tests that need run_submission_for_day
+# to actually reach submit() must inject a ``now`` comfortably before closure, since the
+# real default (real wall-clock "now") would otherwise always see _TARGET_DAY as long
+# past its (fixed, 2026) deadline.
+_BEFORE_GATE_CLOSURE = _AS_OF - pd.Timedelta(hours=1)
 
 
 def _fake_feature_row(day: dt.date, df: pd.DataFrame, renewables: pd.DataFrame) -> pd.DataFrame:
@@ -505,7 +516,12 @@ def test_run_submission_for_day_tolerates_a_known_defect_gap_in_training_window(
         ),
     ):
         outcome = run_submission_for_day(
-            df, pd.DataFrame(), pd.DataFrame(), _TARGET_DAY, as_of=_AS_OF
+            df,
+            pd.DataFrame(),
+            pd.DataFrame(),
+            _TARGET_DAY,
+            as_of=_AS_OF,
+            now=lambda: _BEFORE_GATE_CLOSURE,
         )
 
     assert outcome.skip_reason is None
@@ -621,7 +637,12 @@ def test_run_submission_for_day_happy_path_submits_dry_run() -> None:
         ) as mock_submit,
     ):
         outcome = run_submission_for_day(
-            df, pd.DataFrame(), pd.DataFrame(), _TARGET_DAY, as_of=_AS_OF
+            df,
+            pd.DataFrame(),
+            pd.DataFrame(),
+            _TARGET_DAY,
+            as_of=_AS_OF,
+            now=lambda: _BEFORE_GATE_CLOSURE,
         )
 
     assert outcome.candidate_selected == "full_live_set"
@@ -676,7 +697,12 @@ def test_run_submission_for_day_carries_commodity_staleness_warnings_through() -
         ),
     ):
         outcome = run_submission_for_day(
-            df, pd.DataFrame(), pd.DataFrame(), _TARGET_DAY, as_of=_AS_OF
+            df,
+            pd.DataFrame(),
+            pd.DataFrame(),
+            _TARGET_DAY,
+            as_of=_AS_OF,
+            now=lambda: _BEFORE_GATE_CLOSURE,
         )
 
     assert "ttf_gas_eur_per_mwh" in outcome.commodity_staleness_warnings
@@ -854,7 +880,12 @@ def test_run_submission_for_day_includes_the_real_morning_state_of_today() -> No
         patch("scripts.run_daily_submission.get_challenge", return_value=CHALLENGE),
     ):
         outcome = run_submission_for_day(
-            df, pd.DataFrame(), prices_qh, _TARGET_DAY, as_of=as_of.tz_convert("UTC")
+            df,
+            pd.DataFrame(),
+            prices_qh,
+            _TARGET_DAY,
+            as_of=as_of.tz_convert("UTC"),
+            now=lambda: as_of.tz_convert("UTC"),
         )
 
     assert outcome.skip_reason is None, outcome.skip_reason
@@ -927,10 +958,20 @@ def test_run_submission_for_day_is_deterministic_on_identical_inputs() -> None:
         patch("scripts.run_daily_submission.get_challenge", return_value=CHALLENGE),
     ):
         outcome_1 = run_submission_for_day(
-            df, pd.DataFrame(), prices_qh, _TARGET_DAY, as_of=as_of.tz_convert("UTC")
+            df,
+            pd.DataFrame(),
+            prices_qh,
+            _TARGET_DAY,
+            as_of=as_of.tz_convert("UTC"),
+            now=lambda: as_of.tz_convert("UTC"),
         )
         outcome_2 = run_submission_for_day(
-            df, pd.DataFrame(), prices_qh, _TARGET_DAY, as_of=as_of.tz_convert("UTC")
+            df,
+            pd.DataFrame(),
+            prices_qh,
+            _TARGET_DAY,
+            as_of=as_of.tz_convert("UTC"),
+            now=lambda: as_of.tz_convert("UTC"),
         )
 
     assert outcome_1.skip_reason is None
@@ -958,12 +999,16 @@ def test_is_past_gate_closure_false_before_deadline() -> None:
 
 
 # ---------------------------------------------------------------------------
-# already_submitted
+# accepted_earlier_today (spec 6.7.3 section 2.4 -- day-coloring only, never a lock)
 # ---------------------------------------------------------------------------
 
 
 def _sample_record(
-    *, target_day: dt.date, candidate_selected: str | None, skip_reason: str | None = None
+    *,
+    target_day: dt.date,
+    candidate_selected: str | None,
+    skip_reason: str | None = None,
+    submitted: bool = False,
 ) -> protocol.SubmissionRecord:
     return protocol.SubmissionRecord(
         run_timestamp_utc="2026-07-14T09:00:00+00:00",
@@ -975,28 +1020,44 @@ def _sample_record(
         gate_closure_ok=True,
         candidate_selected=candidate_selected,
         skip_reason=skip_reason,
+        submitted=submitted,
     )
 
 
-def test_already_submitted_true_after_a_completed_run(tmp_path: Path) -> None:
+def test_accepted_earlier_today_true_after_an_accepted_submission(tmp_path: Path) -> None:
     log_path = tmp_path / "submissions.jsonl"
     protocol.append_submission_record(
-        log_path, _sample_record(target_day=_TARGET_DAY, candidate_selected="full_live_set")
+        log_path,
+        _sample_record(target_day=_TARGET_DAY, candidate_selected="full_live_set", submitted=True),
     )
-    assert already_submitted(log_path, _TARGET_DAY) is True
+    assert accepted_earlier_today(log_path, _TARGET_DAY) is True
 
 
-def test_already_submitted_false_after_only_a_skip(tmp_path: Path) -> None:
+def test_accepted_earlier_today_false_after_a_candidate_selected_but_not_submitted(
+    tmp_path: Path,
+) -> None:
+    """A dry-run (or a rejected/error live attempt) selected a candidate but
+    never got accepted -- must not count (spec section 2.4's own wording is
+    "keine Einreichung angenommen", not "kein Kandidat gewaehlt")."""
+    log_path = tmp_path / "submissions.jsonl"
+    protocol.append_submission_record(
+        log_path,
+        _sample_record(target_day=_TARGET_DAY, candidate_selected="full_live_set", submitted=False),
+    )
+    assert accepted_earlier_today(log_path, _TARGET_DAY) is False
+
+
+def test_accepted_earlier_today_false_after_only_a_skip(tmp_path: Path) -> None:
     log_path = tmp_path / "submissions.jsonl"
     protocol.append_submission_record(
         log_path,
         _sample_record(target_day=_TARGET_DAY, candidate_selected=None, skip_reason="Check A: x"),
     )
-    assert already_submitted(log_path, _TARGET_DAY) is False
+    assert accepted_earlier_today(log_path, _TARGET_DAY) is False
 
 
-def test_already_submitted_false_when_log_does_not_exist(tmp_path: Path) -> None:
-    assert already_submitted(tmp_path / "does_not_exist.jsonl", _TARGET_DAY) is False
+def test_accepted_earlier_today_false_when_log_does_not_exist(tmp_path: Path) -> None:
+    assert accepted_earlier_today(tmp_path / "does_not_exist.jsonl", _TARGET_DAY) is False
 
 
 # ---------------------------------------------------------------------------
@@ -1132,16 +1193,49 @@ def test_run_daily_submission_exits_cleanly_past_gate_closure() -> None:
     mock_store.load_store.assert_not_called()
 
 
-def test_run_daily_submission_exits_cleanly_when_already_submitted() -> None:
+def test_run_daily_submission_has_no_idempotency_lock_two_runs_both_load_the_store(
+    tmp_path: Path,
+) -> None:
+    """spec 6.7.3 section 2.4: the idempotency lock is gone -- an earlier
+    accepted submission for target_day must not make a second run for the
+    same day exit early. Proven the same way the 6.7.2 "Kein Netz" tests
+    prove their own guarantees: a call-count assertion on the thing that
+    would have been skipped, not just the exit code."""
     as_of = _GATE_CLOSURE_UTC - pd.Timedelta(hours=1)
+    log_path = tmp_path / "submissions.jsonl"
+    protocol.append_submission_record(
+        log_path,
+        _sample_record(target_day=_TARGET_DAY, candidate_selected="full_live_set", submitted=True),
+    )
+    fake_outcome = SubmissionOutcome(
+        candidate_selected="full_live_set",
+        skip_reason=None,
+        payload={"challenge_id": "2", "target_start": "x", "values": [1.0, 2.0]},
+        submission_result=SubmissionResult(sent=False, challenge_id="2"),
+    )
+    fake_manifest = _manifest({})
+
     with (
-        patch("scripts.run_daily_submission.already_submitted", return_value=True),
+        patch("scripts.run_daily_submission.SUBMISSIONS_LOG", log_path),
+        patch("scripts.run_daily_submission.PAYLOADS_DIR", tmp_path / "payloads"),
         patch("scripts.run_daily_submission.store") as mock_store,
+        patch(
+            "scripts.run_daily_submission.assemble_price_model_inputs", return_value=pd.DataFrame()
+        ),
+        patch("scripts.run_daily_submission.read_weather_runs", return_value=pd.DataFrame()),
+        patch(
+            "scripts.run_daily_submission.read_quarterhourly_prices", return_value=pd.DataFrame()
+        ),
+        patch(
+            "scripts.run_daily_submission.run_submission_for_day", return_value=fake_outcome
+        ) as mock_run,
     ):
-        exit_code = run_daily_submission(as_of, nominal_slot="10:40", is_last_slot_of_day=False)
+        mock_store.load_store.return_value.manifest = fake_manifest
+        exit_code = run_daily_submission(as_of, nominal_slot="11:15", is_last_slot_of_day=False)
 
     assert exit_code == 0
-    mock_store.load_store.assert_not_called()
+    mock_run.assert_called_once()
+    mock_store.load_store.assert_called_once()
 
 
 def test_run_daily_submission_happy_path_appends_protocol_and_writes_payload(
@@ -1214,6 +1308,157 @@ def test_run_daily_submission_silent_run_is_red_only_on_the_last_slot(tmp_path: 
 
     assert _run_once(is_last_slot=False) == 0
     assert _run_once(is_last_slot=True) == 1
+
+
+def test_run_daily_submission_last_slot_silence_stays_green_if_earlier_run_was_accepted(
+    tmp_path: Path,
+) -> None:
+    """spec 6.7.3 section 2.4: the last slot reads the protocol -- never a
+    lock -- for its own day-coloring decision. An earlier accepted
+    submission this day means a silent final run must NOT turn the day
+    red, unlike test_run_daily_submission_silent_run_is_red_only_on_the_last_slot's
+    own no-earlier-acceptance case."""
+    as_of = _GATE_CLOSURE_UTC - pd.Timedelta(hours=1)
+    log_path = tmp_path / "submissions.jsonl"
+    protocol.append_submission_record(
+        log_path,
+        _sample_record(target_day=_TARGET_DAY, candidate_selected="full_live_set", submitted=True),
+    )
+    fake_outcome = SubmissionOutcome(candidate_selected=None, skip_reason="Check A: no weather run")
+    fake_manifest = _manifest({})
+
+    with (
+        patch("scripts.run_daily_submission.SUBMISSIONS_LOG", log_path),
+        patch("scripts.run_daily_submission.PAYLOADS_DIR", tmp_path / "payloads"),
+        patch("scripts.run_daily_submission.store") as mock_store,
+        patch(
+            "scripts.run_daily_submission.assemble_price_model_inputs", return_value=pd.DataFrame()
+        ),
+        patch("scripts.run_daily_submission.read_weather_runs", return_value=pd.DataFrame()),
+        patch(
+            "scripts.run_daily_submission.read_quarterhourly_prices", return_value=pd.DataFrame()
+        ),
+        patch("scripts.run_daily_submission.run_submission_for_day", return_value=fake_outcome),
+    ):
+        mock_store.load_store.return_value.manifest = fake_manifest
+        exit_code = run_daily_submission(as_of, nominal_slot="11:40", is_last_slot_of_day=True)
+
+    assert exit_code == 0
+
+
+# ---------------------------------------------------------------------------
+# Response evaluation at the run_daily_submission level (spec 6.7.3 section
+# 5.5): accepted -> green with a SUBMITTED line; rejected/transport error ->
+# red immediately, on every slot, distinct from "SILENT".
+# ---------------------------------------------------------------------------
+
+
+def _run_with_fake_outcome(
+    tmp_path: Path, outcome: SubmissionOutcome, *, is_last_slot_of_day: bool = False
+) -> int:
+    as_of = _GATE_CLOSURE_UTC - pd.Timedelta(hours=1)
+    with (
+        patch("scripts.run_daily_submission.SUBMISSIONS_LOG", tmp_path / "submissions.jsonl"),
+        patch("scripts.run_daily_submission.PAYLOADS_DIR", tmp_path / "payloads"),
+        patch("scripts.run_daily_submission.store") as mock_store,
+        patch(
+            "scripts.run_daily_submission.assemble_price_model_inputs", return_value=pd.DataFrame()
+        ),
+        patch("scripts.run_daily_submission.read_weather_runs", return_value=pd.DataFrame()),
+        patch(
+            "scripts.run_daily_submission.read_quarterhourly_prices", return_value=pd.DataFrame()
+        ),
+        patch("scripts.run_daily_submission.run_submission_for_day", return_value=outcome),
+    ):
+        mock_store.load_store.return_value.manifest = _manifest({})
+        return run_daily_submission(
+            as_of, nominal_slot="10:40", is_last_slot_of_day=is_last_slot_of_day
+        )
+
+
+def test_run_daily_submission_accepted_live_submission_is_green_with_a_submitted_line(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    payload = {"challenge_id": "2", "target_start": "x", "values": [1.0] * 96}
+    outcome = SubmissionOutcome(
+        candidate_selected="full_live_set",
+        skip_reason=None,
+        payload=payload,
+        submission_result=SubmissionResult(
+            sent=True,
+            challenge_id="2",
+            accepted=True,
+            submission_id=42,
+            status="accepted",
+            response_received_utc="2026-07-14T09:10:00+00:00",
+            confirmed_via_query=True,
+        ),
+    )
+
+    exit_code = _run_with_fake_outcome(tmp_path, outcome)
+
+    assert exit_code == 0
+    assert "SUBMITTED" in capsys.readouterr().out
+
+    records = protocol.read_submission_records(tmp_path / "submissions.jsonl")
+    assert records[0]["submitted"] is True
+    assert records[0]["submission_mode"] == "live"
+    assert records[0]["submission_id"] == 42
+    assert records[0]["api_response_received_utc"] == "2026-07-14T09:10:00+00:00"
+    assert records[0]["confirmed_via_query"] is True
+
+
+def test_run_daily_submission_rejected_live_submission_is_red(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    payload = {"challenge_id": "2", "target_start": "x", "values": [1.0] * 96}
+    outcome = SubmissionOutcome(
+        candidate_selected="full_live_set",
+        skip_reason=None,
+        payload=payload,
+        submission_result=SubmissionResult(
+            sent=True,
+            challenge_id="2",
+            accepted=False,
+            error_kind="rejected",
+            http_status=422,
+            message="target_start is in the past",
+        ),
+    )
+
+    exit_code = _run_with_fake_outcome(tmp_path, outcome)
+
+    out = capsys.readouterr().out
+    assert exit_code == 1
+    assert "REJECTED" in out
+    assert "target_start is in the past" in out
+
+
+def test_run_daily_submission_transport_error_is_red_on_every_slot_not_just_the_last(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """spec 6.7.3 section 5.5: distinct from 'SILENT', a genuine failed
+    attempt turns THIS run red immediately -- unlike the day-coloring
+    logic that only reddens a silent day on its last slot."""
+    payload = {"challenge_id": "2", "target_start": "x", "values": [1.0] * 96}
+    outcome = SubmissionOutcome(
+        candidate_selected="full_live_set",
+        skip_reason=None,
+        payload=payload,
+        submission_result=SubmissionResult(
+            sent=True,
+            challenge_id="2",
+            accepted=False,
+            error_kind="transport_error",
+            message="timed out",
+        ),
+    )
+
+    exit_code = _run_with_fake_outcome(tmp_path, outcome, is_last_slot_of_day=False)
+
+    out = capsys.readouterr().out
+    assert exit_code == 1
+    assert "TRANSPORT_ERROR" in out
 
 
 # ---------------------------------------------------------------------------
@@ -1425,7 +1670,14 @@ def test_run_submission_for_day_completes_without_calling_any_fetch_client(
                 return_value=SubmissionResult(sent=False, challenge_id="2"),
             ),
         ):
-            outcome = run_submission_for_day(df, weather, prices_qh, _TARGET_DAY, as_of=_AS_OF)
+            outcome = run_submission_for_day(
+                df,
+                weather,
+                prices_qh,
+                _TARGET_DAY,
+                as_of=_AS_OF,
+                now=lambda: _BEFORE_GATE_CLOSURE,
+            )
 
         mock_fetch_run.assert_not_called()
 
@@ -1433,29 +1685,38 @@ def test_run_submission_for_day_completes_without_calling_any_fetch_client(
     assert outcome.candidate_selected == "full_live_set"
 
 
-def test_run_submission_for_day_never_passes_live_true_to_submit() -> None:
-    """Spec section 7's second 'Kein Netz' guarantee: run_submission_for_day
-    must never pass live=True to submit(). arena/submit.py's own
-    `if not live: return` already makes the transport unreachable when
-    live=False (tests/test_arena_submit.py), so this needs no _post mock --
-    it is a guard on the call site itself, so an accidental live=True would
-    fail loudly here even before it ever reached submit()."""
+# ---------------------------------------------------------------------------
+# live wiring (spec 6.7.3 section 2.4/5.4): live defaults to False, but is
+# threaded straight through to submit() when the caller (run_daily_submission,
+# ultimately main()'s is_live_enabled(os.environ)) passes it. The 6.7.2-era
+# guarantee that live is NEVER True is gone by design -- these two tests
+# together prove the opposite: the default stays safe, AND live=True
+# genuinely reaches submit() when asked for.
+# ---------------------------------------------------------------------------
+
+
+def _fixture_for_live_wiring_tests() -> tuple[pd.DataFrame, pd.DataFrame, Fold, dict[str, Any]]:
     fold = _fake_fold(_TARGET_DAY)
     matrix_index = fold.train_index.union(fold.test_index)
     matrix = pd.DataFrame({"feat_a": 1.0}, index=matrix_index)
     df = pd.DataFrame({"day_ahead_price": 50.0}, index=matrix_index)
-    forecast = _quarterhourly_series(_TARGET_DAY)
     payload = {
         "challenge_id": "2",
         "target_start": pd.Timestamp(_TARGET_DAY, tz="Europe/Berlin").isoformat(),
         "values": [50.0 + i * 0.01 for i in range(96)],
     }
+    return df, matrix, fold, payload
+
+
+def test_run_submission_for_day_defaults_to_dry_run_without_explicit_live() -> None:
+    df, matrix, fold, payload = _fixture_for_live_wiring_tests()
+    forecast = _quarterhourly_series(_TARGET_DAY)
 
     def _guarded_submit(
         challenge: ChallengeSpec, payload: dict, *, live: bool = False
     ) -> SubmissionResult:
         if live:
-            raise AssertionError("run_submission_for_day must never pass live=True to submit()")
+            raise AssertionError("must not default to live=True")
         return SubmissionResult(sent=False, challenge_id=challenge.challenge_id)
 
     with (
@@ -1477,9 +1738,351 @@ def test_run_submission_for_day_never_passes_live_true_to_submit() -> None:
         patch("scripts.run_daily_submission.submit", side_effect=_guarded_submit),
     ):
         outcome = run_submission_for_day(
-            df, pd.DataFrame(), pd.DataFrame(), _TARGET_DAY, as_of=_AS_OF
+            df,
+            pd.DataFrame(),
+            pd.DataFrame(),
+            _TARGET_DAY,
+            as_of=_AS_OF,
+            now=lambda: _BEFORE_GATE_CLOSURE,
+            # live not passed -- exercises the default
         )
 
     assert outcome.skip_reason is None
     assert outcome.submission_result is not None
     assert outcome.submission_result.sent is False
+
+
+def test_run_submission_for_day_passes_live_true_through_to_submit_when_requested() -> None:
+    df, matrix, fold, payload = _fixture_for_live_wiring_tests()
+    forecast = _quarterhourly_series(_TARGET_DAY)
+
+    def _guarded_submit(
+        challenge: ChallengeSpec, payload: dict, *, live: bool = False
+    ) -> SubmissionResult:
+        if not live:
+            raise AssertionError("live=True must reach submit() when the caller asked for it")
+        return SubmissionResult(sent=True, challenge_id=challenge.challenge_id, accepted=True)
+
+    with (
+        patch("scripts.run_daily_submission.check_a_inputs", return_value=PreflightResult(ok=True)),
+        patch(
+            "scripts.run_daily_submission.run_renewables_step",
+            return_value=(pd.DataFrame(), 1.5),
+        ),
+        patch(
+            "scripts.run_daily_submission.build_price_feature_matrix",
+            return_value=(matrix, fold, set()),
+        ),
+        patch(
+            "scripts.run_daily_submission.fit_predict_expand", return_value=(forecast, 2160, 2160)
+        ),
+        patch(
+            "scripts.run_daily_submission.build_arena_payload", return_value=(payload, CHALLENGE)
+        ),
+        patch("scripts.run_daily_submission.submit", side_effect=_guarded_submit),
+    ):
+        outcome = run_submission_for_day(
+            df,
+            pd.DataFrame(),
+            pd.DataFrame(),
+            _TARGET_DAY,
+            as_of=_AS_OF,
+            now=lambda: _BEFORE_GATE_CLOSURE,
+            live=True,
+        )
+
+    assert outcome.skip_reason is None
+    assert outcome.submission_result is not None
+    assert outcome.submission_result.sent is True
+    assert outcome.submission_result.accepted is True
+
+
+def test_run_submission_for_day_live_with_missing_api_key_raises_never_posts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """spec 6.7.3 section 2.3: 'Ist der Schalter an, aber ARENA_API_KEY
+    fehlt, wird der Lauf rot -- nicht still zum Dry-Run.' Uses the REAL
+    submit()/_post() (no submit mock) so the actual missing-key guard in
+    arena/submit.py::_post runs; requests.post itself is patched only to
+    prove it is never reached."""
+    monkeypatch.delenv("ARENA_API_KEY", raising=False)
+    monkeypatch.setenv("ARENA_API_BASE_URL", "https://arena.example.invalid")
+    df, matrix, fold, payload = _fixture_for_live_wiring_tests()
+    forecast = _quarterhourly_series(_TARGET_DAY)
+
+    with (
+        patch("scripts.run_daily_submission.check_a_inputs", return_value=PreflightResult(ok=True)),
+        patch(
+            "scripts.run_daily_submission.run_renewables_step",
+            return_value=(pd.DataFrame(), 1.5),
+        ),
+        patch(
+            "scripts.run_daily_submission.build_price_feature_matrix",
+            return_value=(matrix, fold, set()),
+        ),
+        patch(
+            "scripts.run_daily_submission.fit_predict_expand", return_value=(forecast, 2160, 2160)
+        ),
+        patch(
+            "scripts.run_daily_submission.build_arena_payload", return_value=(payload, CHALLENGE)
+        ),
+        patch(
+            "energy_price_forecast.arena.submit.requests.post",
+            side_effect=AssertionError("must never POST without an API key"),
+        ),
+        pytest.raises(RuntimeError, match="ARENA_API_KEY"),
+    ):
+        run_submission_for_day(
+            df,
+            pd.DataFrame(),
+            pd.DataFrame(),
+            _TARGET_DAY,
+            as_of=_AS_OF,
+            now=lambda: _BEFORE_GATE_CLOSURE,
+            live=True,
+        )
+
+
+# ---------------------------------------------------------------------------
+# The second, pre-POST gate-closure check (spec 6.7.3 section 2.4)
+# ---------------------------------------------------------------------------
+
+
+def test_run_submission_for_day_skips_post_if_gate_closed_between_start_and_post() -> None:
+    """A run whose fit/predict/build pass took long enough to cross the
+    deadline must not send late -- proven the same way this file's other
+    'Kein Netz' guarantees are: an exploding fake stands in for submit()."""
+    df, matrix, fold, payload = _fixture_for_live_wiring_tests()
+    forecast = _quarterhourly_series(_TARGET_DAY)
+
+    def _exploding_submit(*args: Any, **kwargs: Any) -> SubmissionResult:
+        raise AssertionError("submit() must not be called once the gate has closed")
+
+    with (
+        patch("scripts.run_daily_submission.check_a_inputs", return_value=PreflightResult(ok=True)),
+        patch(
+            "scripts.run_daily_submission.run_renewables_step",
+            return_value=(pd.DataFrame(), 1.5),
+        ),
+        patch(
+            "scripts.run_daily_submission.build_price_feature_matrix",
+            return_value=(matrix, fold, set()),
+        ),
+        patch(
+            "scripts.run_daily_submission.fit_predict_expand", return_value=(forecast, 2160, 2160)
+        ),
+        patch(
+            "scripts.run_daily_submission.build_arena_payload", return_value=(payload, CHALLENGE)
+        ),
+        patch("scripts.run_daily_submission.submit", side_effect=_exploding_submit),
+    ):
+        outcome = run_submission_for_day(
+            df,
+            pd.DataFrame(),
+            pd.DataFrame(),
+            _TARGET_DAY,
+            as_of=_BEFORE_GATE_CLOSURE,
+            now=lambda: _AS_OF,  # _AS_OF == gate closure moment exactly (>= closes it)
+        )
+
+    assert outcome.candidate_selected == "full_live_set"
+    assert outcome.skip_reason == "gate closure passed before POST"
+    # spec section 5.4 step 11: the payload archive still runs even though nothing sent.
+    assert outcome.payload == payload
+    assert outcome.submission_result is None
+
+
+# ---------------------------------------------------------------------------
+# Smoke mode (spec 6.7.3 sections 2.5/5.4)
+# ---------------------------------------------------------------------------
+
+
+def test_smoke_target_day_is_d_plus_2() -> None:
+    assert smoke_target_day(_AS_OF) == _TARGET_DAY + dt.timedelta(days=1)
+
+
+def test_run_smoke_submission_for_day_builds_baseline_payload_and_sends_unconditionally() -> None:
+    target_day = _TARGET_DAY
+    source_day = target_day - dt.timedelta(days=1)
+    prices_qh = _quarterhourly_series(source_day, value=42.0).to_frame(name="day_ahead_price")
+
+    with (
+        patch("scripts.run_daily_submission.get_challenge", return_value=CHALLENGE),
+        patch("scripts.run_daily_submission.read_quarterhourly_prices", return_value=prices_qh),
+        patch(
+            "scripts.run_daily_submission.submit",
+            return_value=SubmissionResult(
+                sent=True, challenge_id="2", accepted=True, submission_id=7, status="accepted"
+            ),
+        ) as mock_submit,
+    ):
+        outcome = run_smoke_submission_for_day(target_day)
+
+    assert outcome.is_smoke is True
+    assert outcome.smoke_baseline_source_day == source_day
+    assert outcome.candidate_selected is None
+    assert outcome.skip_reason is None
+    assert outcome.payload is not None
+    assert len(outcome.payload["values"]) == 96
+    assert all(v == 42.0 for v in outcome.payload["values"])
+    assert outcome.submission_result is not None
+    assert outcome.submission_result.accepted is True
+    mock_submit.assert_called_once()
+    assert mock_submit.call_args.kwargs["live"] is True
+
+
+def test_run_smoke_submission_for_day_raises_if_source_day_price_is_incomplete() -> None:
+    """The baseline is never silently partial (arena_baseline.py's own
+    contract) -- a genuinely missing D-1 price must propagate, not be
+    swallowed into a degraded smoke payload."""
+    target_day = _TARGET_DAY
+    incomplete = _quarterhourly_series(target_day - dt.timedelta(days=1)).iloc[:48]
+    prices_qh = incomplete.to_frame(name="day_ahead_price")
+
+    with (
+        patch("scripts.run_daily_submission.get_challenge", return_value=CHALLENGE),
+        patch("scripts.run_daily_submission.read_quarterhourly_prices", return_value=prices_qh),
+        pytest.raises(ValueError, match="Missing realised price"),
+    ):
+        run_smoke_submission_for_day(target_day)
+
+
+def test_run_smoke_submission_for_day_never_triggers_a_model_fit() -> None:
+    """spec 6.7.3 section 5.4: steps 4-10 (renewables walk-forward, feature
+    build, price fit/predict) do not apply in smoke mode -- proven with
+    exploding fakes, not just by the absence of a call in the source."""
+    target_day = _TARGET_DAY
+    source_day = target_day - dt.timedelta(days=1)
+    prices_qh = _quarterhourly_series(source_day, value=42.0).to_frame(name="day_ahead_price")
+
+    def _exploding(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("smoke mode must never trigger a model fit")
+
+    with (
+        patch("scripts.run_daily_submission.get_challenge", return_value=CHALLENGE),
+        patch("scripts.run_daily_submission.read_quarterhourly_prices", return_value=prices_qh),
+        patch(
+            "scripts.run_daily_submission.submit",
+            return_value=SubmissionResult(sent=True, challenge_id="2", accepted=True),
+        ),
+        patch("scripts.run_daily_submission.run_renewables_step", side_effect=_exploding),
+        patch("scripts.run_daily_submission.build_price_feature_matrix", side_effect=_exploding),
+        patch("scripts.run_daily_submission.fit_predict_expand", side_effect=_exploding),
+    ):
+        outcome = run_smoke_submission_for_day(target_day)
+
+    assert outcome.submission_result is not None
+    assert outcome.submission_result.accepted is True
+
+
+_SMOKE_TARGET_DAY = _TARGET_DAY + dt.timedelta(days=1)  # smoke_target_day(_AS_OF)
+
+
+def _fake_smoke_outcome(*, submission_result: SubmissionResult) -> SubmissionOutcome:
+    return SubmissionOutcome(
+        candidate_selected=None,
+        skip_reason=None,
+        payload={"challenge_id": "2", "target_start": "x", "values": [1.0] * 96},
+        submission_result=submission_result,
+        is_smoke=True,
+        smoke_baseline_source_day=_SMOKE_TARGET_DAY - dt.timedelta(days=1),
+    )
+
+
+def test_run_daily_submission_smoke_exits_cleanly_past_its_own_gate_closure() -> None:
+    """By construction, smoke_target_day(as_of) is always 2 local calendar
+    days after as_of, and its own gate closure sits only 1 day after --
+    always in as_of's future, for any real wall-clock as_of. This branch
+    exists as the same structural safety net the regular flow has (spec
+    section 5.4 step 1, "unveraendert"), not something a realistic as_of
+    can trigger -- proven here via is_past_gate_closure itself, not a
+    contrived as_of."""
+    with (
+        patch("scripts.run_daily_submission.is_past_gate_closure", return_value=True),
+        patch("scripts.run_daily_submission.store") as mock_store,
+    ):
+        exit_code = run_daily_submission_smoke(_AS_OF)
+
+    assert exit_code == 0
+    mock_store.load_store.assert_not_called()
+
+
+def test_run_daily_submission_smoke_accepted_appends_protocol_with_smoke_fields(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    log_path = tmp_path / "submissions.jsonl"
+    outcome = _fake_smoke_outcome(
+        submission_result=SubmissionResult(
+            sent=True, challenge_id="2", accepted=True, submission_id=99, status="accepted"
+        )
+    )
+
+    with (
+        patch("scripts.run_daily_submission.SUBMISSIONS_LOG", log_path),
+        patch("scripts.run_daily_submission.PAYLOADS_DIR", tmp_path / "payloads"),
+        patch("scripts.run_daily_submission.store") as mock_store,
+        patch(
+            "scripts.run_daily_submission.run_smoke_submission_for_day", return_value=outcome
+        ) as mock_run,
+    ):
+        mock_store.load_store.return_value.manifest = _manifest({})
+        exit_code = run_daily_submission_smoke(_AS_OF)
+
+    assert exit_code == 0
+    assert "SUBMITTED" in capsys.readouterr().out
+    mock_run.assert_called_once_with(_SMOKE_TARGET_DAY)
+
+    records = protocol.read_submission_records(log_path)
+    assert len(records) == 1
+    assert records[0]["submission_mode"] == "smoke"
+    assert records[0]["submitted"] is True
+    assert records[0]["submission_id"] == 99
+    assert records[0]["smoke_baseline_source_day"] == _TARGET_DAY.isoformat()
+    written_path = tmp_path / "payloads" / f"{records[0]['target_day']}.json"
+    assert written_path.exists()
+
+
+def test_run_daily_submission_smoke_rejected_is_red(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    outcome = _fake_smoke_outcome(
+        submission_result=SubmissionResult(
+            sent=True,
+            challenge_id="2",
+            accepted=False,
+            error_kind="rejected",
+            http_status=422,
+            message="too late",
+        )
+    )
+
+    with (
+        patch("scripts.run_daily_submission.SUBMISSIONS_LOG", tmp_path / "submissions.jsonl"),
+        patch("scripts.run_daily_submission.PAYLOADS_DIR", tmp_path / "payloads"),
+        patch("scripts.run_daily_submission.store") as mock_store,
+        patch("scripts.run_daily_submission.run_smoke_submission_for_day", return_value=outcome),
+    ):
+        mock_store.load_store.return_value.manifest = _manifest({})
+        exit_code = run_daily_submission_smoke(_AS_OF)
+
+    out = capsys.readouterr().out
+    assert exit_code == 1
+    assert "REJECTED" in out
+
+
+def test_run_daily_submission_smoke_prints_a_distinguishable_line_on_an_unexpected_exception(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with (
+        patch("scripts.run_daily_submission.SUBMISSIONS_LOG", tmp_path / "submissions.jsonl"),
+        patch("scripts.run_daily_submission.store") as mock_store,
+        patch(
+            "scripts.run_daily_submission.run_smoke_submission_for_day",
+            side_effect=RuntimeError("synthetic smoke failure"),
+        ),
+        pytest.raises(RuntimeError, match="synthetic smoke failure"),
+    ):
+        mock_store.load_store.return_value.manifest = _manifest({})
+        run_daily_submission_smoke(_AS_OF)
+
+    assert "EXCEPTION — RuntimeError: synthetic smoke failure" in capsys.readouterr().out

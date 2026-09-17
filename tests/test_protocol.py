@@ -52,6 +52,11 @@ _EXPECTED_KEY_ORDER = [
     "runtime_seconds",
     "n_training_rows",
     "n_training_labels",
+    "submission_mode",
+    "submission_id",
+    "api_response_received_utc",
+    "confirmed_via_query",
+    "smoke_baseline_source_day",
 ]
 
 
@@ -131,6 +136,61 @@ def test_reader_tolerates_a_real_protocol_version_1_line_without_training_label_
     assert records[0]["protocol_version"] == 1
     assert records[0].get("n_training_rows") is None
     assert records[0].get("n_training_labels") is None
+
+
+def test_reader_tolerates_a_real_protocol_version_2_line_without_section_5_6_fields(
+    tmp_path: Path,
+) -> None:
+    """The same compatibility guarantee, this time for the 6.7.3 jump to
+    protocol_version 3 (spec section 5.6): every line written under
+    protocol_version 2 genuinely lacks the five new fields."""
+    path = tmp_path / "submissions.jsonl"
+    v2_line = _sample_record().to_dict()
+    v2_line["protocol_version"] = 2
+    for field_name in (
+        "submission_mode",
+        "submission_id",
+        "api_response_received_utc",
+        "confirmed_via_query",
+        "smoke_baseline_source_day",
+    ):
+        del v2_line[field_name]
+    path.write_text(json.dumps(v2_line) + "\n", encoding="utf-8")
+
+    records = read_submission_records(path)
+    assert len(records) == 1
+    assert records[0]["protocol_version"] == 2
+    assert records[0].get("submission_mode") is None
+    assert records[0].get("submission_id") is None
+    assert records[0].get("api_response_received_utc") is None
+    assert records[0].get("confirmed_via_query") is None
+    assert records[0].get("smoke_baseline_source_day") is None
+
+
+def test_section_5_6_fields_default_none_and_round_trip(tmp_path: Path) -> None:
+    default_record = _sample_record()
+    assert default_record.submission_mode is None
+    assert default_record.submission_id is None
+    assert default_record.api_response_received_utc is None
+    assert default_record.confirmed_via_query is None
+    assert default_record.smoke_baseline_source_day is None
+
+    path = tmp_path / "submissions.jsonl"
+    append_submission_record(
+        path,
+        _sample_record(
+            submission_mode="live",
+            submission_id=42,
+            api_response_received_utc="2026-09-19T10:41:03+00:00",
+            confirmed_via_query=True,
+            smoke_baseline_source_day=None,
+        ),
+    )
+    records = read_submission_records(path)
+    assert records[0]["submission_mode"] == "live"
+    assert records[0]["submission_id"] == 42
+    assert records[0]["api_response_received_utc"] == "2026-09-19T10:41:03+00:00"
+    assert records[0]["confirmed_via_query"] is True
 
 
 def test_missing_features_names_each_feature_individually() -> None:

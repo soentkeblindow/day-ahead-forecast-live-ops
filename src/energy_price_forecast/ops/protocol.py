@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
 
-PROTOCOL_VERSION: Final[int] = 2
+PROTOCOL_VERSION: Final[int] = 3
 
 # Fixed so every appended line writes its keys in the same order (spec
 # section 2.8: "sonst sind die Git-Diffs verrauscht"). New fields are
@@ -61,6 +61,13 @@ _KEY_ORDER: Final[tuple[str, ...]] = (
     "runtime_seconds",
     "n_training_rows",
     "n_training_labels",
+    # protocol_version 3 (spec 6.7.3, section 5.6) -- appended, not inserted,
+    # so every already-written line stays diff-stable.
+    "submission_mode",
+    "submission_id",
+    "api_response_received_utc",
+    "confirmed_via_query",
+    "smoke_baseline_source_day",
 )
 
 
@@ -89,7 +96,22 @@ class SubmissionRecord:
 
     ``submitted``/``api_status``/``api_message`` stay ``False``/``"dry_run"``/
     ``None`` throughout 6.7.2 -- ``live=True`` is never passed to
-    ``arena.submit.submit()`` in this step.
+    ``arena.submit.submit()`` in this step. From protocol_version 3 (spec
+    6.7.3) onward they carry real values once the live switch is on.
+
+    protocol_version 3 fields (spec 6.7.3 section 5.6), all optional and
+    additive -- an older reader ignores them via ``.get(...)``, an older
+    written line simply lacks them:
+
+    - ``submission_mode``: ``"dry_run"``/``"live"``/``"smoke"``, purely
+      informative (no code path branches on it, spec section 2.5).
+    - ``submission_id``: from the platform, if the POST returned one.
+    - ``api_response_received_utc``: when the POST's response (success or
+      failure) was actually received.
+    - ``confirmed_via_query``: ``True``/``False`` if the own-submissions
+      query endpoint was queried after an accepted POST, else ``None``.
+    - ``smoke_baseline_source_day``: the price day the smoke mode's
+      baseline was built from -- only set in ``submission_mode="smoke"``.
 
     ``n_training_rows``/``n_training_labels`` (protocol_version 2, Restarbeit
     Teil A): the size of the training matrix actually passed to
@@ -129,6 +151,11 @@ class SubmissionRecord:
     runtime_seconds: float | None = None
     n_training_rows: int | None = None
     n_training_labels: int | None = None
+    submission_mode: str | None = None
+    submission_id: int | None = None
+    api_response_received_utc: str | None = None
+    confirmed_via_query: bool | None = None
+    smoke_baseline_source_day: str | None = None
     protocol_version: int = PROTOCOL_VERSION
 
     def to_dict(self) -> dict[str, Any]:

@@ -1,11 +1,13 @@
-"""Daily submission job entry point (spec 6.7.2, section 5.1) -- thin
-caller over check/live_inputs/renewables/features/models/payload/protocol.
-POST stays off in this step: submit() is never called with live=True (that
-flip is 6.7.3's job).
+"""Daily submission job entry point (spec 6.7.2 section 5.1, spec 6.7.3
+sections 2.4/5.4-5.6) -- thin caller over
+check/live_inputs/renewables/features/models/payload/protocol.
 
-Only the load-bearing pieces built so far live here; the full run sequence
-(spec 5.1's twelve steps) is still under construction across this and
-following sessions -- see docs/sprint6_step6_7_2_log.md.
+The live switch (arena/config.py::is_live_enabled()) decides whether
+submit() actually POSTs; main() is the only caller that reads it from the
+real environment. The idempotency lock from 6.7.2 is gone (spec section
+2.4): every run that produces a complete payload submits, and the Arena's
+own latest_before_deadline selection policy means a later run's submission
+simply overwrites an earlier one for the same target_day.
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ import logging
 import os
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
@@ -25,6 +28,7 @@ import pandas as pd
 
 from energy_price_forecast.arena.candidates import full_live_set_candidate_table, select_candidate
 from energy_price_forecast.arena.catalog import ChallengeSpec, get_challenge
+from energy_price_forecast.arena.config import ARENA_CHALLENGE_ID, is_live_enabled
 from energy_price_forecast.arena.live_inputs import (
     DEFAULT_WEATHER_MODEL,
     assemble_price_model_inputs,
@@ -57,6 +61,7 @@ from energy_price_forecast.evaluation.walkforward import Fold, walk_forward_spli
 from energy_price_forecast.features.build import build_feature_set_for_day
 from energy_price_forecast.features.nwp_fundamentals import IncompleteReconstructionError
 from energy_price_forecast.market_time import gate_closure_for_index
+from energy_price_forecast.models.arena_baseline import persistence_forecast
 from energy_price_forecast.models.bridge import expand_to_quarterhour, fit_shape_profile
 from energy_price_forecast.models.lgbm import LGBMForecaster
 from energy_price_forecast.ops import store
@@ -72,10 +77,6 @@ logger = logging.getLogger(__name__)
 
 SUBMISSIONS_LOG = PROJECT_ROOT / "logs" / "submissions.jsonl"
 PAYLOADS_DIR = PROJECT_ROOT / "logs" / "submission_payloads"
-
-# "Day-Ahead Prices | Germany-Luxembourg | Point Forecast" -- matches
-# ops/availability_audit.py's own ARENA_CHALLENGE_ID (spec section 5.4 there).
-ARENA_CHALLENGE_ID = "2"
 
 # The price model's own rolling training window (spec section 5.6, ops/availability_audit.py's
 # existing TRAINING_WINDOW_DAYS).
@@ -99,6 +100,10 @@ SHAPE_WINDOW_DAYS = 28
 # _silence_turns_run_red reads this constant rather than the raw 1, so the
 # constant genuinely decides the outcome.
 SILENCE_STREAK_THRESHOLD: Final[int] = 1
+
+
+def _utcnow() -> pd.Timestamp:
+    return pd.Timestamp.now("UTC")
 
 
 def renewables_window(target_day: dt.date) -> tuple[pd.Timestamp, pd.Timestamp]:
@@ -414,6 +419,12 @@ class SubmissionOutcome:
     # happened, so there is nothing real to report yet.
     n_training_rows: int | None = None
     n_training_labels: int | None = None
+    # spec 6.7.3 section 2.5: set only by run_smoke_submission_for_day. candidate_selected
+    # stays None for a smoke outcome -- it never goes through Check B/candidate selection,
+    # so there is no real candidate name to report; submission_mode="smoke" (derived from
+    # is_smoke in build_submission_record) is what actually marks the row, not this field.
+    is_smoke: bool = False
+    smoke_baseline_source_day: dt.date | None = None
 
 
 def run_submission_for_day(
@@ -423,29 +434,38 @@ def run_submission_for_day(
     target_day: dt.date,
     *,
     as_of: pd.Timestamp,
+    live: bool = False,
+    now: Callable[[], pd.Timestamp] = _utcnow,
 ) -> SubmissionOutcome:
     """The prediction pipeline for one target day (spec section 5.1, steps
-    4-10): Check A, renewables walk-forward, feature build, Check B plus the
-    training-extent guard, candidate selection, price fit/predict/expand,
-    payload build/validate/plausibility, and a dry-run submit() call
-    (live=False always -- 6.7.3's job to flip).
+    4-10; spec 6.7.3 section 5.4): Check A, renewables walk-forward, feature
+    build, Check B plus the training-extent guard, candidate selection,
+    price fit/predict/expand, payload build/validate/plausibility, a second
+    gate-closure check, and submit() -- ``live`` is threaded straight
+    through to it (arena/submit.py's own ``if not live: return`` is what
+    actually keeps a dry run from sending, not a guard here).
 
-    A failure at any check point returns immediately with ``skip_reason``
-    set and ``candidate_selected=None`` -- a silent day is an expected
-    operating state (spec section 2.7), never an exception from this
-    function for an expected failure mode. An *unexpected* exception (a
-    genuine bug, a raised IncompleteReconstructionError escaping past the
-    per-day catch in build_price_feature_matrix, an LGBMForecaster failure)
-    is deliberately NOT caught here -- it propagates to the caller, which
-    is where "unerwartete Ausnahme" (spec section 2.7's second red
-    condition, distinct from silence) belongs.
+    A failure at any check point (including the second gate-closure check)
+    returns immediately with ``skip_reason`` set and ``candidate_selected``
+    left as it was found -- a silent day is an expected operating state
+    (spec section 2.7), never an exception from this function for an
+    expected failure mode. An *unexpected* exception (a genuine bug, a
+    raised IncompleteReconstructionError escaping past the per-day catch in
+    build_price_feature_matrix, an LGBMForecaster failure) is deliberately
+    NOT caught here -- it propagates to the caller, which is where
+    "unerwartete Ausnahme" (spec section 2.7's second red condition,
+    distinct from silence) belongs.
 
     ``as_of`` (the run's own wall-clock time) is used only for the
     non-blocking commodity-staleness measurement (spec section 2.3) --
     computed once, right after Check A, and carried in every returned
     SubmissionOutcome (including early skips), since it is diagnostic
     information about ``df``'s own freshness, independent of how far the
-    run otherwise got.
+    run otherwise got. ``now`` is a second, later wall-clock reading, used
+    only for the pre-POST gate-closure re-check (spec section 2.4) -- a
+    real fit/predict pass takes real minutes, so re-using ``as_of`` there
+    would never catch a run that crossed the deadline while computing.
+    Injectable so tests never depend on real time.
     """
     check_a = check_a_inputs(target_day)
     if not check_a.ok:
@@ -522,9 +542,23 @@ def run_submission_for_day(
             n_training_labels=n_training_labels,
         )
 
-    # live=False always in 6.7.2 -- structurally never reaches submit.py's transport
-    # (tests/test_arena_submit.py already proves this), so no dry-run branch is needed here.
-    submission_result = submit(challenge, payload, live=False)
+    # spec 6.7.3 section 2.4: re-check the gate closure immediately before the POST -- a
+    # run whose fit/predict/build pass took long enough to cross the deadline must not
+    # send late. A skip here still carries candidate_selected AND the built payload (spec
+    # section 5.4 step 11: the payload archive runs regardless of whether anything sent).
+    if is_past_gate_closure(target_day, now()):
+        return SubmissionOutcome(
+            candidate_selected=selection.candidate.name,
+            skip_reason="gate closure passed before POST",
+            payload=payload,
+            renewables_runtime_seconds=renewables_runtime_seconds,
+            excluded_training_days=frozenset(excluded),
+            commodity_staleness_warnings=commodity_staleness_warnings,
+            n_training_rows=n_training_rows,
+            n_training_labels=n_training_labels,
+        )
+
+    submission_result = submit(challenge, payload, live=live)
 
     return SubmissionOutcome(
         candidate_selected=selection.candidate.name,
@@ -549,15 +583,19 @@ def is_past_gate_closure(target_day: dt.date, as_of: pd.Timestamp) -> bool:
     return bool(as_of >= gate_closure_utc)
 
 
-def already_submitted(log_path: Path, target_day: dt.date) -> bool:
-    """Spec section 5.1 step 2: idempotency. True if an earlier run already
-    selected a candidate for target_day (a completed, non-skipped run) --
-    spares the remaining minutes of an already-successful day, but is not
-    itself a correctness guarantee (that is latest_before_deadline's job on
-    the Arena side, spec section 5.1).
+def accepted_earlier_today(log_path: Path, target_day: dt.date) -> bool:
+    """Spec 6.7.3 section 2.4: whether some earlier run already got a
+    submission accepted for target_day. Read only for the last slot's own
+    day-coloring decision in run_daily_submission, never as a lock -- the
+    idempotency lock 6.7.2 used to apply here is gone (every run that
+    produces a complete payload submits; a later run's submission simply
+    overwrites an earlier one on the Arena side via
+    latest_before_deadline). A smoke-mode line never satisfies this: it
+    targets D+2, never the same target_day as a regular run (spec section
+    2.5), so no special-casing is needed here.
     """
     for record in read_submission_records(log_path):
-        if record.get("target_day") == target_day.isoformat() and record.get("candidate_selected"):
+        if record.get("target_day") == target_day.isoformat() and record.get("submitted") is True:
             return True
     return False
 
@@ -594,6 +632,43 @@ def _payload_stats(
     return len(values), min(values), sum(values) / len(values), max(values)
 
 
+def _submission_fields(
+    result: SubmissionResult | None,
+) -> tuple[bool, str | None, str | None, str | None, int | None, str | None, bool | None]:
+    """Map a SubmissionResult onto the protocol's submitted/api_status/
+    api_message/submission_mode/submission_id/api_response_received_utc/
+    confirmed_via_query fields (spec 6.7.3 sections 5.4-5.6).
+
+    Returns (submitted, api_status, api_message, submission_mode,
+    submission_id, api_response_received_utc, confirmed_via_query). All
+    None/False if no submit() call happened at all -- an early skip, or the
+    second gate-closure check firing right before the POST.
+    """
+    if result is None:
+        return False, None, None, None, None, None, None
+    if not result.sent:
+        return False, "dry_run", None, "dry_run", None, None, None
+    if result.accepted:
+        return (
+            True,
+            result.status or "accepted",
+            result.message,
+            "live",
+            result.submission_id,
+            result.response_received_utc,
+            result.confirmed_via_query,
+        )
+    return (
+        False,
+        result.error_kind,
+        result.message,
+        "live",
+        result.submission_id,
+        result.response_received_utc,
+        result.confirmed_via_query,
+    )
+
+
 def build_submission_record(
     outcome: SubmissionOutcome,
     manifest: store.Manifest,
@@ -618,7 +693,25 @@ def build_submission_record(
         {column: age_days * 24 for column, age_days in outcome.commodity_staleness_warnings.items()}
     )
     n_values, payload_min, payload_mean, payload_max = _payload_stats(outcome.payload)
-    submitted = outcome.submission_result.sent if outcome.submission_result is not None else False
+    (
+        submitted,
+        api_status,
+        api_message,
+        submission_mode,
+        submission_id,
+        api_response_received_utc,
+        confirmed_via_query,
+    ) = _submission_fields(outcome.submission_result)
+    # spec 6.7.3 section 2.5: submission_mode="smoke" overrides whatever _submission_fields
+    # derived from the SubmissionResult alone (a smoke run always calls submit(live=True), so
+    # it would otherwise read "live" -- is_smoke is the one authoritative signal for this).
+    if outcome.is_smoke:
+        submission_mode = "smoke"
+    smoke_baseline_source_day = (
+        outcome.smoke_baseline_source_day.isoformat()
+        if outcome.smoke_baseline_source_day is not None
+        else None
+    )
     return SubmissionRecord(
         run_timestamp_utc=as_of.isoformat(),
         run_id=run_id,
@@ -636,11 +729,16 @@ def build_submission_record(
         payload_mean=payload_mean,
         payload_max=payload_max,
         submitted=submitted,
-        api_status="dry_run" if outcome.payload is not None else None,
-        api_message=None,
+        api_status=api_status,
+        api_message=api_message,
         runtime_seconds=runtime_seconds,
         n_training_rows=outcome.n_training_rows,
         n_training_labels=outcome.n_training_labels,
+        submission_mode=submission_mode,
+        submission_id=submission_id,
+        api_response_received_utc=api_response_received_utc,
+        confirmed_via_query=confirmed_via_query,
+        smoke_baseline_source_day=smoke_baseline_source_day,
     )
 
 
@@ -674,27 +772,24 @@ def _silence_turns_run_red(*, is_last_slot_of_day: bool) -> bool:
 
 
 def run_daily_submission(
-    as_of: pd.Timestamp, *, nominal_slot: str, is_last_slot_of_day: bool
+    as_of: pd.Timestamp, *, nominal_slot: str, is_last_slot_of_day: bool, live: bool = False
 ) -> int:
-    """The full run sequence (spec section 5.1), taking the run's own
-    wall-clock time as an explicit argument rather than reading it
-    internally -- the same testability discipline as run_submission_for_day
-    itself, so this can be driven by synthetic timestamps in tests without
-    a real clock or a real store. main() is the only caller that reads the
-    real clock and environment.
+    """The full run sequence (spec section 5.1; spec 6.7.3 section 2.4),
+    taking the run's own wall-clock time as an explicit argument rather
+    than reading it internally -- the same testability discipline as
+    run_submission_for_day itself, so this can be driven by synthetic
+    timestamps in tests without a real clock or a real store. main() is the
+    only caller that reads the real clock, environment, and live switch.
+
+    No idempotency lock (spec section 2.4 -- see accepted_earlier_today's
+    own docstring): every run that reaches candidate selection attempts a
+    submission, live or dry-run.
     """
     target_day = next_delivery_day(as_of)
 
     if is_past_gate_closure(target_day, as_of):
         logger.info(
             "gate closure for %s already passed at %s -- exiting cleanly", target_day, as_of
-        )
-        return 0
-
-    if already_submitted(SUBMISSIONS_LOG, target_day):
-        logger.info(
-            "%s already has a submitted candidate from an earlier run today -- exiting cleanly",
-            target_day,
         )
         return 0
 
@@ -721,7 +816,7 @@ def run_daily_submission(
     # re-raises unchanged -- exit code, traceback, and CI redness are
     # exactly as before this addition.
     try:
-        outcome = run_submission_for_day(df, weather, prices_qh, target_day, as_of=as_of)
+        outcome = run_submission_for_day(df, weather, prices_qh, target_day, as_of=as_of, live=live)
     except Exception as exc:  # noqa: BLE001 -- deliberately broad, re-raised unchanged below
         print(f"EXCEPTION — {type(exc).__name__}: {exc}")
         raise
@@ -758,10 +853,143 @@ def run_daily_submission(
 
     if outcome.skip_reason is not None:
         print(f"SILENT — {outcome.skip_reason}")
-        # Red only on the day's last slot (spec section 2.7): an earlier run without
-        # complete data is an expected operating state, not a failure.
+        # spec 6.7.3 section 2.4: the last slot reads the protocol (never a lock) --
+        # a day with an already-accepted submission from an earlier run stays green
+        # even if this, the final, run itself stayed silent.
+        if is_last_slot_of_day and accepted_earlier_today(SUBMISSIONS_LOG, target_day):
+            return 0
+        # Red only on the day's last slot otherwise (spec section 2.7): an earlier run
+        # without complete data is an expected operating state, not a failure.
         return 1 if _silence_turns_run_red(is_last_slot_of_day=is_last_slot_of_day) else 0
 
+    response_exit = _print_response_summary(outcome, target_day)
+    if response_exit is not None:
+        return response_exit
+
+    print(f"submitted (dry-run): candidate={outcome.candidate_selected}, target_day={target_day}")
+    return 0
+
+
+def _print_response_summary(outcome: SubmissionOutcome, target_day: dt.date) -> int | None:
+    """Spec 6.7.3 section 5.5's response-evaluation print/exit-code logic --
+    shared between the regular (run_daily_submission) and smoke
+    (run_daily_submission_smoke) run sequences. Returns None if no submit()
+    call was made at all (an early skip, or a dry run), leaving the
+    dry-run message to the caller.
+    """
+    result = outcome.submission_result
+    if result is None or not result.sent:
+        return None
+
+    if not result.accepted:
+        # A rejected or transport-failed live POST makes this run red immediately, on
+        # every slot -- distinct from "SILENT", a genuine attempt that failed, not data
+        # that wasn't ready yet.
+        print(
+            f"{(result.error_kind or 'error').upper()} — target {target_day}, "
+            f"status {result.http_status}, message: {result.message}"
+        )
+        return 1
+
+    n_values = len(outcome.payload["values"]) if outcome.payload is not None else None
+    print(
+        f"SUBMITTED — target {target_day}, {n_values} values, "
+        f"status {result.status}, id {result.submission_id}"
+    )
+    return 0
+
+
+def smoke_target_day(as_of: pd.Timestamp) -> dt.date:
+    """Spec 6.7.3 section 2.5: the smoke test always targets D+2, never
+    D+1 -- a smoke dispatch only makes sense after 12:00 local (D+1's own
+    gate closure has already passed by then, spec section 2.5's own
+    reasoning), and D+2's window opens 3 days before its deadline.
+    """
+    return next_delivery_day(as_of) + dt.timedelta(days=1)
+
+
+def run_smoke_submission_for_day(target_day: dt.date) -> SubmissionOutcome:
+    """Spec 6.7.3 sections 2.5/5.4: the smoke test's own prediction step.
+    Steps 4-10 of the regular run (spec section 5.1) do not apply here --
+    no renewables walk-forward, no feature build, no model fit. The
+    payload is the existing 6.4 baseline replica (persistence_forecast),
+    built from target_day's own D-1 (target_day - 1) realised
+    quarter-hourly prices -- the day whose day-ahead auction has already
+    cleared "today" by the time a smoke dispatch can run.
+
+    Sends unconditionally: live=True regardless of ARENA_LIVE (spec
+    section 2.5 -- the manual mode=smoke dispatch IS the deliberate human
+    authorization, the whole point of a smoke test).
+    """
+    source_day = target_day - dt.timedelta(days=1)
+    challenge = get_challenge(ARENA_CHALLENGE_ID)
+    prices_qh = read_quarterhourly_prices()
+    baseline = persistence_forecast(
+        prices_qh["day_ahead_price"], pd.Timestamp(target_day), tz=challenge.timezone
+    )
+    target_start = pd.Timestamp(target_day, tz=challenge.timezone)
+    payload = build_payload(challenge, target_start, baseline.sort_index().to_list())
+    validate_payload(payload, challenge)
+
+    submission_result = submit(challenge, payload, live=True)
+
+    return SubmissionOutcome(
+        candidate_selected=None,
+        skip_reason=None,
+        payload=payload,
+        submission_result=submission_result,
+        is_smoke=True,
+        smoke_baseline_source_day=source_day,
+    )
+
+
+def run_daily_submission_smoke(as_of: pd.Timestamp, *, nominal_slot: str = "smoke") -> int:
+    """The smoke test's own full run sequence (spec 6.7.3 sections
+    2.5/5.4) -- the gate-closure check still runs first (step 1,
+    unchanged in shape, just against smoke_target_day instead of
+    next_delivery_day), then straight to baseline/submit/protocol. No
+    idempotency/day-coloring concept applies here (spec section 2.5: a
+    smoke dispatch is a one-off manual action, not one of the day's
+    regular slots). main() is the only caller that reads MODE from the
+    real environment.
+    """
+    target_day = smoke_target_day(as_of)
+
+    if is_past_gate_closure(target_day, as_of):
+        logger.info(
+            "gate closure for %s already passed at %s -- exiting cleanly", target_day, as_of
+        )
+        return 0
+
+    t0 = time.monotonic()
+    store_state = store.load_store(PROJECT_ROOT)
+
+    try:
+        outcome = run_smoke_submission_for_day(target_day)
+    except Exception as exc:  # noqa: BLE001 -- deliberately broad, re-raised unchanged below
+        print(f"EXCEPTION — {type(exc).__name__}: {exc}")
+        raise
+    runtime_seconds = time.monotonic() - t0
+
+    record = build_submission_record(
+        outcome,
+        store_state.manifest,
+        target_day=target_day,
+        nominal_slot=nominal_slot,
+        gate_closure_ok=True,
+        as_of=as_of,
+        runtime_seconds=runtime_seconds,
+    )
+    append_submission_record(SUBMISSIONS_LOG, record)
+
+    if outcome.payload is not None:
+        write_payload_to_repo(outcome.payload, target_day)
+
+    response_exit = _print_response_summary(outcome, target_day)
+    if response_exit is not None:
+        return response_exit
+
+    # Should not happen -- run_smoke_submission_for_day always calls submit(live=True).
     print(f"submitted (dry-run): candidate={outcome.candidate_selected}, target_day={target_day}")
     return 0
 
@@ -769,13 +997,18 @@ def run_daily_submission(
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     as_of = pd.Timestamp.now("UTC")
+    mode = os.environ.get("MODE", "scheduled")
+    if mode == "smoke":
+        return run_daily_submission_smoke(as_of)
+
     nominal_slot = os.environ.get("NOMINAL_SLOT", "manual")
     # Wired to the real slot schedule once ops/trigger/'s SLOTS table gains the three
     # submission slots (spec section 3.2) -- conservative default (False) means an
     # under-configured run never wrongly marks a day red on its own.
     is_last_slot_of_day = os.environ.get("IS_LAST_SLOT_OF_DAY", "false").lower() == "true"
+    live = is_live_enabled(os.environ)
     return run_daily_submission(
-        as_of, nominal_slot=nominal_slot, is_last_slot_of_day=is_last_slot_of_day
+        as_of, nominal_slot=nominal_slot, is_last_slot_of_day=is_last_slot_of_day, live=live
     )
 
 

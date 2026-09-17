@@ -16,6 +16,10 @@ on:
   # environment-variable defaults.
   workflow_dispatch:
     inputs:
+      mode:
+        description: "'scheduled' (default, obeys the ARENA_LIVE switch) or 'smoke' -- a one-off real baseline submission for D+2, sent unconditionally, used exactly once before the live switch is ever flipped on (spec 6.7.3 section 2.5)."
+        required: false
+        default: "scheduled"
       nominal_slot:
         description: "Which of today's submission slots this run represents (spec 6.7.3 section 2.2)."
         required: false
@@ -67,14 +71,20 @@ jobs:
       # the store and the on-disk weather/commodity caches only. GITHUB_TOKEN
       # downloads the store release asset (ops/release_assets.py) and pushes
       # the protocol/payload commit below. ARENA_API_KEY/ARENA_API_BASE_URL are
-      # for the one read-only catalog call (arena/catalog.py::get_challenge) --
-      # the POST itself stays off in this step (submit() is never called with
-      # live=True).
+      # for the one read-only catalog call (arena/catalog.py::get_challenge) and,
+      # once ARENA_LIVE is on (or mode=smoke), the actual POST. ARENA_LIVE is a
+      # repository VARIABLE, not a secret (spec section 2.3 -- it must be
+      # flippable from the GitHub UI without a commit, the kill switch); unset
+      # or anything other than the literal "true" keeps main() in dry-run
+      # (arena/config.py::is_live_enabled(), fail-safe by design). mode=smoke
+      # bypasses ARENA_LIVE entirely (scripts/run_daily_submission.py::main()).
       - name: Run the daily submission job
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ARENA_API_KEY: ${{ secrets.ARENA_API_KEY }}
           ARENA_API_BASE_URL: ${{ vars.ARENA_API_BASE_URL }}
+          ARENA_LIVE: ${{ vars.ARENA_LIVE }}
+          MODE: ${{ inputs.mode }}
           NOMINAL_SLOT: ${{ inputs.nominal_slot }}
           IS_LAST_SLOT_OF_DAY: ${{ inputs.is_last_slot_of_day }}
         run: uv run python scripts/run_daily_submission.py
