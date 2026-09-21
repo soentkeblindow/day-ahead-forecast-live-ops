@@ -65,34 +65,49 @@ const POLL_INTERVAL_MINUTES = 5;
 // from here on, manual diagnosis only -- the workflow file itself already
 // dropped its schedule: trigger back in 6.7.1); weather_availability_probe.yml
 // keeps its pre-gate-closure morning slots (08:30/09:30) and its post-18:00
-// confirmation slot (18:30), but loses 10:30/11:30 -- section 2.2 requires
-// it out of the 10:00-12:00 window entirely, since it must never take
-// priority over maintenance/submission (it is deliberately NOT in the
-// maintain-store concurrency group either, see submit.yml's own comment).
+// confirmation slot (18:30).
+//
+// Section 2.2's "never in the 10:00-12:00 window" rule for the probe was
+// explicitly relaxed by the owner on 2026-09-21: the three slots it removed
+// (originally 10:30/11:30) were exactly what made the Energy-Charts
+// knowledge-time probe's ~28min-before-gate-closure margin for `load`
+// measurable at all (docs/data_sources_for_live_model_use.md section 3.3) --
+// losing them meant that finding could never be refined or re-confirmed.
+// Three slots restored at 10:35/11:10/11:35, each five minutes ahead of the
+// submit.yml slot it precedes, to capture the availability state
+// immediately before each submission attempt. Still deliberately not in the
+// maintain-store concurrency group (see submit.yml's own comment) -- a
+// probe-only workflow reading an unrelated third-party API has nothing to
+// coordinate with maintenance/submission over, the original "never take
+// priority" framing was caution, not a real resource conflict.
 const SLOTS: Slot[] = [
   { localTime: "08:30", workflow: "weather_availability_probe.yml" },
   { localTime: "09:30", workflow: "weather_availability_probe.yml" },
   // Maintenance/submission window (spec 6.7.3 section 2.2): three passes of
-  // each, interleaved -- Pflege 10:10 -> Einreichung 10:40 -> Pflege 10:55
-  // (a second chance for the load forecast and the weather run) ->
-  // Einreichung 11:15 -> Pflege 11:25 (a third chance) -> Einreichung 11:40
-  // (the day's last submission attempt, ~20 minutes clear of the 12:00 gate
-  // closure even in the worst case). submit.yml's own nominal_slot/
-  // is_last_slot_of_day inputs replace its former wall-clock derivation --
-  // this worker already knows which slot it meant to fire.
+  // each, interleaved -- Pflege 10:10 -> Sonde 10:35 -> Einreichung 10:40 ->
+  // Pflege 10:55 (a second chance for the load forecast and the weather
+  // run) -> Sonde 11:10 -> Einreichung 11:15 -> Pflege 11:25 (a third
+  // chance) -> Sonde 11:35 -> Einreichung 11:40 (the day's last submission
+  // attempt, ~20 minutes clear of the 12:00 gate closure even in the worst
+  // case). submit.yml's own nominal_slot/is_last_slot_of_day inputs replace
+  // its former wall-clock derivation -- this worker already knows which
+  // slot it meant to fire.
   { localTime: "10:10", workflow: "maintain_store.yml" },
+  { localTime: "10:35", workflow: "weather_availability_probe.yml" },
   {
     localTime: "10:40",
     workflow: "submit.yml",
     inputs: { nominal_slot: "10:40", is_last_slot_of_day: "false" },
   },
   { localTime: "10:55", workflow: "maintain_store.yml" },
+  { localTime: "11:10", workflow: "weather_availability_probe.yml" },
   {
     localTime: "11:15",
     workflow: "submit.yml",
     inputs: { nominal_slot: "11:15", is_last_slot_of_day: "false" },
   },
   { localTime: "11:25", workflow: "maintain_store.yml" },
+  { localTime: "11:35", workflow: "weather_availability_probe.yml" },
   {
     localTime: "11:40",
     workflow: "submit.yml",
