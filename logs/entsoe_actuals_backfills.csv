@@ -1,0 +1,3 @@
+filled_at_utc,gap_local_date,cells_filled,columns,source,source_url,license
+2026-09-20T14:08:06.812664+00:00,2026-09-20,174,load_actual;gen_wind_onshore;gen_solar,Energy-Charts (Fraunhofer ISE) public_power,https://api.energy-charts.info/public_power?country=de&start=2026-09-20&end=2026-09-20,"CC BY 4.0 (Energy-Charts general license; no per-response license_info field on this endpoint, unlike /price)"
+2026-09-20T14:14:51.998316+00:00,2026-09-20,174,load_actual;gen_wind_onshore;gen_solar,Energy-Charts (Fraunhofer ISE) public_power,https://api.energy-charts.info/public_power?country=de&start=2026-09-20&end=2026-09-20,"CC BY 4.0 (Energy-Charts general license; no per-response license_info field on this endpoint, unlike /price)"

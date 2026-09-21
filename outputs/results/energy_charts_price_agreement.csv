@@ -1,0 +1,10 @@
+# diff = ec - store; day_ahead_price, hourly before 2025-09-30 and quarter-hourly after on both sides, compared on their raw timestamp intersection, no resampling.
+series,breakdown,group,window_start,window_end,n_days_missing_in_store,n_days_missing_in_ec,n,exact_fraction,diff_median,diff_p95_abs,diff_max_abs,corr
+day_ahead_price,overall,all,2019-12-31T23:00:00+00:00,2026-09-21T21:45:00+00:00,0.0,0.0,84574,1.0,0.0,0.0,0.0,1.0
+day_ahead_price,year,2020,,,,,8783,1.0,0.0,0.0,0.0,1.0
+day_ahead_price,year,2021,,,,,8760,1.0,0.0,0.0,0.0,0.9999999999999998
+day_ahead_price,year,2022,,,,,8760,1.0,0.0,0.0,0.0,0.9999999999999998
+day_ahead_price,year,2023,,,,,8760,1.0,0.0,0.0,0.0,1.0
+day_ahead_price,year,2024,,,,,8784,1.0,0.0,0.0,0.0,1.0
+day_ahead_price,year,2025,,,,,15387,1.0,0.0,0.0,0.0,1.0
+day_ahead_price,year,2026,,,,,25340,1.0,0.0,0.0,0.0,1.0
