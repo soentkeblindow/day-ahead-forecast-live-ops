@@ -1,4 +1,4 @@
-name: Daily submission (dry run)
+name: Daily submission
 
 on:
   # workflow_dispatch only -- ops/trigger/'s Cloudflare Worker is the sole
