@@ -87,7 +87,9 @@ def _request_url(local_date: dt.date) -> str:
     return prepared.url
 
 
-def fetch_energy_charts_public_power(local_date: dt.date, *, country: str = _COUNTRY) -> pd.DataFrame:
+def fetch_energy_charts_public_power(
+    local_date: dt.date, *, country: str = _COUNTRY
+) -> pd.DataFrame:
     """Real, already-realised load/generation for local (Europe/Berlin)
     calendar date ``local_date`` -- no cache, this script is itself the
     one-off fill action.
@@ -116,7 +118,9 @@ def fetch_energy_charts_public_power(local_date: dt.date, *, country: str = _COU
     columns: dict[str, pd.Series] = {}
     for ec_name, _source_name, our_col in _TARGETS:
         if ec_name not in series_by_name:
-            raise ValueError(f"Energy-Charts response for {local_date} is missing series {ec_name!r}")
+            raise ValueError(
+                f"Energy-Charts response for {local_date} is missing series {ec_name!r}"
+            )
         values = series_by_name[ec_name]
         if any(v is None for v in values):
             raise ValueError(
@@ -244,7 +248,9 @@ def main() -> int:
                 merged_col, cells_filled = backfill_column(
                     existing, column, fresh.loc[month_index, column]
                 )
-                logger.info("%s / %s (%s): %d cell(s) filled", source_name, column, month, cells_filled)
+                logger.info(
+                    "%s / %s (%s): %d cell(s) filled", source_name, column, month, cells_filled
+                )
                 total_filled += cells_filled
                 if cells_filled:
                     existing[column] = merged_col

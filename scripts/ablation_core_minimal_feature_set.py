@@ -41,6 +41,7 @@ import datetime as dt
 import logging
 import os
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import mlflow
@@ -87,6 +88,15 @@ _OUT_PATH = Path("data/processed/ablation_core_minimal_feature_set_predictions.p
 _MLFLOW_EXPERIMENT = "feature_reduction_for_live_system"
 
 _CORE_CANDIDATES = ("core_with_commodities", "core_no_commodities", "core_gas_only")
+
+
+@dataclass
+class GateResult:
+    native_vs_baseline: DMResult
+    daily_vs_baseline: DMResult
+    gate_pass: bool
+    native_vs_live: DMResult | None = None
+    daily_vs_live: DMResult | None = None
 
 
 def _hourly_index_for_local_day(target_day: dt.date) -> pd.DatetimeIndex:
@@ -321,7 +331,7 @@ def main() -> None:
     print(
         "(spec 6.6 Entscheidung 24 criterion: RMSE(candidate) < RMSE(baseline) AND native-QH DM p<0.10)\n"
     )
-    gate_results: dict[str, dict[str, object]] = {}
+    gate_results: dict[str, GateResult] = {}
     for name in _CORE_CANDIDATES:
         native_vs_base, daily_vs_base = _run_dm(name, "baseline")
         rmse_ok = metrics[name]["rmse"] < metrics["baseline"]["rmse"]
@@ -330,11 +340,11 @@ def main() -> None:
         verdict = (
             "PASS -- still worth submitting" if gate_pass else "FAIL -- baseline wins, don't submit"
         )
-        gate_results[name] = {
-            "native_vs_baseline": native_vs_base,
-            "daily_vs_baseline": daily_vs_base,
-            "gate_pass": gate_pass,
-        }
+        gate_results[name] = GateResult(
+            native_vs_baseline=native_vs_base,
+            daily_vs_baseline=daily_vs_base,
+            gate_pass=gate_pass,
+        )
         print(f"{name} vs baseline:")
         print(
             f"  native (hac={_QH_HAC_LAG},h={_QH_HORIZON}): mean_loss_diff_sq={native_vs_base.mean_loss_diff:.4f}  "
@@ -352,8 +362,8 @@ def main() -> None:
     print("--- for context: vs the current live candidate (full feature set) ---\n")
     for name in _CORE_CANDIDATES:
         native_vs_live, daily_vs_live = _run_dm(name, "live")
-        gate_results[name]["native_vs_live"] = native_vs_live
-        gate_results[name]["daily_vs_live"] = daily_vs_live
+        gate_results[name].native_vs_live = native_vs_live
+        gate_results[name].daily_vs_live = daily_vs_live
         sig = (
             "significant (p<0.10)"
             if native_vs_live.p_value < _GATE_P_THRESHOLD
@@ -400,19 +410,18 @@ def main() -> None:
             log_metrics[f"{name}_rmse"] = metrics[name]["rmse"]
         for name in _CORE_CANDIDATES:
             gr = gate_results[name]
-            log_metrics[f"{name}_vs_baseline_native_loss_diff"] = gr[
-                "native_vs_baseline"
-            ].mean_loss_diff
-            log_metrics[f"{name}_vs_baseline_native_p"] = gr["native_vs_baseline"].p_value
-            log_metrics[f"{name}_vs_baseline_daily_loss_diff"] = gr[
-                "daily_vs_baseline"
-            ].mean_loss_diff
-            log_metrics[f"{name}_vs_baseline_daily_p"] = gr["daily_vs_baseline"].p_value
-            log_metrics[f"{name}_vs_live_native_loss_diff"] = gr["native_vs_live"].mean_loss_diff
-            log_metrics[f"{name}_vs_live_native_p"] = gr["native_vs_live"].p_value
-            log_metrics[f"{name}_vs_live_daily_loss_diff"] = gr["daily_vs_live"].mean_loss_diff
-            log_metrics[f"{name}_vs_live_daily_p"] = gr["daily_vs_live"].p_value
-            mlflow.set_tag(f"{name}_gate_verdict", "PASS" if gr["gate_pass"] else "FAIL")
+            log_metrics[f"{name}_vs_baseline_native_loss_diff"] = (
+                gr.native_vs_baseline.mean_loss_diff
+            )
+            log_metrics[f"{name}_vs_baseline_native_p"] = gr.native_vs_baseline.p_value
+            log_metrics[f"{name}_vs_baseline_daily_loss_diff"] = gr.daily_vs_baseline.mean_loss_diff
+            log_metrics[f"{name}_vs_baseline_daily_p"] = gr.daily_vs_baseline.p_value
+            assert gr.native_vs_live is not None and gr.daily_vs_live is not None
+            log_metrics[f"{name}_vs_live_native_loss_diff"] = gr.native_vs_live.mean_loss_diff
+            log_metrics[f"{name}_vs_live_native_p"] = gr.native_vs_live.p_value
+            log_metrics[f"{name}_vs_live_daily_loss_diff"] = gr.daily_vs_live.mean_loss_diff
+            log_metrics[f"{name}_vs_live_daily_p"] = gr.daily_vs_live.p_value
+            mlflow.set_tag(f"{name}_gate_verdict", "PASS" if gr.gate_pass else "FAIL")
         mlflow.log_metrics(log_metrics)
         mlflow.log_artifact(str(_OUT_PATH))
     print(f"\nlogged to mlflow experiment {_MLFLOW_EXPERIMENT!r}")
