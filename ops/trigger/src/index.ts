@@ -64,7 +64,7 @@ const POLL_INTERVAL_MINUTES = 5;
 // derivation): audit.yml's slots are gone entirely (workflow_dispatch-only
 // from here on, manual diagnosis only -- the workflow file itself already
 // dropped its schedule: trigger back in 6.7.1); weather_availability_probe.yml
-// keeps its pre-gate-closure morning slots (08:30/09:30) and its post-18:00
+// keeps a pre-gate-closure morning slot (09:30) and its post-18:00
 // confirmation slot (18:30).
 //
 // Section 2.2's "never in the 10:00-12:00 window" rule for the probe was
@@ -81,7 +81,6 @@ const POLL_INTERVAL_MINUTES = 5;
 // coordinate with maintenance/submission over, the original "never take
 // priority" framing was caution, not a real resource conflict.
 const SLOTS: Slot[] = [
-  { localTime: "08:30", workflow: "weather_availability_probe.yml" },
   { localTime: "09:30", workflow: "weather_availability_probe.yml" },
   // Maintenance/submission window (spec 6.7.3 section 2.2): three passes of
   // each, interleaved -- Pflege 10:10 -> Sonde 10:35 -> Einreichung 10:40 ->
@@ -99,6 +98,18 @@ const SLOTS: Slot[] = [
     workflow: "submit.yml",
     inputs: { nominal_slot: "10:40", is_last_slot_of_day: "false" },
   },
+  // Extra probe slot added 2026-09-22, in place of the former 08:30 slot
+  // (owner instruction): bisects the 10:35-11:10 window in which the
+  // Energy-Charts `load` day-ahead forecast was observed to become
+  // available on 2026-09-22 (10:35 still 404, 11:10 already available) --
+  // narrows that ~35min uncertainty band instead of re-confirming the
+  // already well-established "never available before ~10:30" baseline the
+  // old 08:30 slot mostly produced by now (see
+  // docs/data_sources_for_live_model_use.md section 3.3). The weather-run
+  // early-warning role 08:30 also served is accepted as redundant with
+  // 09:30 for now -- section 2.3's offset bug is fixed and the 10:10
+  // maintenance pass has reliably gotten the fresh run every time measured.
+  { localTime: "10:50", workflow: "weather_availability_probe.yml" },
   { localTime: "10:55", workflow: "maintain_store.yml" },
   { localTime: "11:10", workflow: "weather_availability_probe.yml" },
   {

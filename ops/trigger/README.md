@@ -32,42 +32,59 @@ fired -- the CET/CEST doubling was never actually load-bearing for that
 property. Full narrative: `docs/sprint6_step6_7_1_log.md`, step A2
 addendum.
 
-Current slot table (spec 6.7.3 section 2.2, owner-confirmed 2026-09-16):
+Current slot table (spec 6.7.3 section 2.2 baseline, owner-confirmed
+2026-09-16, revised 2026-09-21 and 2026-09-22 as noted below):
 `audit.yml` has retired from the schedule entirely (`workflow_dispatch`
-only from here on, manual diagnosis) and `weather_availability_probe.yml`
-no longer has any slot inside the 10:00-12:00 maintenance/submission
-window (section 2.2: it must never take priority over either).
+only from here on, manual diagnosis).
 
 | Local time (Europe/Berlin) | Workflow |
 |---|---|
-| 08:30 | `weather_availability_probe.yml` |
 | 09:30 | `weather_availability_probe.yml` |
 | 10:10 | `maintain_store.yml` |
+| 10:35 | `weather_availability_probe.yml` |
 | 10:40 | `submit.yml` |
+| 10:50 | `weather_availability_probe.yml` |
 | 10:55 | `maintain_store.yml` |
+| 11:10 | `weather_availability_probe.yml` |
 | 11:15 | `submit.yml` |
 | 11:25 | `maintain_store.yml` |
+| 11:35 | `weather_availability_probe.yml` |
 | 11:40 | `submit.yml` |
 | 18:30 | `weather_availability_probe.yml` |
 
-The three remaining `weather_availability_probe.yml` slots (owner-specified
-2026-09-15, originally five, reduced by the 10:00-12:00 exclusion above)
-exist for the Energy-Charts knowledge-time probe riding along in the same
-workflow (`scripts/probe_energy_charts_forecast.py`), not for the weather
-probe itself -- weather's own run has historically been available well
-before any of these times. Two samples in the pre-gate-closure (12:00
-local) morning, plus one past 18:00 (an independent timing check, not
-useful for a submission itself).
+The `weather_availability_probe.yml` slots exist for the Energy-Charts
+knowledge-time probe riding along in the same workflow
+(`scripts/probe_energy_charts_forecast.py`), not for the weather probe
+itself -- weather's own run has historically been available well before
+any of these times. Section 2.2's original "never inside the 10:00-12:00
+maintenance/submission window" rule was relaxed by the owner on
+2026-09-21: three slots (10:35/11:10/11:35, each five minutes ahead of the
+`submit.yml` slot it precedes) were restored specifically to measure the
+Energy-Charts `load` day-ahead forecast's own knowledge-time margin
+relative to each real submission attempt
+(`docs/data_sources_for_live_model_use.md` section 3.3) -- losing that
+window meant the finding could never be refined. A fourth slot, 10:50, was
+added 2026-09-22 (replacing the former 08:30 slot) to bisect the
+10:35-11:10 gap after a real measurement that day found `load` still
+unavailable at 10:35 but available at 11:10 -- narrowing that ~35min
+uncertainty band was judged more valuable than the 08:30 slot's now-mostly
+redundant "still 404 this early" baseline (established at all three
+measured days by then) and its early weather-run-availability check
+(section 2.3's own offset bug is fixed; the 10:10 maintenance pass has
+reliably gotten the fresh run every time measured). One slot remains
+before the 10:00-12:00 window (09:30) and one after gate closure (18:30,
+an independent timing check, not useful for a submission itself).
 
 The three submission slots are deliberately interleaved with, not appended
-after, the maintenance slots: Pflege 10:10 -> Einreichung 10:40 -> Pflege
-10:55 (a second chance for the load forecast and the weather run) ->
-Einreichung 11:15 -> Pflege 11:25 (a third chance) -> Einreichung 11:40
-(the day's last submission attempt, ~20 minutes clear of the 12:00 gate
-closure even in the worst case -- spec 6.7.3 section 2.2's own
-worst-case-timing derivation). The real day-ahead window is only two hours
-wide because the load forecast is only guaranteed at 10:00 local. Each
-`submit.yml` dispatch now carries `nominal_slot`/`is_last_slot_of_day` as
+after, the maintenance slots: Pflege 10:10 -> Sonde 10:35 -> Einreichung
+10:40 -> Sonde 10:50 -> Pflege 10:55 (a second chance for the load forecast
+and the weather run) -> Sonde 11:10 -> Einreichung 11:15 -> Pflege 11:25
+(a third chance) -> Sonde 11:35 -> Einreichung 11:40 (the day's last
+submission attempt, ~20 minutes clear of the 12:00 gate closure even in
+the worst case -- spec 6.7.3 section 2.2's own worst-case-timing
+derivation). The real day-ahead window is only two hours wide because the
+load forecast is only guaranteed at 10:00 local. Each `submit.yml`
+dispatch now carries `nominal_slot`/`is_last_slot_of_day` as
 `workflow_dispatch` inputs (`Slot.inputs` in `src/index.ts`) instead of
 `submit.yml` re-deriving them from its own wall-clock start time.
 
