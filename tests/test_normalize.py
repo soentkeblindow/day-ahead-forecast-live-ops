@@ -78,6 +78,84 @@ def test_vwap_nan_weight_fallback() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Group 3b — VWAP: weight_fallback (docs/bugs_in_live_system.md entry 2)
+# ---------------------------------------------------------------------------
+
+
+def test_vwap_no_fallback_partial_nan_weight_is_zero_weighted() -> None:
+    """Without weight_fallback (the default), a partially-NaN weight silently
+    zero-weights the affected quarter-hour instead of excluding it -- this is
+    the exact prior behaviour and must stay unchanged when nothing opts in."""
+    idx = pd.date_range("2024-01-01", periods=4, freq="15min", tz="UTC")
+    price = pd.Series([50.0, 60.0, 70.0, 80.0], index=idx)
+    weight = pd.Series([100.0, float("nan"), 300.0, 400.0], index=idx)
+    result = to_hourly_vwap(price, weight)
+    # hand-computed: (50*100 + 70*300 + 80*400) / (100+300+400) = 72.5
+    assert result.iloc[0] == pytest.approx(72.5)
+
+
+def test_vwap_fallback_fills_missing_primary_weight() -> None:
+    """A quarter-hour missing `weight` but present in `weight_fallback` is
+    included in the VWAP with the fallback weight, not zero-weighted."""
+    idx = pd.date_range("2024-01-01", periods=4, freq="15min", tz="UTC")
+    price = pd.Series([50.0, 60.0, 70.0, 80.0], index=idx)
+    weight = pd.Series([100.0, float("nan"), 300.0, 400.0], index=idx)
+    fallback = pd.Series([90.0, 200.0, 290.0, 410.0], index=idx)
+    result = to_hourly_vwap(price, weight, weight_fallback=fallback)
+    # hand-computed with the second quarter's weight taken from fallback (200):
+    # (50*100 + 60*200 + 70*300 + 80*400) / (100+200+300+400) = 70.0
+    assert result.iloc[0] == pytest.approx(70.0)
+
+
+def test_vwap_fallback_still_missing_forces_simple_mean() -> None:
+    """If a quarter-hour's weight is NaN in *both* `weight` and
+    `weight_fallback`, the whole hour falls back to the simple mean instead
+    of silently VWAP-ing over the remaining three quarter-hours."""
+    idx = pd.date_range("2024-01-01", periods=4, freq="15min", tz="UTC")
+    price = pd.Series([50.0, 60.0, 70.0, 80.0], index=idx)
+    weight = pd.Series([100.0, float("nan"), 300.0, 400.0], index=idx)
+    fallback = pd.Series([90.0, float("nan"), 290.0, 410.0], index=idx)
+    result = to_hourly_vwap(price, weight, weight_fallback=fallback)
+    assert result.iloc[0] == pytest.approx(65.0)  # simple mean of all four
+
+
+def test_vwap_fallback_complete_hour_matches_no_fallback_call() -> None:
+    """When `weight` already has no gaps, passing weight_fallback must not
+    change the result at all (it's never consulted)."""
+    idx = pd.date_range("2024-01-01", periods=4, freq="15min", tz="UTC")
+    price = pd.Series([50.0, 60.0, 70.0, 80.0], index=idx)
+    weight = pd.Series([100.0, 200.0, 300.0, 400.0], index=idx)
+    fallback = pd.Series([999.0, 999.0, 999.0, 999.0], index=idx)
+    with_fallback = to_hourly_vwap(price, weight, weight_fallback=fallback)
+    without_fallback = to_hourly_vwap(price, weight)
+    pd.testing.assert_series_equal(with_fallback, without_fallback)
+
+
+def test_to_hourly_wires_load_forecast_as_weight_fallback() -> None:
+    """to_hourly() must pass load_forecast_day_ahead as weight_fallback, so a
+    gap in load_actual that load_forecast_day_ahead covers no longer degrades
+    to the pre-fix zero-weighting (docs/bugs_in_live_system.md entry 2)."""
+    idx = _qh_index("2024-01-01", n_hours=2)
+    df = _minimal_df(idx)
+    df.loc[idx[1], "load_actual"] = float("nan")
+    df["load_forecast_day_ahead"] = 30_000.0
+    result = to_hourly(df)
+    # all four quarter-hours end up weighted (three real + one fallback, all
+    # equal here) -> still a clean, fully-weighted VWAP, not a hole.
+    assert not result["day_ahead_price"].isna().any()
+
+
+def test_to_hourly_without_load_forecast_column_is_unaffected() -> None:
+    """A frame that doesn't carry load_forecast_day_ahead at all (e.g. an
+    older/synthetic fixture) must behave exactly as before -- df.get() must
+    not raise, and the result must match the no-fallback code path."""
+    idx = _qh_index("2024-01-01", n_hours=2)
+    df = _minimal_df(idx)
+    result = to_hourly(df)
+    assert not result["day_ahead_price"].isna().any()
+
+
+# ---------------------------------------------------------------------------
 # Group 4 — "Mean, not sum": continuity across the resolution break
 # ---------------------------------------------------------------------------
 
