@@ -591,9 +591,7 @@ def main() -> None:
     gas_log_metrics: dict[str, float] = {}
     gate_pass = gas_metrics["D1_gas"]["rmse"] < gas_metrics["baseline"]["rmse"]
     with mlflow.start_run(run_name="measurement_d1_gas_ec_load_6_9"):
-        mlflow.log_params(
-            {"n_folds": len(folds_to_run), "refit_every": _REFIT_EVERY, "k3": _K3}
-        )
+        mlflow.log_params({"n_folds": len(folds_to_run), "refit_every": _REFIT_EVERY, "k3": _K3})
         mlflow.set_tags({"spec": "sprint6_step6_9", "measurement": "D1_gas (section 2.2)"})
 
         print("\n--- DM vs baseline (criterion), vs core_gas_only (informative) ---\n")
@@ -652,7 +650,7 @@ def main() -> None:
     if gate_final:
         print(
             f"\nGATE PASS: D1_gas (core_gas_ec candidate) RMSE={gas_metrics['D1_gas']['rmse']:.4f} "
-            "-- replaces the interpolated \"~26.5\" placeholder in the Zielbild (spec 6.9 "
+            '-- replaces the interpolated "~26.5" placeholder in the Zielbild (spec 6.9 '
             "section 2.2)."
         )
     else:
@@ -663,8 +661,10 @@ def main() -> None:
 
     elapsed = time.monotonic() - t0
     print(f"\nelapsed: {elapsed:.0f}s")
-    print(f"logged to mlflow experiment {_MLFLOW_EXPERIMENT!r}, summaries at {_SUMMARY_PATH} "
-          f"and {_D1_GAS_SUMMARY_PATH}")
+    print(
+        f"logged to mlflow experiment {_MLFLOW_EXPERIMENT!r}, summaries at {_SUMMARY_PATH} "
+        f"and {_D1_GAS_SUMMARY_PATH}"
+    )
 
 
 if __name__ == "__main__":
