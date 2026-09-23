@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
 
-PROTOCOL_VERSION: Final[int] = 3
+PROTOCOL_VERSION: Final[int] = 4
 
 # Fixed so every appended line writes its keys in the same order (spec
 # section 2.8: "sonst sind die Git-Diffs verrauscht"). New fields are
@@ -68,6 +68,31 @@ _KEY_ORDER: Final[tuple[str, ...]] = (
     "api_response_received_utc",
     "confirmed_via_query",
     "smoke_baseline_source_day",
+    # protocol_version 4 (spec 6.9, section 5.7) -- appended, same rule.
+    # Step 3 (docs/sprint6_step6_9_log.md) only adds the schema; every field
+    # here is None/empty until the step that actually computes it lands
+    # (candidate_rank/candidates_evaluated/downgrade_blocked/
+    # best_accepted_rank_before in step 10, nwp_available/training_* in
+    # step 8, target_day_fills in step 11, load_forecast_source/
+    # price_provenance/price_source_conflicts in step 7,
+    # rnw_label_edge_age_days in step 8, capacity_anchor_days_left in step 8).
+    "candidate_rank",
+    "candidates_evaluated",
+    "nwp_available",
+    "nwp_unavailable_reason",
+    "price_provenance",
+    "price_source_conflicts",
+    "load_forecast_source",
+    "n_training_days",
+    "age_of_last_complete_day",
+    "training_tolerance_used",
+    "training_missing_days",
+    "known_weather_defect_days",
+    "rnw_label_edge_age_days",
+    "target_day_fills",
+    "downgrade_blocked",
+    "best_accepted_rank_before",
+    "capacity_anchor_days_left",
 )
 
 
@@ -128,6 +153,48 @@ class SubmissionRecord:
     whether a gap here should ever block a run is a decision for 6.8, made
     from real logged numbers, not this step. Both ``None`` for any run that
     never reached the fit step (Check A/extent/Check B skip).
+
+    protocol_version 4 fields (spec 6.9 section 5.7), all optional and
+    additive, schema-only as of this step (docs/sprint6_step6_9_log.md,
+    step 3) -- every one of them is still its default here, filled in by
+    later 6.9 steps once the corresponding logic exists:
+
+    - ``candidate_rank``: the selected fallback-ladder row's rank (1-3).
+    - ``candidates_evaluated``: one entry per row tried, each
+      ``{"name": ..., "rank": ..., "outcome": "selected"/"failed"/
+      "not_reached", "reason": ...}``.
+    - ``nwp_available``/``nwp_unavailable_reason``: Check A's split NWP
+      verdict (spec section 2.3) -- whether weather/capacity allowed a
+      renewables walk-forward at all this run, independent of which row
+      the ladder ultimately selected.
+    - ``price_provenance``: per price-consumer (``training_labels``,
+      ``price_lags``, ``shape_window``, ``persistence``) which source fed
+      it -- ``"entsoe"`` or ``"energy_charts"`` (spec section 5.3).
+    - ``price_source_conflicts``: count of cells where both ENTSO-E and
+      Energy-Charts had a value and they disagreed (spec section 5.3) --
+      purely informative, never gates, never warns.
+    - ``load_forecast_source``: ``"entsoe"``/``"energy_charts"``/``None``,
+      whichever fed the selected row's load-forecast fundamentals.
+    - ``n_training_days``/``age_of_last_complete_day``/
+      ``training_tolerance_used``/``training_missing_days``: the measured-
+      tolerance training-window report (spec section 2.6) that replaces
+      the old exact-row-count ``check_training_extent``.
+    - ``known_weather_defect_days``: training days excluded whose cause is
+      an already-documented, permanent weather defect (spec section 2.6) --
+      reporting only, no longer a tolerance input
+      (``known_defect_tolerance_hours`` is removed in this spec).
+    - ``rnw_label_edge_age_days``: how many days before the training
+      window's own right edge the last complete 14.1.D renewables label
+      lies (spec section 2.7).
+    - ``target_day_fills``: one entry per target-day gap handled, each
+      ``{"group": ..., "n_hours": ..., "hours": [...], "action":
+      "forward_fill"/"partial_fill"}`` (spec section 2.8).
+    - ``downgrade_blocked``/``best_accepted_rank_before``: whether this
+      run's own candidate would have overwritten an already-accepted,
+      better-ranked submission for the same target day, and what that
+      rank was (spec section 2.9).
+    - ``capacity_anchor_days_left``: days until the capacity anchor table's
+      own validity boundary, at this run's ``as_of`` (spec section 2.3).
     """
 
     run_timestamp_utc: str
@@ -156,6 +223,23 @@ class SubmissionRecord:
     api_response_received_utc: str | None = None
     confirmed_via_query: bool | None = None
     smoke_baseline_source_day: str | None = None
+    candidate_rank: int | None = None
+    candidates_evaluated: list[dict[str, Any]] = field(default_factory=list)
+    nwp_available: bool | None = None
+    nwp_unavailable_reason: str | None = None
+    price_provenance: dict[str, str] = field(default_factory=dict)
+    price_source_conflicts: int | None = None
+    load_forecast_source: str | None = None
+    n_training_days: int | None = None
+    age_of_last_complete_day: int | None = None
+    training_tolerance_used: bool | None = None
+    training_missing_days: list[str] = field(default_factory=list)
+    known_weather_defect_days: list[str] = field(default_factory=list)
+    rnw_label_edge_age_days: int | None = None
+    target_day_fills: list[dict[str, Any]] = field(default_factory=list)
+    downgrade_blocked: bool | None = None
+    best_accepted_rank_before: int | None = None
+    capacity_anchor_days_left: int | None = None
     protocol_version: int = PROTOCOL_VERSION
 
     def to_dict(self) -> dict[str, Any]:

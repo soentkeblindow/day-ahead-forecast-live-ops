@@ -65,6 +65,7 @@ from energy_price_forecast.evaluation.dm_test import DMResult, dm_test
 from energy_price_forecast.evaluation.metrics import mae, rmse
 from energy_price_forecast.features.availability import Feature, build_matrix
 from energy_price_forecast.features.calendar import build_calendar_features
+from energy_price_forecast.features.fundamentals import build_commodity_features
 from energy_price_forecast.features.lags import build_price_lags
 from energy_price_forecast.features.nwp_fundamentals import (
     build_nwp_forecast_fundamentals,
@@ -78,10 +79,12 @@ from scripts.ablation_energy_charts_residual_load import (
     _hourly_index_for_local_day,
     _read_ec_hourly,
     build_ec_candidate_for_day,
+    build_ec_fundamentals,
 )
 from scripts.measurement_a_candidate_intake import (
     _DAILY_HAC_LAG,
     _DAILY_HORIZON,
+    _GATE_P_THRESHOLD,
     _QH_HAC_LAG,
     _QH_HORIZON,
     _RANDOM_STATE,
@@ -100,6 +103,14 @@ _MLFLOW_EXPERIMENT = "live_robustness_6_8"
 _OUT_PATH = Path("data/processed/measurement_d_ec_load_predictions.parquet")
 _SUMMARY_PATH = Path("outputs/results/measurement_d_ec_load_summary.csv")
 _REFERENCE_PATH = Path("data/processed/measurement_a_candidate_intake_predictions.parquet")
+
+# Spec 6.9 section 2.2: D1 (EC load, training and target) on a core_gas_only
+# basis -- the follow-up measurement closing "Messung D lief gasfrei" before
+# core_gas_ec (rank 2 of the fallback ladder) can go live. Kept in separate
+# output files from the original D0-D3_k3 arms above (untouched by this
+# addition) rather than folded into them.
+_D1_GAS_OUT_PATH = Path("data/processed/measurement_d1_gas_ec_load_predictions.parquet")
+_D1_GAS_SUMMARY_PATH = Path("outputs/results/measurement_d1_gas_ec_load_summary.csv")
 
 _CAVEAT = (
     "# CAVEAT (spec section 7, verbatim): Energy-Charts load is, per the probe data so far, "
@@ -180,6 +191,100 @@ def _predict_qh(
 ) -> pd.Series:
     hourly_pred = model.predict(fold.test_index, history=history, x_test=x_test)
     return expand_to_quarterhour(hourly_pred, profile, target_day=fold.delivery_day, tz=_TZ)
+
+
+def build_ec_gas_for_day(
+    target_day,
+    df: pd.DataFrame,
+    renewables: pd.DataFrame,
+    ec: dict[str, pd.Series],
+    cfg,
+) -> pd.DataFrame:
+    """Spec 6.9 section 2.2 / section 2.1's rank-2 row (`core_gas_ec`):
+    core_ec_load's own fundamentals (EC load, own NWP renewables
+    reconstruction -- build_ec_fundamentals's "core_ec_load" branch,
+    unchanged) plus a TTF-gas-only commodity feature, the same way
+    scripts.ablation_core_minimal_feature_set.build_core_for_day and
+    scripts.measurement_a_candidate_intake.build_floor_for_day already add
+    gas on top of their own shared blocks -- not a new pattern, the one
+    missing repetition identified in step 1 (docs/sprint6_step6_9_log.md
+    section 3.1 point 1: build_ec_candidate_for_day never calls
+    build_commodity_features at all)."""
+    target_index = _hourly_index_for_local_day(target_day)
+    fundamentals = build_ec_fundamentals("core_ec_load", target_index, df, renewables, ec)
+    gas = build_commodity_features(df, target_index, cfg)[:1]  # ttf_gas only, no EUA
+    price = build_price_lags(df, target_index, cfg)
+    features = [*build_calendar_features(target_index, cfg), *fundamentals, *gas, *price]
+    return build_matrix(features)
+
+
+def run_d1_gas_measurement(
+    evaluable_folds: list,
+    ec_gas_matrix: pd.DataFrame,
+    y_hourly: pd.Series,
+    prices_qh: pd.Series,
+) -> pd.DataFrame:
+    """Spec 6.9 section 2.2: D1 (EC load, training and target) on a
+    core_gas_only basis.
+
+    No separate D1-k3 arm is fitted here -- and an earlier revision of this
+    function that did (dropping the training window's last _K3 local days
+    via _last_k_days_mask, mirroring D3_k3) was a real modelling mistake,
+    caught by its own "muss = D1 sein" plausibility check failing loudly
+    (max abs diff ~59 EUR/MWh on a real run, 2026-09-23): _last_k_days_mask
+    simulates an ENTSO-E load-forecast outage, the one and only thing D3_k3
+    exists to test. None of D1_gas's own inputs (Energy-Charts load, TTF
+    gas, the NWP renewables reconstruction) come from ENTSO-E's load
+    forecast at all, so that scenario removes nothing from D1_gas's
+    training data -- there is no gap of any kind to simulate, exactly the
+    same reasoning that already made the original (gas-free) D1-k3 "reported
+    not recomputed" (spec 6.8 section 7) rather than a second fit. Fitting a
+    smaller, differently-windowed model and comparing it against D1_gas was
+    never a meaningful plausibility check for this candidate -- it just
+    measured "does removing 3 unrelated training days change the fit"
+    (yes, unsurprisingly, for any model). D1-gas-k3 is therefore identical
+    to D1_gas by construction, same as D1-k3 was to D1."""
+    qh_index = pd.DatetimeIndex(prices_qh.index)
+    model_d1 = LGBMForecaster(objective="quantile", alpha=0.5, random_state=_RANDOM_STATE, n_jobs=1)
+
+    n_folds = len(evaluable_folds)
+    records: list[pd.DataFrame] = []
+    for i, fold in enumerate(evaluable_folds):
+        if i % _REFIT_EVERY == 0:
+            y_train = y_hourly.reindex(fold.train_index)
+            x_train = ec_gas_matrix.reindex(fold.train_index).dropna()
+            model_d1.fit(y_train.loc[x_train.index], x_train)
+
+        history = y_hourly.loc[fold.train_index]
+        end_day_minus_1 = fold.delivery_day - pd.DateOffset(days=1)
+        profile = fit_shape_profile(
+            prices_qh, end_day=end_day_minus_1, n_days=_SHAPE_WINDOW_DAYS, tz=_TZ
+        )
+
+        x_test = ec_gas_matrix.loc[fold.test_index]
+        preds = {"D1_gas": _predict_qh(model_d1, x_test, fold, history, profile)}
+
+        day_start = pd.Timestamp(fold.delivery_day.date(), tz=_TZ)
+        day_end = day_start + pd.DateOffset(days=1)
+        y_true_day = prices_qh.loc[(qh_index >= day_start) & (qh_index < day_end)].sort_index()
+
+        records.append(
+            pd.DataFrame(
+                {
+                    "y_true": y_true_day.to_numpy(),
+                    **{
+                        f"pred_{name}": series.reindex(y_true_day.index).to_numpy()
+                        for name, series in preds.items()
+                    },
+                    "delivery_day": fold.delivery_day,
+                },
+                index=y_true_day.index,
+            )
+        )
+        if (i + 1) % max(1, n_folds // 10) == 0 or i == n_folds - 1:
+            log.info("D1_gas progress: %d/%d folds", i + 1, n_folds)
+
+    return pd.concat(records).sort_index()
 
 
 def run_measurement_d(
@@ -320,6 +425,20 @@ def main() -> None:
             "fold lists are not identical across Messung D's own candidates (section 2)"
         )
 
+    log.info("building core_gas_ec matrix (spec 6.9 section 2.2)...")
+    ec_gas_matrix, ec_gas_excluded = _build_matrix_over_days(
+        all_days_needed,
+        lambda d: build_ec_gas_for_day(d, df, renewables, ec, cfg),
+    )
+    log.info(
+        "core_gas_ec matrix: %d rows, %d days excluded", len(ec_gas_matrix), len(ec_gas_excluded)
+    )
+    if not pd.DatetimeIndex(ec_gas_matrix.index).intersection(test_index).equals(test_index):
+        raise AssertionError(
+            "core_gas_ec matrix does not cover every evaluable fold's test index -- "
+            "fold lists are not identical (spec 6.9 section 2.2)"
+        )
+
     folds_to_run = evaluable_folds[: args.probe_folds] if args.probe_folds else evaluable_folds
 
     run_t0 = time.monotonic()
@@ -328,18 +447,34 @@ def main() -> None:
     )
     run_elapsed = time.monotonic() - run_t0
 
+    gas_t0 = time.monotonic()
+    out_gas = run_d1_gas_measurement(folds_to_run, ec_gas_matrix, y_hourly, prices_qh)
+    gas_elapsed = time.monotonic() - gas_t0
+
     if args.probe_folds:
         per_fold = run_elapsed / len(folds_to_run)
         estimated_total = per_fold * len(evaluable_folds)
         log.info(
-            "PROBE: %d folds took %.1fs (%.2fs/fold) -- extrapolated total for %d folds: "
-            "%.0fs (%.1f min)",
+            "PROBE (D0-D3_k3): %d folds took %.1fs (%.2fs/fold) -- extrapolated total for %d "
+            "folds: %.0fs (%.1f min)",
             len(folds_to_run),
             run_elapsed,
             per_fold,
             len(evaluable_folds),
             estimated_total,
             estimated_total / 60,
+        )
+        per_fold_gas = gas_elapsed / len(folds_to_run)
+        estimated_total_gas = per_fold_gas * len(evaluable_folds)
+        log.info(
+            "PROBE (D1_gas): %d folds took %.1fs (%.2fs/fold) -- extrapolated total "
+            "for %d folds: %.0fs (%.1f min)",
+            len(folds_to_run),
+            gas_elapsed,
+            per_fold_gas,
+            len(evaluable_folds),
+            estimated_total_gas,
+            estimated_total_gas / 60,
         )
         return
 
@@ -421,9 +556,115 @@ def main() -> None:
         mlflow.log_artifact(str(_OUT_PATH))
 
     print("D1_k3: identical to D1 -- Energy-Charts load covers the outage days, no gap to remove.")
+
+    # --- Spec 6.9 section 2.2: D1 on a core_gas_only basis -----------------
+    _D1_GAS_OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    out_gas.to_parquet(_D1_GAS_OUT_PATH)
+
+    ref_gas = reference.loc[out_gas.index]
+    out_gas["pred_baseline"] = ref_gas["pred_baseline"].to_numpy()
+    out_gas["pred_core_gas_only"] = ref_gas["pred_core_gas_only"].to_numpy()
+
+    print(
+        "\nD1_gas_k3: identical to D1_gas by construction -- none of D1_gas's own inputs "
+        "(Energy-Charts load, TTF gas, the NWP renewables reconstruction) come from ENTSO-E's "
+        "load forecast, so an ENTSO-E load-forecast outage (the one scenario _last_k_days_mask "
+        "simulates) removes nothing from its training data. Same reasoning as the original "
+        "D1-k3 (spec 6.8 section 7). See run_d1_gas_measurement's own docstring for the real "
+        "run (2026-09-23) that found fitting a separate, differently-windowed model here was a "
+        "modelling mistake, not a meaningful plausibility check."
+    )
+
+    gas_metrics: dict[str, dict[str, float]] = {}
+    for name in ("D1_gas", "core_gas_only", "baseline"):
+        col = f"pred_{name}"
+        gas_metrics[name] = {
+            "mae": mae(out_gas["y_true"], out_gas[col]),
+            "rmse": rmse(out_gas["y_true"], out_gas[col]),
+        }
+        print(
+            f"{name:15s}  MAE={gas_metrics[name]['mae']:.4f}  RMSE={gas_metrics[name]['rmse']:.4f}"
+        )
+
+    mlflow.set_experiment(_MLFLOW_EXPERIMENT)
+    gas_summary_rows: list[dict[str, object]] = []
+    gas_log_metrics: dict[str, float] = {}
+    gate_pass = gas_metrics["D1_gas"]["rmse"] < gas_metrics["baseline"]["rmse"]
+    with mlflow.start_run(run_name="measurement_d1_gas_ec_load_6_9"):
+        mlflow.log_params(
+            {"n_folds": len(folds_to_run), "refit_every": _REFIT_EVERY, "k3": _K3}
+        )
+        mlflow.set_tags({"spec": "sprint6_step6_9", "measurement": "D1_gas (section 2.2)"})
+
+        print("\n--- DM vs baseline (criterion), vs core_gas_only (informative) ---\n")
+        native_gate = None
+        for reference_name in ("baseline", "core_gas_only"):
+            loss_a = (out_gas["pred_D1_gas"] - out_gas["y_true"]) ** 2
+            loss_b = (out_gas[f"pred_{reference_name}"] - out_gas["y_true"]) ** 2
+            native, daily = _run_dm(loss_a, loss_b, out_gas["delivery_day"])
+            if reference_name == "baseline":
+                native_gate = native
+            better = "better" if native.mean_loss_diff < 0 else "worse"
+            gate_label = (
+                f"  gate={'PASS' if gate_pass and native.p_value < _GATE_P_THRESHOLD else 'FAIL'}"
+                if reference_name == "baseline"
+                else ""
+            )
+            print(
+                f"  vs {reference_name:15s} loss_diff={native.mean_loss_diff:+.4f} "
+                f"p={native.p_value:.4f} ({better}){gate_label}"
+            )
+            gas_summary_rows.append(
+                {
+                    "arm": "D1_gas",
+                    "reference": reference_name,
+                    "rmse_arm": gas_metrics["D1_gas"]["rmse"],
+                    "rmse_reference": gas_metrics[reference_name]["rmse"],
+                    "native_loss_diff": native.mean_loss_diff,
+                    "native_p": native.p_value,
+                    "daily_loss_diff": daily.mean_loss_diff,
+                    "daily_p": daily.p_value,
+                }
+            )
+            gas_log_metrics[f"D1_gas_vs_{reference_name}_native_p"] = native.p_value
+            gas_log_metrics[f"D1_gas_vs_{reference_name}_native_loss_diff"] = native.mean_loss_diff
+        for name, m in gas_metrics.items():
+            gas_log_metrics[f"{name}_rmse"] = m["rmse"]
+            gas_log_metrics[f"{name}_mae"] = m["mae"]
+
+        gate_final = bool(
+            gate_pass and native_gate is not None and native_gate.p_value < _GATE_P_THRESHOLD
+        )
+        mlflow.log_metrics(gas_log_metrics)
+        mlflow.set_tag("gate_pass", str(gate_final))
+        gas_summary = pd.DataFrame(gas_summary_rows)
+        _D1_GAS_SUMMARY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with _D1_GAS_SUMMARY_PATH.open("w", newline="\n") as f:
+            f.write(_CAVEAT + "\n")
+            f.write(
+                "# D1_gas_k3: identical to D1_gas by construction (no ENTSO-E-load-forecast "
+                "input to outage-simulate) -- not a separate row, same as spec 6.8's own D1-k3.\n"
+            )
+            gas_summary.to_csv(f, index=False, lineterminator="\n")
+        mlflow.log_artifact(str(_D1_GAS_SUMMARY_PATH))
+        mlflow.log_artifact(str(_D1_GAS_OUT_PATH))
+
+    if gate_final:
+        print(
+            f"\nGATE PASS: D1_gas (core_gas_ec candidate) RMSE={gas_metrics['D1_gas']['rmse']:.4f} "
+            "-- replaces the interpolated \"~26.5\" placeholder in the Zielbild (spec 6.9 "
+            "section 2.2)."
+        )
+    else:
+        print(
+            "\nGATE FAIL -- do not enter D1_gas into the fallback-ladder table as measured. "
+            "Rueckfrage per spec 6.9 section 2.2/10.9."
+        )
+
     elapsed = time.monotonic() - t0
     print(f"\nelapsed: {elapsed:.0f}s")
-    print(f"logged to mlflow experiment {_MLFLOW_EXPERIMENT!r}, summary at {_SUMMARY_PATH}")
+    print(f"logged to mlflow experiment {_MLFLOW_EXPERIMENT!r}, summaries at {_SUMMARY_PATH} "
+          f"and {_D1_GAS_SUMMARY_PATH}")
 
 
 if __name__ == "__main__":

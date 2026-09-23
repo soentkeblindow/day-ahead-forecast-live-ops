@@ -57,7 +57,44 @@ _EXPECTED_KEY_ORDER = [
     "api_response_received_utc",
     "confirmed_via_query",
     "smoke_baseline_source_day",
+    "candidate_rank",
+    "candidates_evaluated",
+    "nwp_available",
+    "nwp_unavailable_reason",
+    "price_provenance",
+    "price_source_conflicts",
+    "load_forecast_source",
+    "n_training_days",
+    "age_of_last_complete_day",
+    "training_tolerance_used",
+    "training_missing_days",
+    "known_weather_defect_days",
+    "rnw_label_edge_age_days",
+    "target_day_fills",
+    "downgrade_blocked",
+    "best_accepted_rank_before",
+    "capacity_anchor_days_left",
 ]
+
+_SECTION_5_7_FIELDS = (
+    "candidate_rank",
+    "candidates_evaluated",
+    "nwp_available",
+    "nwp_unavailable_reason",
+    "price_provenance",
+    "price_source_conflicts",
+    "load_forecast_source",
+    "n_training_days",
+    "age_of_last_complete_day",
+    "training_tolerance_used",
+    "training_missing_days",
+    "known_weather_defect_days",
+    "rnw_label_edge_age_days",
+    "target_day_fills",
+    "downgrade_blocked",
+    "best_accepted_rank_before",
+    "capacity_anchor_days_left",
+)
 
 
 def test_appended_line_carries_protocol_version_and_fixed_key_order(tmp_path: Path) -> None:
@@ -237,3 +274,99 @@ def test_training_label_fields_default_none_and_round_trip(tmp_path: Path) -> No
     records = read_submission_records(path)
     assert records[0]["n_training_rows"] == 2160
     assert records[0]["n_training_labels"] == 2136
+
+
+def test_reader_tolerates_a_real_protocol_version_3_line_without_section_5_7_fields(
+    tmp_path: Path,
+) -> None:
+    """Same compatibility guarantee as the v1->v2 and v2->v3 tests above,
+    this time for the 6.9 jump to protocol_version 4 (spec section 5.7):
+    every line written under protocol_version 3 genuinely lacks the
+    seventeen new fields."""
+    path = tmp_path / "submissions.jsonl"
+    v3_line = _sample_record().to_dict()
+    v3_line["protocol_version"] = 3
+    for field_name in _SECTION_5_7_FIELDS:
+        del v3_line[field_name]
+    path.write_text(json.dumps(v3_line) + "\n", encoding="utf-8")
+
+    records = read_submission_records(path)
+    assert len(records) == 1
+    assert records[0]["protocol_version"] == 3
+    for field_name in _SECTION_5_7_FIELDS:
+        assert records[0].get(field_name) is None
+
+
+def test_section_5_7_fields_default_and_round_trip(tmp_path: Path) -> None:
+    """Spec 6.9 section 5.7 -- step 3 only adds the schema (docs/
+    sprint6_step6_9_log.md), so every field defaults to None/empty here;
+    later 6.9 steps are what actually compute real values. Both directions
+    checked: the defaults, and that real values round-trip unchanged."""
+    default_record = _sample_record()
+    assert default_record.candidate_rank is None
+    assert default_record.candidates_evaluated == []
+    assert default_record.nwp_available is None
+    assert default_record.nwp_unavailable_reason is None
+    assert default_record.price_provenance == {}
+    assert default_record.price_source_conflicts is None
+    assert default_record.load_forecast_source is None
+    assert default_record.n_training_days is None
+    assert default_record.age_of_last_complete_day is None
+    assert default_record.training_tolerance_used is None
+    assert default_record.training_missing_days == []
+    assert default_record.known_weather_defect_days == []
+    assert default_record.rnw_label_edge_age_days is None
+    assert default_record.target_day_fills == []
+    assert default_record.downgrade_blocked is None
+    assert default_record.best_accepted_rank_before is None
+    assert default_record.capacity_anchor_days_left is None
+
+    path = tmp_path / "submissions.jsonl"
+    append_submission_record(
+        path,
+        _sample_record(
+            candidate_rank=2,
+            candidates_evaluated=[
+                {"name": "core_gas", "rank": 1, "outcome": "failed", "reason": "load missing"},
+                {"name": "core_gas_ec", "rank": 2, "outcome": "selected", "reason": None},
+            ],
+            nwp_available=True,
+            price_provenance={"training_labels": "entsoe", "price_lags": "energy_charts"},
+            price_source_conflicts=0,
+            load_forecast_source="energy_charts",
+            n_training_days=87,
+            age_of_last_complete_day=1,
+            training_tolerance_used=True,
+            training_missing_days=["2026-09-20"],
+            known_weather_defect_days=["2026-06-23"],
+            rnw_label_edge_age_days=2,
+            target_day_fills=[
+                {"group": "nwp_residual", "n_hours": 2, "hours": [22, 23], "action": "forward_fill"}
+            ],
+            downgrade_blocked=False,
+            best_accepted_rank_before=None,
+            capacity_anchor_days_left=35,
+        ),
+    )
+    records = read_submission_records(path)
+    r = records[0]
+    assert r["candidate_rank"] == 2
+    assert r["candidates_evaluated"][1]["name"] == "core_gas_ec"
+    assert r["nwp_available"] is True
+    assert r["price_provenance"] == {"training_labels": "entsoe", "price_lags": "energy_charts"}
+    assert r["price_source_conflicts"] == 0
+    assert r["load_forecast_source"] == "energy_charts"
+    assert r["n_training_days"] == 87
+    assert r["age_of_last_complete_day"] == 1
+    assert r["training_tolerance_used"] is True
+    assert r["training_missing_days"] == ["2026-09-20"]
+    assert r["known_weather_defect_days"] == ["2026-06-23"]
+    assert r["rnw_label_edge_age_days"] == 2
+    assert r["target_day_fills"][0]["group"] == "nwp_residual"
+    assert r["downgrade_blocked"] is False
+    assert r["best_accepted_rank_before"] is None
+    assert r["capacity_anchor_days_left"] == 35
+
+
+def test_protocol_version_is_4() -> None:
+    assert PROTOCOL_VERSION == 4

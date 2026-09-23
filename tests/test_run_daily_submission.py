@@ -399,6 +399,37 @@ def test_check_a_inputs_assembles_reads_and_delegates_to_check_reconstruction_in
     )
 
 
+def test_check_a_inputs_weather_root_override_actually_reads_from_it(tmp_path: Path) -> None:
+    """Spec 6.9 section 2.12: scripts/outage_drill.py needs to point Check A
+    at a store copy instead of this machine's own local weather cache --
+    found live 2026-09-23 that check_a_inputs was the one read in the whole
+    pipeline not already parameterized like this. Real files on disk, no
+    mocking of the read function itself, so this proves the override is
+    genuinely honoured rather than just accepted and ignored. Both roots
+    passed explicitly (the default parameter value is bound at import time,
+    so patching the module-level CACHE_ROOT afterward would not affect an
+    already-defined function's default -- not what this test is checking
+    anyway, only that an explicitly given weather_root is actually used)."""
+    run_init = run_init_for_target_day(_TARGET_DAY)
+    populated_root = tmp_path / "populated_cache"
+    write_cached_run(
+        _synthetic_weather_frame(run_init),
+        cache_path(run_init, DEFAULT_WEATHER_MODEL, root=populated_root),
+    )
+    empty_root = tmp_path / "empty_cache"
+
+    with patch(
+        "scripts.run_daily_submission.anchor_table_valid_until",
+        return_value=pd.Timestamp("2099-01-01", tz="UTC"),
+    ):
+        result_empty = check_a_inputs(_TARGET_DAY, weather_root=empty_root)
+        assert not result_empty.ok
+        assert any("weather run" in r for r in result_empty.reasons)
+
+        result_populated = check_a_inputs(_TARGET_DAY, weather_root=populated_root)
+        assert result_populated.ok
+
+
 # ---------------------------------------------------------------------------
 # run_submission_for_day
 # ---------------------------------------------------------------------------

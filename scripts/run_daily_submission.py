@@ -366,7 +366,7 @@ def holiday_calendar_covers_target(target_day: dt.date) -> bool:
     return len(de) > 0
 
 
-def check_a_inputs(target_day: dt.date) -> PreflightResult:
+def check_a_inputs(target_day: dt.date, *, weather_root: Path = CACHE_ROOT) -> PreflightResult:
     """Assemble Check A's already-loaded inputs and run it (spec section
     5.2) -- the cheap gate before any fit happens (spec section 2.1).
 
@@ -375,9 +375,19 @@ def check_a_inputs(target_day: dt.date) -> PreflightResult:
     capacity anchor table's validity boundary. No fetch client, no network
     (spec section 4 rule 4) -- a missing or unreadable weather run surfaces
     as ``weather_run=None``, itself a Check A failure, not an exception.
+
+    ``weather_root`` defaults to the real local cache (module-level
+    ``CACHE_ROOT``, unchanged behaviour for every existing caller) --
+    overridable so scripts/outage_drill.py (spec 6.9 section 2.12) can
+    point this at a copy of the published store instead. Found live
+    2026-09-23: this was the one place in the whole read path that was NOT
+    already parameterized like arena.live_inputs.assemble_price_model_inputs/
+    read_weather_runs/read_quarterhourly_prices, so an early outage-drill
+    run silently checked this machine's own (stale) local weather cache
+    instead of the store copy it had just downloaded.
     """
     run_init = run_init_for_target_day(target_day)
-    weather_run = read_cached_run(cache_path(run_init, DEFAULT_WEATHER_MODEL, root=CACHE_ROOT))
+    weather_run = read_cached_run(cache_path(run_init, DEFAULT_WEATHER_MODEL, root=weather_root))
     anchor_valid_until = anchor_table_valid_until(CapacitySource.PUBLIC_REGISTRY)
     return check_reconstruction_inputs(
         weather_run=weather_run,
@@ -436,6 +446,7 @@ def run_submission_for_day(
     as_of: pd.Timestamp,
     live: bool = False,
     now: Callable[[], pd.Timestamp] = _utcnow,
+    weather_root: Path = CACHE_ROOT,
 ) -> SubmissionOutcome:
     """The prediction pipeline for one target day (spec section 5.1, steps
     4-10; spec 6.7.3 section 5.4): Check A, renewables walk-forward, feature
@@ -466,8 +477,12 @@ def run_submission_for_day(
     real fit/predict pass takes real minutes, so re-using ``as_of`` there
     would never catch a run that crossed the deadline while computing.
     Injectable so tests never depend on real time.
+
+    ``weather_root`` defaults to the real local cache, matching every
+    existing caller's behaviour unchanged -- see check_a_inputs's own
+    docstring for why scripts/outage_drill.py (spec 6.9) needs to override it.
     """
-    check_a = check_a_inputs(target_day)
+    check_a = check_a_inputs(target_day, weather_root=weather_root)
     if not check_a.ok:
         return SubmissionOutcome(
             candidate_selected=None, skip_reason="Check A: " + "; ".join(check_a.reasons)

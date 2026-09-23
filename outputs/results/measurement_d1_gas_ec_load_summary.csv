@@ -1,0 +1,5 @@
+# CAVEAT (spec section 7, verbatim): Energy-Charts load is, per the probe data so far, only available shortly before the LAST submission slot (n small). These numbers apply only to slots where the probe demonstrates availability. See docs/sprint6_auftrag_ec_load_sonde_fein.md for the dedicated fine-grained probe.
+# D1_gas_k3: identical to D1_gas by construction (no ENTSO-E-load-forecast input to outage-simulate) -- not a separate row, same as spec 6.8's own D1-k3. An earlier revision of this run fitted a separate, differently-windowed model here by mistake (max abs diff 59.03 EUR/MWh against D1_gas) -- a modelling error in the run script, not a real property of this candidate; see scripts/measurement_d_ec_load.py::run_d1_gas_measurement's docstring.
+arm,reference,rmse_arm,rmse_reference,native_loss_diff,native_p,daily_loss_diff,daily_p
+D1_gas,baseline,29.042881488476326,45.27491471584702,-1206.3289373735406,0.0,-1206.4417849043248,2.1382895454280515e-13
+D1_gas,core_gas_only,29.042881488476326,28.96593563680098,4.463537838383799,0.5445547247808002,4.457393589557865,0.5889597394011483
