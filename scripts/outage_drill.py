@@ -46,6 +46,7 @@ import pandas as pd
 
 from energy_price_forecast.arena.live_inputs import (
     assemble_price_model_inputs,
+    price_provenance_report,
     read_quarterhourly_prices,
     read_weather_runs,
 )
@@ -53,7 +54,12 @@ from energy_price_forecast.config import PROJECT_ROOT
 from energy_price_forecast.data._weather_cache import CACHE_ROOT
 from energy_price_forecast.ops import store
 from energy_price_forecast.ops.protocol import append_submission_record
-from energy_price_forecast.ops.store_sources import COMMODITIES_DIR, ENTSOE_SOURCES, EntsoeSource
+from energy_price_forecast.ops.store_sources import (
+    COMMODITIES_DIR,
+    ENERGY_CHARTS_DIR,
+    ENTSOE_SOURCES,
+    EntsoeSource,
+)
 from energy_price_forecast.ops.windows import LOCAL_TZ, next_delivery_day
 from scripts.run_daily_submission import (
     PAYLOADS_DIR,
@@ -80,24 +86,27 @@ class CopiedStore:
     entsoe_sources: tuple[EntsoeSource, ...]
     commodities_dir: Path
     weather_root: Path
+    energy_charts_dir: Path
 
 
 def _copy_sources_for_workdir(workdir: Path) -> CopiedStore:
-    """Re-root ENTSOE_SOURCES/COMMODITIES_DIR/CACHE_ROOT under ``workdir``
-    by relativizing against PROJECT_ROOT -- derives the paths rather than
-    hard-coding them a second time, so a future new source in
-    ops/store_sources.py is picked up automatically."""
+    """Re-root ENTSOE_SOURCES/COMMODITIES_DIR/CACHE_ROOT/ENERGY_CHARTS_DIR
+    under ``workdir`` by relativizing against PROJECT_ROOT -- derives the
+    paths rather than hard-coding them a second time, so a future new
+    source in ops/store_sources.py is picked up automatically."""
     entsoe_sources = tuple(
         dataclasses.replace(s, cache_dir=workdir / s.cache_dir.relative_to(PROJECT_ROOT))
         for s in ENTSOE_SOURCES
     )
     commodities_dir = workdir / COMMODITIES_DIR.relative_to(PROJECT_ROOT)
     weather_root = workdir / CACHE_ROOT
+    energy_charts_dir = workdir / ENERGY_CHARTS_DIR.relative_to(PROJECT_ROOT)
     return CopiedStore(
         workdir=workdir,
         entsoe_sources=entsoe_sources,
         commodities_dir=commodities_dir,
         weather_root=weather_root,
+        energy_charts_dir=energy_charts_dir,
     )
 
 
@@ -237,7 +246,9 @@ def run_outage_drill(
         SCENARIOS[scenario](copied)
 
         df = assemble_price_model_inputs(
-            entsoe_sources=copied.entsoe_sources, commodities_dir=copied.commodities_dir
+            entsoe_sources=copied.entsoe_sources,
+            commodities_dir=copied.commodities_dir,
+            energy_charts_dir=copied.energy_charts_dir,
         )
         window_start, window_end = renewables_window(target_day)
         local_days = pd.date_range(
@@ -246,7 +257,9 @@ def run_outage_drill(
             freq="D",
         )
         weather = read_weather_runs([d.date() for d in local_days], root=copied.weather_root)
-        prices_qh = read_quarterhourly_prices(entsoe_sources=copied.entsoe_sources)
+        prices_qh = read_quarterhourly_prices(
+            entsoe_sources=copied.entsoe_sources, energy_charts_dir=copied.energy_charts_dir
+        )
 
         outcome = run_submission_for_day(
             df,
@@ -259,6 +272,11 @@ def run_outage_drill(
             weather_root=copied.weather_root,
         )
         runtime_seconds = time.monotonic() - t0
+        price_provenance, price_source_conflicts = price_provenance_report(
+            entsoe_sources=copied.entsoe_sources,
+            energy_charts_dir=copied.energy_charts_dir,
+            as_of=as_of,
+        )
 
         record = build_submission_record(
             outcome,
@@ -268,6 +286,8 @@ def run_outage_drill(
             gate_closure_ok=True,
             as_of=as_of,
             runtime_seconds=runtime_seconds,
+            price_provenance=price_provenance,
+            price_source_conflicts=price_source_conflicts,
         )
         out_path = protocol_path or (
             Path(tempfile.gettempdir()) / f"outage_drill_{scenario}_protocol.jsonl"

@@ -1662,9 +1662,12 @@ def test_run_submission_for_day_completes_without_calling_any_fetch_client(
                 ("eua_co2", _raising_commodity_fetch("eua_co2"), "eua_co2_eur_per_t"),
             ),
             commodities_dir=commodities_dir,
+            energy_charts_dir=tmp_path / "energy_charts",
         )
         weather = read_weather_runs([_TARGET_DAY], root=weather_root)
-        prices_qh = read_quarterhourly_prices(entsoe_sources=entsoe_sources)
+        prices_qh = read_quarterhourly_prices(
+            entsoe_sources=entsoe_sources, energy_charts_dir=tmp_path / "energy_charts"
+        )
 
         fold = _fake_fold(_TARGET_DAY)
         matrix = pd.DataFrame({"feat_a": 1.0}, index=fold.train_index.union(fold.test_index))

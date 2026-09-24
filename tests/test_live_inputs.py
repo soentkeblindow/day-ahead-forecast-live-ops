@@ -85,6 +85,11 @@ def test_assemble_price_model_inputs_reads_disk_only_and_joins_sources(tmp_path:
             ("eua_co2", _never_call_row_fetch, "eua_co2_eur_per_t"),
         ),
         commodities_dir=commodities_dir,
+        # Isolates from this machine's own real, populated store (spec 6.9
+        # Schritt 6 backfill wrote real data under the real ENERGY_CHARTS_DIR)
+        # -- an empty, never-written tmp_path dir reproduces the exact prior
+        # behaviour (_read_ec_price's own missing-file fallback).
+        energy_charts_dir=tmp_path / "energy_charts",
     )
 
     assert list(result.index) == list(idx)
@@ -133,6 +138,11 @@ def test_assemble_price_model_inputs_forward_fill_respects_7_real_days_at_quarte
             ("eua_co2", _never_call_row_fetch, "eua_co2_eur_per_t"),
         ),
         commodities_dir=commodities_dir,
+        # Isolates from this machine's own real, populated store (spec 6.9
+        # Schritt 6 backfill wrote real data under the real ENERGY_CHARTS_DIR)
+        # -- an empty, never-written tmp_path dir reproduces the exact prior
+        # behaviour (_read_ec_price's own missing-file fallback).
+        energy_charts_dir=tmp_path / "energy_charts",
     )
 
     # 96 real hours after the last known value -- well past the ~42-hour span
@@ -178,6 +188,11 @@ def test_assemble_price_model_inputs_keeps_a_row_missing_only_price(tmp_path: Pa
             ("eua_co2", _never_call_row_fetch, "eua_co2_eur_per_t"),
         ),
         commodities_dir=commodities_dir,
+        # Isolates from this machine's own real, populated store (spec 6.9
+        # Schritt 6 backfill wrote real data under the real ENERGY_CHARTS_DIR)
+        # -- an empty, never-written tmp_path dir reproduces the exact prior
+        # behaviour (_read_ec_price's own missing-file fallback).
+        energy_charts_dir=tmp_path / "energy_charts",
     )
 
     assert len(result) == 4
@@ -226,6 +241,11 @@ def test_assemble_price_model_inputs_priceless_days_keep_other_real_data(
             ("eua_co2", _never_call_row_fetch, "eua_co2_eur_per_t"),
         ),
         commodities_dir=commodities_dir,
+        # Isolates from this machine's own real, populated store (spec 6.9
+        # Schritt 6 backfill wrote real data under the real ENERGY_CHARTS_DIR)
+        # -- an empty, never-written tmp_path dir reproduces the exact prior
+        # behaviour (_read_ec_price's own missing-file fallback).
+        energy_charts_dir=tmp_path / "energy_charts",
     )
 
     # Local (Europe/Berlin) calendar date, not the raw UTC one: local
@@ -239,6 +259,123 @@ def test_assemble_price_model_inputs_priceless_days_keep_other_real_data(
     assert day1["day_ahead_price"].notna().all()
     assert day2["day_ahead_price"].isna().all() and day2["load_forecast_day_ahead"].notna().all()
     assert day3["day_ahead_price"].isna().all() and day3["load_forecast_day_ahead"].notna().all()
+
+
+# ---------------------------------------------------------------------------
+# Energy-Charts coalescing (spec 6.9 section 5.3/2.4, Schritt 7)
+# ---------------------------------------------------------------------------
+
+
+def test_assemble_price_model_inputs_fills_a_real_price_gap_from_energy_charts(
+    tmp_path: Path,
+) -> None:
+    price_dir = tmp_path / "day_ahead_price"
+    load_dir = tmp_path / "load"
+    price_dir.mkdir()
+    load_dir.mkdir()
+
+    idx = pd.date_range("2024-01-01", periods=4, freq="h", tz="UTC")
+    pd.DataFrame({"day_ahead_price": [50.0, float("nan"), 52.0, 53.0]}, index=idx).to_parquet(
+        price_dir / "DE_LU_2024-01.parquet"
+    )
+    pd.DataFrame(
+        {"load_actual": [1.0] * 4, "load_forecast_day_ahead": [1.0] * 4}, index=idx
+    ).to_parquet(load_dir / "DE_LU_2024-01.parquet")
+
+    commodities_dir = tmp_path / "commodities"
+    commodities_dir.mkdir()
+    energy_charts_dir = tmp_path / "energy_charts"
+    energy_charts_dir.mkdir()
+    pd.DataFrame({"day_ahead_price_ec": [50.0, 99.0, 52.0, 53.0]}, index=idx).to_parquet(
+        energy_charts_dir / "day_ahead_price_ec.parquet"
+    )
+
+    result = assemble_price_model_inputs(
+        entsoe_sources=(
+            _entsoe_source("day_ahead_price", price_dir),
+            _entsoe_source("load", load_dir),
+        ),
+        commodity_sources=(
+            ("ttf_gas", _never_call_row_fetch, "ttf_gas_eur_per_mwh"),
+            ("eua_co2", _never_call_row_fetch, "eua_co2_eur_per_t"),
+        ),
+        commodities_dir=commodities_dir,
+        energy_charts_dir=energy_charts_dir,
+    )
+
+    assert result["day_ahead_price"].tolist() == [50.0, 99.0, 52.0, 53.0]
+    # The raw EC column has done its job feeding the coalesce and does not
+    # linger in the output (it would otherwise be misread by to_hourly() as
+    # an ordinary MW column).
+    assert "day_ahead_price_ec" not in result.columns
+
+
+def test_assemble_price_model_inputs_keeps_ec_load_forecast_as_its_own_column(
+    tmp_path: Path,
+) -> None:
+    """spec section 2.4: "Zeile 1 liest nur ENTSO-E, Zeile 2 nur EC" -- the
+    two load forecasts must never be merged into one another."""
+    price_dir = tmp_path / "day_ahead_price"
+    load_dir = tmp_path / "load"
+    price_dir.mkdir()
+    load_dir.mkdir()
+
+    idx = pd.date_range("2024-01-01", periods=2, freq="h", tz="UTC")
+    pd.DataFrame({"day_ahead_price": [50.0, 51.0]}, index=idx).to_parquet(
+        price_dir / "DE_LU_2024-01.parquet"
+    )
+    pd.DataFrame(
+        {"load_actual": [1.0, 1.0], "load_forecast_day_ahead": [10.0, 11.0]}, index=idx
+    ).to_parquet(load_dir / "DE_LU_2024-01.parquet")
+
+    commodities_dir = tmp_path / "commodities"
+    commodities_dir.mkdir()
+    energy_charts_dir = tmp_path / "energy_charts"
+    energy_charts_dir.mkdir()
+    pd.DataFrame({"load_forecast_day_ahead_ec": [20.0, 21.0]}, index=idx).to_parquet(
+        energy_charts_dir / "load_forecast_day_ahead_ec.parquet"
+    )
+
+    result = assemble_price_model_inputs(
+        entsoe_sources=(
+            _entsoe_source("day_ahead_price", price_dir),
+            _entsoe_source("load", load_dir),
+        ),
+        commodity_sources=(
+            ("ttf_gas", _never_call_row_fetch, "ttf_gas_eur_per_mwh"),
+            ("eua_co2", _never_call_row_fetch, "eua_co2_eur_per_t"),
+        ),
+        commodities_dir=commodities_dir,
+        energy_charts_dir=energy_charts_dir,
+    )
+
+    assert result["load_forecast_day_ahead"].tolist() == [10.0, 11.0]
+    assert result["load_forecast_day_ahead_ec"].tolist() == [20.0, 21.0]
+
+
+def test_read_quarterhourly_prices_fills_a_real_gap_from_energy_charts(tmp_path: Path) -> None:
+    price_dir = tmp_path / "day_ahead_price"
+    price_dir.mkdir()
+    idx = pd.date_range("2025-09-30 22:00", periods=4, freq="15min", tz="UTC")
+    pd.DataFrame({"day_ahead_price": [1.0, 2.0, 3.0]}, index=idx[[0, 1, 3]]).to_parquet(
+        price_dir / "DE_LU_2025-09.parquet"
+    )  # the third quarter-hour is missing entirely, not just NaN
+
+    energy_charts_dir = tmp_path / "energy_charts"
+    energy_charts_dir.mkdir()
+    # Position 3 matches ENTSO-E's own real 3.0 -- only position 2 (missing
+    # from ENTSO-E entirely) is a genuine gap-fill, not a conflict.
+    pd.DataFrame({"day_ahead_price_ec": [1.0, 2.0, 99.0, 3.0]}, index=idx).to_parquet(
+        energy_charts_dir / "day_ahead_price_ec.parquet"
+    )
+
+    result = read_quarterhourly_prices(
+        entsoe_sources=(_entsoe_source("day_ahead_price", price_dir),),
+        energy_charts_dir=energy_charts_dir,
+    )
+
+    assert list(result.index) == list(idx)
+    assert result["day_ahead_price"].tolist() == [1.0, 2.0, 99.0, 3.0]
 
 
 # ---------------------------------------------------------------------------
@@ -300,7 +437,8 @@ def test_read_quarterhourly_prices_filters_to_the_cutover_and_dedups(tmp_path: P
     )
 
     result = read_quarterhourly_prices(
-        entsoe_sources=(_entsoe_source("day_ahead_price", price_dir),)
+        entsoe_sources=(_entsoe_source("day_ahead_price", price_dir),),
+        energy_charts_dir=tmp_path / "energy_charts",
     )
 
     assert list(result.index) == list(post_cutover)

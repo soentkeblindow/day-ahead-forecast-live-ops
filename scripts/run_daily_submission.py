@@ -32,6 +32,7 @@ from energy_price_forecast.arena.config import ARENA_CHALLENGE_ID, is_live_enabl
 from energy_price_forecast.arena.live_inputs import (
     DEFAULT_WEATHER_MODEL,
     assemble_price_model_inputs,
+    price_provenance_report,
     read_quarterhourly_prices,
     read_weather_runs,
 )
@@ -693,6 +694,8 @@ def build_submission_record(
     gate_closure_ok: bool,
     as_of: pd.Timestamp,
     runtime_seconds: float,
+    price_provenance: dict[str, str] | None = None,
+    price_source_conflicts: int | None = None,
 ) -> SubmissionRecord:
     """Assemble one run's ops.protocol.SubmissionRecord (spec section 5.7)
     from this run's SubmissionOutcome plus run/store metadata. Commodity
@@ -701,6 +704,14 @@ def build_submission_record(
     vantage points (the store manifest's own covered_end_utc vs. the
     assembled df's actual last non-NaN value); the more precise, data-level
     measurement wins for the two commodity columns it covers.
+
+    ``price_provenance``/``price_source_conflicts`` (spec 6.9 section 5.3/
+    5.7, Schritt 7) are optional, additive keywords -- omitted, the record
+    keeps SubmissionRecord's own defaults ({}/None), same as any run that
+    predates this step. The caller computes them (arena.live_inputs.py::
+    price_provenance_report) rather than this function reading raw price
+    data itself, keeping this assembly function a pure read of already-
+    computed facts, same discipline as every other field here.
     """
     run_id, run_url = run_id_and_url()
     source_ages = source_ages_from_manifest(manifest, as_of)
@@ -754,6 +765,8 @@ def build_submission_record(
         api_response_received_utc=api_response_received_utc,
         confirmed_via_query=confirmed_via_query,
         smoke_baseline_source_day=smoke_baseline_source_day,
+        price_provenance=price_provenance or {},
+        price_source_conflicts=price_source_conflicts,
     )
 
 
@@ -836,6 +849,7 @@ def run_daily_submission(
         print(f"EXCEPTION — {type(exc).__name__}: {exc}")
         raise
     runtime_seconds = time.monotonic() - t0
+    price_provenance, price_source_conflicts = price_provenance_report(as_of=as_of)
 
     record = build_submission_record(
         outcome,
@@ -845,6 +859,8 @@ def run_daily_submission(
         gate_closure_ok=True,
         as_of=as_of,
         runtime_seconds=runtime_seconds,
+        price_provenance=price_provenance,
+        price_source_conflicts=price_source_conflicts,
     )
     append_submission_record(SUBMISSIONS_LOG, record)
 

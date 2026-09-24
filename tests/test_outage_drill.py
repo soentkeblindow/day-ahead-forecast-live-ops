@@ -16,7 +16,11 @@ import pandas as pd
 import pytest
 
 from energy_price_forecast.config import PROJECT_ROOT
-from energy_price_forecast.ops.store_sources import COMMODITIES_DIR, ENTSOE_SOURCES
+from energy_price_forecast.ops.store_sources import (
+    COMMODITIES_DIR,
+    ENERGY_CHARTS_DIR,
+    ENTSOE_SOURCES,
+)
 from scripts.outage_drill import (
     SCENARIOS,
     CopiedStore,
@@ -98,6 +102,16 @@ def test_copy_sources_commodities_and_weather_paths(tmp_path: Path) -> None:
     assert copied.commodities_dir.name == COMMODITIES_DIR.name
     assert copied.weather_root.is_relative_to(tmp_path)
     assert copied.workdir == tmp_path
+
+
+def test_copy_sources_energy_charts_dir_path(tmp_path: Path) -> None:
+    """Schritt 7 regression: the copy must be used for EC reads too, or a
+    drill run would silently fall back to the real, live ENERGY_CHARTS_DIR
+    instead of the freshly-downloaded store copy -- the exact bug class
+    Schritt 3 already found and fixed for weather_root."""
+    copied = _copy_sources_for_workdir(tmp_path)
+    assert copied.energy_charts_dir.is_relative_to(tmp_path)
+    assert copied.energy_charts_dir == tmp_path / ENERGY_CHARTS_DIR.relative_to(PROJECT_ROOT)
 
 
 def test_copy_sources_returns_a_copiedstore(tmp_path: Path) -> None:

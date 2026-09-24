@@ -53,6 +53,7 @@ from energy_price_forecast.ops import store
 from energy_price_forecast.ops.store_sources import (
     COMMODITIES_DIR,
     COMMODITY_SOURCES,
+    ENERGY_CHARTS_DIR,
     ENTSOE_SOURCES,
     EntsoeSource,
     RowFetchFn,
@@ -60,12 +61,67 @@ from energy_price_forecast.ops.store_sources import (
 
 DEFAULT_WEATHER_MODEL = "ecmwf_ifs"
 
+_PRICE_COLUMN = "day_ahead_price"
+_EC_PRICE_COLUMN = "day_ahead_price_ec"
+_EC_LOAD_FORECAST_COLUMN = "load_forecast_day_ahead_ec"
+
+
+def coalesce_price(entsoe: pd.Series, ec: pd.Series) -> tuple[pd.Series, pd.Series, int]:
+    """ENTSO-E where present, Energy-Charts where ENTSO-E is missing (spec
+    6.9 section 5.3).
+
+    Returns (merged series, provenance mask [True = value came from
+    Energy-Charts], number of cells where both were present and differed).
+    ENTSO-E always wins on a conflict, silently, never raising (owner
+    decision 2026-09-23): a changed rounding convention on either side
+    must never take the live system down. Operates on whatever native grid
+    the two inputs already share (hourly before, quarter-hourly from
+    data/quarterhourly.py::QUARTERHOUR_START) -- callers coalesce before
+    any further resampling, never after, so every downstream consumer
+    (price lags, the price-model label, the shape profile, the persistence
+    value) sees the same merged series (spec section 2.4).
+    """
+    combined = pd.DataFrame({"entsoe": entsoe, "ec": ec})
+    merged = combined["entsoe"].combine_first(combined["ec"])
+    provenance = combined["entsoe"].isna() & combined["ec"].notna()
+
+    both_present = combined["entsoe"].notna() & combined["ec"].notna()
+    n_conflicts = int((both_present & (combined["entsoe"] != combined["ec"])).sum())
+
+    name = str(entsoe.name) if entsoe.name is not None else None
+    return merged.rename(name), provenance.rename(name), n_conflicts
+
+
+def _read_ec_price(*, root: Path = ENERGY_CHARTS_DIR) -> pd.Series:
+    """The store's own Energy-Charts price cache (scripts/sync_store.py's
+    ``day_ahead_price_ec`` single-file cache, spec section 2.4) -- an empty,
+    correctly-named series if the file does not exist yet (mirrors
+    assemble_price_model_inputs' own missing-commodity-file fallback)."""
+    path = root / "day_ahead_price_ec.parquet"
+    if not path.exists():
+        return pd.Series(
+            dtype="float64", name=_EC_PRICE_COLUMN, index=pd.DatetimeIndex([], tz="UTC")
+        )
+    return pd.read_parquet(path)[_EC_PRICE_COLUMN]
+
+
+def _read_ec_load_forecast(*, root: Path = ENERGY_CHARTS_DIR) -> pd.Series:
+    """The store's own Energy-Charts load-forecast cache -- same
+    empty-fallback discipline as _read_ec_price."""
+    path = root / "load_forecast_day_ahead_ec.parquet"
+    if not path.exists():
+        return pd.Series(
+            dtype="float64", name=_EC_LOAD_FORECAST_COLUMN, index=pd.DatetimeIndex([], tz="UTC")
+        )
+    return pd.read_parquet(path)[_EC_LOAD_FORECAST_COLUMN]
+
 
 def assemble_price_model_inputs(
     *,
     entsoe_sources: tuple[EntsoeSource, ...] = ENTSOE_SOURCES,
     commodity_sources: tuple[tuple[str, RowFetchFn, str], ...] = COMMODITY_SOURCES,
     commodities_dir: Path = COMMODITIES_DIR,
+    energy_charts_dir: Path = ENERGY_CHARTS_DIR,
 ) -> pd.DataFrame:
     """The full merged, hourly-normalised price-model input frame, read
     purely from the store's on-disk raw cache (spec section 4, rule 4).
@@ -118,6 +174,20 @@ def assemble_price_model_inputs(
     dropped, and no row it would have dropped before (all-NaN across every
     source) is newly kept, since pd.concat's outer join never invents an
     index entry with zero source data.
+
+    Energy-Charts, since spec 6.9 section 5.3/2.4 (Schritt 7): the store's
+    own ``day_ahead_price_ec`` is coalesced into ``day_ahead_price`` via
+    coalesce_price() -- ENTSO-E wins where present, EC only fills a real
+    gap -- BEFORE to_hourly() runs, so every hourly consumer of this
+    column (price lags, the price-model label) sees the already-merged
+    series, not a second, separate one. The raw ``day_ahead_price_ec``
+    column itself is dropped afterwards -- it has fully done its job by
+    feeding the coalesce, and leaving it in would make to_hourly() treat
+    it as an ordinary MW column to time-average, which it structurally is
+    not. ``load_forecast_day_ahead_ec`` is deliberately NOT coalesced with
+    ENTSO-E's own ``load_forecast_day_ahead`` (spec section 2.4: "Zeile 1
+    liest nur ENTSO-E, Zeile 2 nur EC") -- it survives as its own column
+    for whichever fallback-ladder row (Schritt 10) reads it directly.
     """
     frames = [store.read_cached_range(source.cache_dir) for source in entsoe_sources]
 
@@ -138,10 +208,19 @@ def assemble_price_model_inputs(
                 )
             )
 
+    frames.append(_read_ec_price(root=energy_charts_dir).to_frame())
+    frames.append(_read_ec_load_forecast(root=energy_charts_dir).to_frame())
+
     merged = pd.concat(frames, axis=1, join="outer")
 
     for _name, _fetch, column in commodity_sources:
         merged[column] = time_limited_ffill(merged[column], limit_hours=COMMODITY_FFILL_LIMIT)
+
+    coalesced_price, _provenance, _n_conflicts = coalesce_price(
+        merged[_PRICE_COLUMN], merged[_EC_PRICE_COLUMN]
+    )
+    merged[_PRICE_COLUMN] = coalesced_price
+    merged = merged.drop(columns=[_EC_PRICE_COLUMN])
 
     return to_hourly(merged)
 
@@ -183,6 +262,7 @@ def read_quarterhourly_prices(
     *,
     entsoe_sources: tuple[EntsoeSource, ...] = ENTSOE_SOURCES,
     start: pd.Timestamp = QUARTERHOUR_START,
+    energy_charts_dir: Path = ENERGY_CHARTS_DIR,
 ) -> pd.DataFrame:
     """The native, unresampled quarter-hourly day-ahead price series the
     shape profile (models/bridge.py::fit_shape_profile) needs (spec section
@@ -194,8 +274,77 @@ def read_quarterhourly_prices(
     cache dir via ops.store.read_cached_range() instead of calling
     fetch_day_ahead_prices() (spec section 4, rule 4). data/quarterhourly.py
     itself is not modified (spec section 3.3).
+
+    Coalesced with Energy-Charts (spec 6.9 section 5.3/2.4, Schritt 7) via
+    the same coalesce_price() assemble_price_model_inputs() uses -- the
+    shape profile is one of the four named price consumers that must see
+    the merged series, not the ENTSO-E-only one.
     """
     source = next(s for s in entsoe_sources if s.name == "day_ahead_price")
     df = store.read_cached_range(source.cache_dir, start=start)
     df = df.sort_index()
-    return df[~df.index.duplicated(keep="first")]
+    df = df[~df.index.duplicated(keep="first")]
+
+    ec_price = _read_ec_price(root=energy_charts_dir)
+    ec_price = ec_price[ec_price.index >= start]
+    # Built directly from the coalesced series, not assigned back into df's
+    # own index -- coalesce_price's result can have MORE rows than df alone
+    # (a slot ENTSO-E is missing entirely, not just NaN within an existing
+    # row), and a real gap-fill must add that row, not silently drop it.
+    coalesced_price, _provenance, _n_conflicts = coalesce_price(df[_PRICE_COLUMN], ec_price)
+    return coalesced_price.sort_index().to_frame()
+
+
+# Matches the Shape Profile's own established default window
+# (models/bridge.py::fit_shape_profile's own n_days, Sprint 6.4/6.8) --
+# purely for this report's own "did EC feed the shape window" question,
+# never passed into fit_shape_profile itself.
+_SHAPE_WINDOW_DAYS = 28
+
+
+def price_provenance_report(
+    *,
+    entsoe_sources: tuple[EntsoeSource, ...] = ENTSOE_SOURCES,
+    energy_charts_dir: Path = ENERGY_CHARTS_DIR,
+    as_of: pd.Timestamp,
+) -> tuple[dict[str, str], int]:
+    """Per-consumer price provenance and the overall conflict count (spec
+    6.9 section 5.7's protocol_version 4 ``price_provenance``/
+    ``price_source_conflicts`` fields).
+
+    Reads the same two underlying series assemble_price_model_inputs()/
+    read_quarterhourly_prices() each coalesce internally, independently --
+    so this can never diverge from them on WHICH cells get merged, only on
+    when it happens to run -- purely to report, for each of the four named
+    price consumers (spec section 5.7: ``training_labels``, ``price_lags``,
+    ``shape_window``, ``persistence``), whether at least one
+    Energy-Charts-sourced cell fell inside that consumer's own relevant
+    window.
+
+    ``training_labels``/``price_lags``/``persistence`` all ultimately read
+    from the same trained-on price history -- reported here over the FULL
+    available window as a deliberately conservative, over-inclusive proxy
+    for whichever exact training window Schritt 8/10 end up using (reporting
+    "energy_charts" too eagerly is the safe direction; reporting it too
+    rarely is not). ``shape_window`` uses the last _SHAPE_WINDOW_DAYS days
+    before ``as_of``, matching the Shape Profile's own established default.
+    """
+    source = next(s for s in entsoe_sources if s.name == "day_ahead_price")
+    entsoe_price = store.read_cached_range(source.cache_dir)[_PRICE_COLUMN]
+    ec_price = _read_ec_price(root=energy_charts_dir)
+
+    _merged, provenance, n_conflicts = coalesce_price(entsoe_price, ec_price)
+
+    shape_window_start = as_of - pd.Timedelta(days=_SHAPE_WINDOW_DAYS)
+    shape_provenance = provenance[provenance.index >= shape_window_start]
+
+    def _label(mask: pd.Series) -> str:
+        return "energy_charts" if bool(mask.any()) else "entsoe"
+
+    report = {
+        "training_labels": _label(provenance),
+        "price_lags": _label(provenance),
+        "shape_window": _label(shape_provenance),
+        "persistence": _label(provenance),
+    }
+    return report, n_conflicts
