@@ -39,7 +39,7 @@ from typing import Final
 import pandas as pd
 
 from energy_price_forecast.config import DATA_RAW, PROJECT_ROOT
-from energy_price_forecast.data.energy_charts_probe import (
+from energy_price_forecast.data.energy_charts import (
     SERIES,
     EnergyChartsRateLimitedError,
     fetch_series_range,

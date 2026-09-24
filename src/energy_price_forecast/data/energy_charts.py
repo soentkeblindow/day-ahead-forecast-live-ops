@@ -1,29 +1,51 @@
-"""Client for the Energy-Charts ``public_power_forecast`` endpoint
-(docs/sprint6_auftrag_energy_charts_backup.md and its _backup_2.md follow-up).
+"""Energy-Charts client for permanent operation (docs/sprint6_step6_9_spec.md
+section 3.2, Schritt 4: "EC-Client-Umzug", a pure move -- no behavior change).
 
-Two consumers share this one module rather than each owning a separate
-client for the same endpoint (backup_2.md section 2's explicit rule):
+Covers two Energy-Charts endpoints this project uses, moved here from
+``scripts/`` (``fetch_energy_charts_price_history.py``) or already living
+here under the module's previous, forecast-only name
+(``energy_charts_probe.py``, renamed as part of this move):
 
-- The knowledge-time probe (``probe_series``, ``scripts/probe_energy_charts_
-  forecast.py``): measures, once per call, whether a day-ahead forecast
-  series (load, solar, wind_onshore, wind_offshore) is fully available for a
-  given delivery day at the moment of the probe -- never writes to the
-  store, never feeds a feature, never touches the submission path. The
-  question it answers: is ``public_power_forecast(forecast_type=day-ahead)``
-  available before gate closure (12:00 Europe/Berlin on D-1), per series?
-  Every outcome except a genuine API-behavior anomaly is logged and treated
-  as a successful measurement: a forecast that is not yet published, a rate
-  limit, or a transport error are exactly what this probe exists to
-  observe, not failures of the probe itself.
-- The historical bulk fetch (``fetch_series_range``,
-  ``scripts/fetch_energy_charts_forecast_history.py``): pulls the same four
-  series over an arbitrary past date range for the backup_2.md Teil 1/2/3
-  measurement. Past history has no "not yet published" outcome, so this
-  raises (fail-fast) on any non-200 status instead of logging a row.
+- ``public_power_forecast`` (load/solar/wind_onshore/wind_offshore day-ahead
+  forecasts, docs/sprint6_auftrag_energy_charts_backup.md and its
+  _backup_2.md follow-up). Two consumers share this part of the module
+  rather than each owning a separate client (backup_2.md section 2's
+  explicit rule):
 
-Both raise ``EnergyChartsProbeAnomalyError`` for the same structural
-anomaly: a response claiming ``deprecated=true``, or one that echoes back a
-different ``production_type``/``forecast_type`` than requested.
+  - The knowledge-time probe (``probe_series``, ``scripts/probe_energy_
+    charts_forecast.py``): measures, once per call, whether a day-ahead
+    forecast series is fully available for a given delivery day at the
+    moment of the probe -- never writes to the store, never feeds a
+    feature, never touches the submission path. Every outcome except a
+    genuine API-behavior anomaly is logged and treated as a successful
+    measurement: a forecast that is not yet published, a rate limit, or a
+    transport error are exactly what this probe exists to observe, not
+    failures of the probe itself.
+  - The historical bulk fetch (``fetch_series_range``, ``scripts/fetch_
+    energy_charts_forecast_history.py``): pulls the same four series over
+    an arbitrary past date range. Past history has no "not yet published"
+    outcome, so this raises (fail-fast) on any non-200 status instead of
+    logging a row.
+
+  Both raise ``EnergyChartsProbeAnomalyError`` for the same structural
+  anomaly: a response claiming ``deprecated=true``, or one that echoes back
+  a different ``production_type``/``forecast_type`` than requested.
+
+- ``/price`` (day-ahead price, ``bzn=DE-LU``, docs/sprint6_step6_8_spec.md
+  section 3): ``fetch_price_range``, used by ``scripts/fetch_energy_charts_
+  price_history.py`` for the historical bulk pull and, from Schritt 6
+  onward, by the permanent store maintenance job. Raises
+  ``EnergyChartsPriceAnomalyError`` on ``deprecated=true`` or an unexpected
+  ``unit`` -- this endpoint's own, smaller echo surface (no production_type/
+  forecast_type field to compare against the request).
+
+Both endpoints share ``EnergyChartsRateLimitedError`` (HTTP 429, honour
+``Retry-After``) and ``merge_existing_with_fresh`` (existing-wins merge with
+a byte-identical post-merge verification of every pre-existing non-NaN
+cell) -- previously two separate, near-identical implementations in
+``extend_energy_charts_load_forecast.py`` and
+``fetch_energy_charts_price_history.py``, consolidated here per the 6.9
+Schritt-1 finding (docs/sprint6_step6_9_log.md section 3.1 point 7).
 """
 
 from __future__ import annotations
@@ -345,3 +367,97 @@ def append_probe_row(row: dict[str, object], log_path: Path) -> None:
     existing = existing.reindex(columns=union_columns)
     frame = frame.reindex(columns=union_columns)
     pd.concat([existing, frame], ignore_index=True).to_csv(log_path, index=False)
+
+
+# ---------------------------------------------------------------------------
+# ``/price`` -- day-ahead price, bzn=DE-LU (moved from
+# scripts/fetch_energy_charts_price_history.py, Schritt 4)
+# ---------------------------------------------------------------------------
+
+_PRICE_ENDPOINT: Final = "https://api.energy-charts.info/price"
+_PRICE_BZN: Final = "DE-LU"
+_PRICE_EXPECTED_UNIT: Final = "EUR / MWh"
+PRICE_COLUMN: Final = "day_ahead_price_ec"
+
+
+class EnergyChartsPriceAnomalyError(RuntimeError):
+    """A genuine API-behavior anomaly on the ``/price`` endpoint:
+    ``deprecated=true``, or an unexpected ``unit`` -- the same anomaly class
+    ``EnergyChartsProbeAnomalyError`` is for ``public_power_forecast``,
+    applied to this endpoint's own, smaller echo surface (module docstring)."""
+
+
+def fetch_price_range(start: dt.date, end: dt.date, *, bzn: str = _PRICE_BZN) -> pd.Series:
+    """Raw day-ahead prices over local calendar-date range [start, end]
+    (both ends inclusive), UTC-indexed, ``None`` kept as NaN. Raises
+    ``EnergyChartsRateLimitedError`` on 429, ``requests.HTTPError`` on any
+    other non-200, ``EnergyChartsPriceAnomalyError`` on ``deprecated=true``
+    or an unexpected unit."""
+    params = {"bzn": bzn, "start": start.isoformat(), "end": end.isoformat()}
+    response = requests.get(_PRICE_ENDPOINT, params=params, timeout=_TIMEOUT_S)
+
+    if response.status_code == 429:
+        raise EnergyChartsRateLimitedError(_parse_retry_after(response))
+    response.raise_for_status()
+
+    payload: dict[str, Any] = response.json()
+    if payload.get("deprecated"):
+        raise EnergyChartsPriceAnomalyError(
+            f"price [{start}..{end}]: endpoint reports deprecated=true"
+        )
+    unit = payload.get("unit")
+    if unit != _PRICE_EXPECTED_UNIT:
+        raise EnergyChartsPriceAnomalyError(
+            f"price [{start}..{end}]: unexpected unit {unit!r}, expected {_PRICE_EXPECTED_UNIT!r}"
+        )
+
+    unix_seconds = payload.get("unix_seconds", [])
+    prices = payload.get("price", [])
+    if len(unix_seconds) != len(prices):
+        raise EnergyChartsPriceAnomalyError(
+            f"price [{start}..{end}]: unix_seconds length {len(unix_seconds)} != "
+            f"price length {len(prices)}"
+        )
+
+    index = pd.DatetimeIndex(pd.to_datetime(unix_seconds, unit="s", utc=True), name="timestamp")
+    values = [float(v) if v is not None else float("nan") for v in prices]
+    return pd.Series(values, index=index, name=PRICE_COLUMN, dtype="float64")
+
+
+# ---------------------------------------------------------------------------
+# Shared existing-wins merge (consolidates the two near-identical
+# ``_merge_fresh`` copies found in Schritt 1, docs/sprint6_step6_9_log.md
+# section 3.1 point 7)
+# ---------------------------------------------------------------------------
+
+
+def merge_existing_with_fresh(
+    existing_full: pd.DataFrame | None, fresh: pd.Series, *, column: str
+) -> pd.DataFrame:
+    """Merge ``fresh`` into ``existing_full`` (the whole on-disk series for
+    ``column``), existing wins, verified byte-identical for every
+    pre-existing non-NaN cell. ``existing_full=None`` (nothing on disk yet)
+    returns ``fresh`` as-is."""
+    fresh_frame = fresh.to_frame(name=column)
+    if existing_full is None:
+        return fresh_frame
+
+    overlap = existing_full.index.intersection(fresh_frame.index)
+    real_overlap = existing_full.loc[overlap, column].dropna()
+    if not real_overlap.empty:
+        disagreeing = ~fresh_frame.loc[real_overlap.index, column].eq(real_overlap)
+        if disagreeing.any():
+            first = disagreeing[disagreeing].index[0]
+            raise ValueError(
+                f"{int(disagreeing.sum())} timestamp(s) already have a real value that "
+                f"disagrees with the freshly fetched one -- refusing to overwrite; first: {first}"
+            )
+
+    merged = existing_full.combine_first(fresh_frame)
+    existing_notna = existing_full[column].dropna()
+    if not merged.loc[existing_notna.index, column].equals(existing_notna):
+        raise RuntimeError(
+            "an existing non-NaN value changed during the merge -- this must never happen, "
+            "aborting without writing"
+        )
+    return merged

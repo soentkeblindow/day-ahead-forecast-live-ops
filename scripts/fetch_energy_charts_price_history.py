@@ -43,12 +43,17 @@ import time
 import uuid
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Final
+from typing import Final
 
 import pandas as pd
-import requests
 
 from energy_price_forecast.config import DATA_RAW, PROJECT_ROOT
+from energy_price_forecast.data.energy_charts import (
+    PRICE_COLUMN,
+    EnergyChartsRateLimitedError,
+    fetch_price_range,
+    merge_existing_with_fresh,
+)
 from energy_price_forecast.data.quarterhourly import QUARTERHOUR_START
 from energy_price_forecast.ops.store import read_cached_range
 from energy_price_forecast.ops.store_sources import ENTSOE_SOURCES
@@ -57,12 +62,7 @@ from energy_price_forecast.ops.windows import LOCAL_TZ, expected_timestamp_count
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-_ENDPOINT: Final = "https://api.energy-charts.info/price"
-_BZN: Final = "DE-LU"
-_TIMEOUT_S: Final = 30.0
-_EXPECTED_UNIT: Final = "EUR / MWh"
-_COLUMN: Final = "day_ahead_price_ec"
-
+_COLUMN: Final = PRICE_COLUMN
 _OUTPUT_DIR: Final = DATA_RAW / "energy_charts" / "price"
 _REPORT_PATH: Final = PROJECT_ROOT / "outputs" / "results" / "energy_charts_price_grid_report.csv"
 _FILE_PREFIX: Final = "DE_LU"
@@ -71,66 +71,6 @@ _INTER_REQUEST_DELAY_S: Final = 30.0
 _MAX_RATE_LIMIT_RETRIES: Final = 5
 
 _PRICE_SOURCE = next(s for s in ENTSOE_SOURCES if s.name == "day_ahead_price")
-
-
-class EnergyChartsRateLimitedError(RuntimeError):
-    def __init__(self, retry_after_s: float) -> None:
-        self.retry_after_s = retry_after_s
-        super().__init__(f"rate limited by {_ENDPOINT}, Retry-After={retry_after_s}s")
-
-
-class EnergyChartsPriceAnomalyError(RuntimeError):
-    """A genuine API-behavior anomaly: ``deprecated=true`` or an unexpected
-    unit -- the same anomaly class energy_charts_probe.py raises for the
-    forecast endpoint, applied to this endpoint's own, smaller echo surface
-    (module docstring, obligation 4)."""
-
-
-def _parse_retry_after(response: requests.Response) -> float:
-    header = response.headers.get("Retry-After")
-    if header is None:
-        return 30.0
-    try:
-        return float(header)
-    except ValueError:
-        return 30.0
-
-
-def fetch_price_range(start: dt.date, end: dt.date, *, bzn: str = _BZN) -> pd.Series:
-    """Raw day-ahead prices over local calendar-date range [start, end]
-    (both ends inclusive), UTC-indexed, ``None`` kept as NaN. Raises
-    ``EnergyChartsRateLimitedError`` on 429, ``requests.HTTPError`` on any
-    other non-200, ``EnergyChartsPriceAnomalyError`` on ``deprecated=true``
-    or an unexpected unit."""
-    params = {"bzn": bzn, "start": start.isoformat(), "end": end.isoformat()}
-    response = requests.get(_ENDPOINT, params=params, timeout=_TIMEOUT_S)
-
-    if response.status_code == 429:
-        raise EnergyChartsRateLimitedError(_parse_retry_after(response))
-    response.raise_for_status()
-
-    payload: dict[str, Any] = response.json()
-    if payload.get("deprecated"):
-        raise EnergyChartsPriceAnomalyError(
-            f"price [{start}..{end}]: endpoint reports deprecated=true"
-        )
-    unit = payload.get("unit")
-    if unit != _EXPECTED_UNIT:
-        raise EnergyChartsPriceAnomalyError(
-            f"price [{start}..{end}]: unexpected unit {unit!r}, expected {_EXPECTED_UNIT!r}"
-        )
-
-    unix_seconds = payload.get("unix_seconds", [])
-    prices = payload.get("price", [])
-    if len(unix_seconds) != len(prices):
-        raise EnergyChartsPriceAnomalyError(
-            f"price [{start}..{end}]: unix_seconds length {len(unix_seconds)} != "
-            f"price length {len(prices)}"
-        )
-
-    index = pd.DatetimeIndex(pd.to_datetime(unix_seconds, unit="s", utc=True), name="timestamp")
-    values = [float(v) if v is not None else float("nan") for v in prices]
-    return pd.Series(values, index=index, name=_COLUMN, dtype="float64")
 
 
 def _month_chunks(start: dt.date, end: dt.date) -> list[tuple[dt.date, dt.date]]:
@@ -257,32 +197,6 @@ def _read_existing(output_dir: Path) -> pd.DataFrame | None:
     return frame
 
 
-def _merge_fresh(existing_full: pd.DataFrame | None, fresh: pd.Series) -> pd.DataFrame:
-    fresh_frame = fresh.to_frame()
-    if existing_full is None:
-        return fresh_frame
-
-    overlap = existing_full.index.intersection(fresh_frame.index)
-    real_overlap = existing_full.loc[overlap, _COLUMN].dropna()
-    if not real_overlap.empty:
-        disagreeing = ~fresh_frame.loc[real_overlap.index, _COLUMN].eq(real_overlap)
-        if disagreeing.any():
-            first = disagreeing[disagreeing].index[0]
-            raise ValueError(
-                f"{int(disagreeing.sum())} timestamp(s) already have a real value that "
-                f"disagrees with the freshly fetched one -- refusing to overwrite; first: {first}"
-            )
-
-    merged = existing_full.combine_first(fresh_frame)
-    existing_notna = existing_full[_COLUMN].dropna()
-    if not merged.loc[existing_notna.index, _COLUMN].equals(existing_notna):
-        raise RuntimeError(
-            "an existing non-NaN value changed during the merge -- this must never happen, "
-            "aborting without writing"
-        )
-    return merged
-
-
 def fetch_price_history(
     *,
     start_date: dt.date | None = None,
@@ -362,7 +276,7 @@ def fetch_price_history(
         fresh = pd.concat(parts).sort_index()
         fresh = fresh[~fresh.index.duplicated(keep="first")]
         fresh.name = _COLUMN
-        merged_full = _merge_fresh(existing_full, fresh)
+        merged_full = merge_existing_with_fresh(existing_full, fresh, column=_COLUMN)
         write_monthly_files(merged_full[_COLUMN], output_dir=output_dir)
         full_series = merged_full[_COLUMN]
 

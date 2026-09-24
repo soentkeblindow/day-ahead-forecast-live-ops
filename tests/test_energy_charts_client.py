@@ -1,5 +1,7 @@
-"""Unit tests for data/energy_charts_probe.py and its thin wiring script
-scripts/probe_energy_charts_forecast.py (docs/sprint6_auftrag_energy_charts_backup.md).
+"""Unit tests for data/energy_charts.py (Energy-Charts client, moved/
+consolidated here per docs/sprint6_step6_9_spec.md section 3.2 Schritt 4)
+and its thin wiring script scripts/probe_energy_charts_forecast.py
+(docs/sprint6_auftrag_energy_charts_backup.md).
 """
 
 from __future__ import annotations
@@ -12,12 +14,16 @@ import pandas as pd
 import pytest
 import requests
 
-from energy_price_forecast.data.energy_charts_probe import (
+from energy_price_forecast.data.energy_charts import (
+    PRICE_COLUMN,
     SERIES,
+    EnergyChartsPriceAnomalyError,
     EnergyChartsProbeAnomalyError,
     EnergyChartsRateLimitedError,
     append_probe_row,
+    fetch_price_range,
     fetch_series_range,
+    merge_existing_with_fresh,
     probe_series,
 )
 from energy_price_forecast.ops.windows import local_day_bounds, next_delivery_day
@@ -100,7 +106,7 @@ def _install_fake_get(
         calls.append(params)
         return response
 
-    import energy_price_forecast.data.energy_charts_probe as module
+    import energy_price_forecast.data.energy_charts as module
 
     monkeypatch.setattr(module.requests, "get", fake_get)
     return calls
@@ -116,7 +122,7 @@ def _install_fake_get_sequence(
         calls.append(params)
         return remaining.pop(0)
 
-    import energy_price_forecast.data.energy_charts_probe as module
+    import energy_price_forecast.data.energy_charts as module
 
     monkeypatch.setattr(module.requests, "get", fake_get)
     return calls
@@ -439,3 +445,150 @@ def test_run_probe_writes_one_row_per_series_before_a_later_anomaly(
     df = pd.read_csv(log_path)
     assert len(df) == 1
     assert df.loc[0, "production_type"] == SERIES[0]
+
+
+# ---------------------------------------------------------------------------
+# fetch_price_range: the /price client, moved here from
+# scripts/fetch_energy_charts_price_history.py (Schritt 4, previously
+# untested in isolation)
+# ---------------------------------------------------------------------------
+
+
+def _price_payload(
+    start: dt.date,
+    end: dt.date,
+    *,
+    unit: str = "EUR / MWh",
+    null_at: list[int] | None = None,
+) -> dict[str, Any]:
+    day_start, _ = local_day_bounds(start)
+    _, day_end = local_day_bounds(end)
+    index = pd.date_range(
+        day_start.tz_convert("UTC"), day_end.tz_convert("UTC"), freq="15min", inclusive="left"
+    )
+    values: list[float | None] = [10.0 + i for i in range(len(index))]
+    for i in null_at or []:
+        values[i] = None
+    return {
+        "unix_seconds": [int(ts.timestamp()) for ts in index],
+        "price": values,
+        "unit": unit,
+        "deprecated": False,
+    }
+
+
+def _install_fake_get_price(
+    monkeypatch: pytest.MonkeyPatch, response: _FakeResponse
+) -> list[dict[str, Any]]:
+    calls: list[dict[str, Any]] = []
+
+    def fake_get(url: str, params: dict[str, Any], timeout: float) -> _FakeResponse:
+        calls.append(params)
+        return response
+
+    import energy_price_forecast.data.energy_charts as module
+
+    monkeypatch.setattr(module.requests, "get", fake_get)
+    return calls
+
+
+def test_fetch_price_range_returns_utc_indexed_series(monkeypatch: pytest.MonkeyPatch) -> None:
+    start, end = dt.date(2024, 6, 1), dt.date(2024, 6, 2)
+    calls = _install_fake_get_price(monkeypatch, _FakeResponse(200, _price_payload(start, end)))
+
+    series = fetch_price_range(start, end)
+
+    assert len(calls) == 1
+    assert calls[0]["bzn"] == "DE-LU"
+    assert series.name == PRICE_COLUMN
+    assert isinstance(series.index, pd.DatetimeIndex)
+    assert str(series.index.tz) == "UTC"
+    assert len(series) == 96 * 2
+
+
+def test_fetch_price_range_keeps_null_values_as_nan(monkeypatch: pytest.MonkeyPatch) -> None:
+    start = end = dt.date(2024, 6, 1)
+    payload = _price_payload(start, end, null_at=[3, 4])
+    _install_fake_get_price(monkeypatch, _FakeResponse(200, payload))
+
+    series = fetch_price_range(start, end)
+
+    assert series.isna().sum() == 2
+    assert series.notna().sum() == 94
+
+
+def test_fetch_price_range_raises_anomaly_on_deprecated(monkeypatch: pytest.MonkeyPatch) -> None:
+    start = end = dt.date(2024, 6, 1)
+    payload = _price_payload(start, end)
+    payload["deprecated"] = True
+    _install_fake_get_price(monkeypatch, _FakeResponse(200, payload))
+
+    with pytest.raises(EnergyChartsPriceAnomalyError):
+        fetch_price_range(start, end)
+
+
+def test_fetch_price_range_raises_anomaly_on_unexpected_unit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    start = end = dt.date(2024, 6, 1)
+    payload = _price_payload(start, end, unit="EUR/kWh")
+    _install_fake_get_price(monkeypatch, _FakeResponse(200, payload))
+
+    with pytest.raises(EnergyChartsPriceAnomalyError):
+        fetch_price_range(start, end)
+
+
+def test_fetch_price_range_raises_rate_limited_with_header_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    start = end = dt.date(2024, 6, 1)
+    _install_fake_get_price(monkeypatch, _FakeResponse(429, {}, headers={"Retry-After": "7"}))
+
+    with pytest.raises(EnergyChartsRateLimitedError) as exc_info:
+        fetch_price_range(start, end)
+    assert exc_info.value.retry_after_s == 7.0
+
+
+def test_fetch_price_range_raises_http_error_on_server_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    start = end = dt.date(2024, 6, 1)
+    _install_fake_get_price(monkeypatch, _FakeResponse(500, {}))
+
+    with pytest.raises(requests.HTTPError):
+        fetch_price_range(start, end)
+
+
+# ---------------------------------------------------------------------------
+# merge_existing_with_fresh: the shared existing-wins merge (previously two
+# separate, near-identical ``_merge_fresh`` copies, consolidated in Schritt 4
+# per docs/sprint6_step6_9_log.md section 3.1 point 7)
+# ---------------------------------------------------------------------------
+
+
+def test_merge_existing_with_fresh_returns_fresh_when_nothing_on_disk() -> None:
+    fresh = pd.Series([1.0, 2.0], index=pd.date_range("2024-01-01", periods=2, freq="h", tz="UTC"))
+
+    merged = merge_existing_with_fresh(None, fresh, column="x")
+
+    assert list(merged.columns) == ["x"]
+    assert merged["x"].tolist() == [1.0, 2.0]
+
+
+def test_merge_existing_with_fresh_fills_a_gap_without_touching_existing_values() -> None:
+    index = pd.date_range("2024-01-01", periods=3, freq="h", tz="UTC")
+    existing = pd.DataFrame({"x": [1.0, float("nan"), 3.0]}, index=index)
+    fresh = pd.Series([1.0, 2.0, 3.0], index=index, name="x")
+
+    merged = merge_existing_with_fresh(existing, fresh, column="x")
+
+    assert merged["x"].tolist() == [1.0, 2.0, 3.0]
+
+
+def test_merge_existing_with_fresh_raises_on_disagreement() -> None:
+    index = pd.date_range("2024-01-01", periods=2, freq="h", tz="UTC")
+    existing = pd.DataFrame({"x": [1.0, 2.0]}, index=index)
+    fresh = pd.Series([1.0, 999.0], index=index, name="x")
+
+    with pytest.raises(ValueError, match="disagrees"):
+        merge_existing_with_fresh(existing, fresh, column="x")

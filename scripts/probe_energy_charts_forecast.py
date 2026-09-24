@@ -27,7 +27,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from energy_price_forecast.data.energy_charts_probe import SERIES, append_probe_row, probe_series
+from energy_price_forecast.data.energy_charts import SERIES, append_probe_row, probe_series
 from energy_price_forecast.ops.store_sources import run_id_and_url
 from energy_price_forecast.ops.windows import next_delivery_day
 

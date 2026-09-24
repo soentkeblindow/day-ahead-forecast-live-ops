@@ -36,7 +36,7 @@ from pathlib import Path
 import pandas as pd
 
 from energy_price_forecast.config import DATA_RAW, PROJECT_ROOT
-from energy_price_forecast.data.energy_charts_probe import SERIES
+from energy_price_forecast.data.energy_charts import SERIES
 from energy_price_forecast.ops.store import read_cached_range
 from energy_price_forecast.ops.store_sources import ENTSOE_SOURCES
 from energy_price_forecast.ops.windows import LOCAL_TZ

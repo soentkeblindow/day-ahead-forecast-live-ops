@@ -38,9 +38,10 @@ from typing import Final
 import pandas as pd
 
 from energy_price_forecast.config import DATA_RAW, PROJECT_ROOT
-from energy_price_forecast.data.energy_charts_probe import (
+from energy_price_forecast.data.energy_charts import (
     EnergyChartsRateLimitedError,
     fetch_series_range,
+    merge_existing_with_fresh,
 )
 from energy_price_forecast.ops.windows import LOCAL_TZ, expected_timestamp_count, local_day_bounds
 
@@ -158,32 +159,6 @@ def _write_parquet_atomically(df: pd.DataFrame, path: Path) -> None:
     os.replace(tmp_path, path)
 
 
-def _merge_fresh(existing_full: pd.DataFrame, fresh: pd.Series) -> pd.DataFrame:
-    """Merge ``fresh`` into ``existing_full`` (the whole on-disk series),
-    existing wins, verified byte-identical for every pre-existing non-NaN
-    cell -- same discipline as backfill_day_ahead_price_gap.py::backfill_gap."""
-    fresh_frame = fresh.to_frame()
-    overlap = existing_full.index.intersection(fresh_frame.index)
-    real_overlap = existing_full.loc[overlap, _SERIES].dropna()
-    if not real_overlap.empty:
-        disagreeing = ~fresh_frame.loc[real_overlap.index, _SERIES].eq(real_overlap)
-        if disagreeing.any():
-            first = disagreeing[disagreeing].index[0]
-            raise ValueError(
-                f"{int(disagreeing.sum())} timestamp(s) already have a real value that "
-                f"disagrees with the freshly fetched one -- refusing to overwrite; first: {first}"
-            )
-
-    merged = existing_full.combine_first(fresh_frame)
-    existing_notna = existing_full[_SERIES].dropna()
-    if not merged.loc[existing_notna.index, _SERIES].equals(existing_notna):
-        raise RuntimeError(
-            "an existing non-NaN value changed during the merge -- this must never happen, "
-            "aborting without writing"
-        )
-    return merged
-
-
 def _write_monthly(merged_full: pd.DataFrame, *, output_dir: Path) -> list[Path]:
     """Rewrite every month file the merge touched (existing months affected
     by the extension plus any brand-new month) -- always the whole month's
@@ -255,7 +230,7 @@ def extend_load_forecast(
     fresh = fresh[~fresh.index.duplicated(keep="first")]
     fresh.name = _SERIES
 
-    merged_full = _merge_fresh(existing_full, fresh)
+    merged_full = merge_existing_with_fresh(existing_full, fresh, column=_SERIES)
     files_written = _write_monthly(merged_full, output_dir=output_dir)
     new_rows = _update_report(merged_full[_SERIES], report_path=report_path)
 

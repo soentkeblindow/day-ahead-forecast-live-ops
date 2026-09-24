@@ -9,7 +9,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from energy_price_forecast.data.energy_charts_probe import EnergyChartsRateLimitedError
+from energy_price_forecast.data.energy_charts import EnergyChartsRateLimitedError
 from scripts.fetch_energy_charts_forecast_history import (
     _fetch_with_retry,
     _year_chunks,
