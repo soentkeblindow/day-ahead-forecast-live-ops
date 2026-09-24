@@ -1260,6 +1260,7 @@ def test_run_daily_submission_has_no_idempotency_lock_two_runs_both_load_the_sto
         patch(
             "scripts.run_daily_submission.run_submission_for_day", return_value=fake_outcome
         ) as mock_run,
+        patch("scripts.run_daily_submission.price_provenance_report", return_value=({}, None)),
     ):
         mock_store.load_store.return_value.manifest = fake_manifest
         exit_code = run_daily_submission(as_of, nominal_slot="11:15", is_last_slot_of_day=False)
@@ -1295,6 +1296,7 @@ def test_run_daily_submission_happy_path_appends_protocol_and_writes_payload(
         patch(
             "scripts.run_daily_submission.run_submission_for_day", return_value=fake_outcome
         ) as mock_run,
+        patch("scripts.run_daily_submission.price_provenance_report", return_value=({}, None)),
     ):
         mock_store.load_store.return_value.manifest = fake_manifest
         exit_code = run_daily_submission(as_of, nominal_slot="10:40", is_last_slot_of_day=True)
@@ -1331,6 +1333,7 @@ def test_run_daily_submission_silent_run_is_red_only_on_the_last_slot(tmp_path: 
                 return_value=pd.DataFrame(),
             ),
             patch("scripts.run_daily_submission.run_submission_for_day", return_value=fake_outcome),
+            patch("scripts.run_daily_submission.price_provenance_report", return_value=({}, None)),
         ):
             mock_store.load_store.return_value.manifest = fake_manifest
             return run_daily_submission(
@@ -1370,6 +1373,7 @@ def test_run_daily_submission_last_slot_silence_stays_green_if_earlier_run_was_a
             "scripts.run_daily_submission.read_quarterhourly_prices", return_value=pd.DataFrame()
         ),
         patch("scripts.run_daily_submission.run_submission_for_day", return_value=fake_outcome),
+        patch("scripts.run_daily_submission.price_provenance_report", return_value=({}, None)),
     ):
         mock_store.load_store.return_value.manifest = fake_manifest
         exit_code = run_daily_submission(as_of, nominal_slot="11:40", is_last_slot_of_day=True)
@@ -1400,6 +1404,7 @@ def _run_with_fake_outcome(
             "scripts.run_daily_submission.read_quarterhourly_prices", return_value=pd.DataFrame()
         ),
         patch("scripts.run_daily_submission.run_submission_for_day", return_value=outcome),
+        patch("scripts.run_daily_submission.price_provenance_report", return_value=({}, None)),
     ):
         mock_store.load_store.return_value.manifest = _manifest({})
         return run_daily_submission(
@@ -1529,6 +1534,7 @@ def test_silence_streak_threshold_of_two_turns_every_silent_run_red(tmp_path: Pa
             "scripts.run_daily_submission.read_quarterhourly_prices", return_value=pd.DataFrame()
         ),
         patch("scripts.run_daily_submission.run_submission_for_day", return_value=fake_outcome),
+        patch("scripts.run_daily_submission.price_provenance_report", return_value=({}, None)),
     ):
         mock_store.load_store.return_value.manifest = fake_manifest
         exit_code = run_daily_submission(as_of, nominal_slot="10:40", is_last_slot_of_day=False)
