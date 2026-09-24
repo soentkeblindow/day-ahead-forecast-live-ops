@@ -17,12 +17,17 @@ import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Final, Protocol
 
 import pandas as pd
 
 from energy_price_forecast.config import DATA_RAW, PROJECT_ROOT
 from energy_price_forecast.data.commodities_client import fetch_eua_co2, fetch_ttf_gas
+from energy_price_forecast.data.energy_charts import (
+    PRICE_COLUMN,
+    fetch_price_range,
+    fetch_series_range,
+)
 from energy_price_forecast.data.entsoe_client import (
     fetch_cross_border_flows,
     fetch_day_ahead_prices,
@@ -31,6 +36,7 @@ from energy_price_forecast.data.entsoe_client import (
     fetch_scheduled_exchanges,
     fetch_wind_solar_forecast,
 )
+from energy_price_forecast.ops.windows import LOCAL_TZ
 
 RowFetchFn = Callable[[pd.Timestamp, pd.Timestamp], pd.DataFrame]
 
@@ -81,6 +87,55 @@ COMMODITY_SOURCES: tuple[tuple[str, RowFetchFn, str], ...] = (
 # no on-disk cache before this spec -- the store needs one to have anything
 # to pack.
 COMMODITIES_DIR: Path = PROJECT_ROOT / "data" / "raw" / "commodities"
+
+# Energy-Charts as a permanent second source (spec 6.9 section 2.4/3.2,
+# Schritt 6). Deliberately a NEW location, not the Sprint 6.8 bulk-fetch
+# artifact directories under data/raw/energy_charts/price|public_power_
+# forecast/ -- those are monthly-file-per-series historical artifacts with
+# their own layout (Teil 1/2/3, scripts/fetch_energy_charts_*_history.py),
+# not the store's own single-file-per-source cache shape. scripts/
+# backfill_energy_charts_store.py (one-time) reads FROM the 6.8 artifacts
+# and writes INTO this directory; scripts/sync_store.py's ongoing
+# maintenance runs only ever read/write here.
+ENERGY_CHARTS_DIR: Path = PROJECT_ROOT / "data" / "raw" / "energy_charts" / "store"
+
+_EC_LOAD_FORECAST_COLUMN: Final = "load_forecast_day_ahead_ec"
+
+
+def _fetch_ec_price(start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+    """Adapts fetch_price_range's dt.date/local-calendar-day, both-ends-
+    inclusive contract to the RowFetchFn shape sync_store.py's generic loop
+    expects (UTC pd.Timestamp, half-open [start, end))."""
+    start_date = start.tz_convert(LOCAL_TZ).date()
+    end_date = (end - pd.Timedelta(seconds=1)).tz_convert(LOCAL_TZ).date()
+    if start_date > end_date:
+        return pd.DataFrame({PRICE_COLUMN: []}, index=pd.DatetimeIndex([], tz="UTC"))
+    return fetch_price_range(start_date, end_date).to_frame()
+
+
+def _fetch_ec_load_forecast(start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+    """Same date-contract adaptation as _fetch_ec_price, for the ``load``
+    series of fetch_series_range -- renamed to the store's own
+    load_forecast_day_ahead_ec column (fetch_series_range itself names the
+    series after the requested production_type, "load", which would
+    otherwise collide with ENTSO-E's own ``load`` fetch group name)."""
+    start_date = start.tz_convert(LOCAL_TZ).date()
+    end_date = (end - pd.Timedelta(seconds=1)).tz_convert(LOCAL_TZ).date()
+    if start_date > end_date:
+        return pd.DataFrame({_EC_LOAD_FORECAST_COLUMN: []}, index=pd.DatetimeIndex([], tz="UTC"))
+    series = fetch_series_range("load", start_date, end_date)
+    return series.rename(_EC_LOAD_FORECAST_COLUMN).to_frame()
+
+
+# (source name, fetch function, raw column name) -- same shape as
+# COMMODITY_SOURCES, but a separate tuple: EC updates far more often than
+# once a day, so scripts/sync_store.py's EC sync must NOT reuse
+# _sync_commodity_source's once-a-day cadence gate (spec section 2.8 was
+# written for Yahoo Finance's own daily-close semantics, not this).
+ENERGY_CHARTS_SOURCES: tuple[tuple[str, RowFetchFn, str], ...] = (
+    ("day_ahead_price_ec", _fetch_ec_price, PRICE_COLUMN),
+    ("load_forecast_day_ahead_ec", _fetch_ec_load_forecast, _EC_LOAD_FORECAST_COLUMN),
+)
 
 
 def code_sha() -> str:

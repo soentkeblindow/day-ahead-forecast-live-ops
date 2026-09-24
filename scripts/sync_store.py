@@ -38,6 +38,7 @@ import pandas as pd
 
 from energy_price_forecast.config import PROJECT_ROOT
 from energy_price_forecast.data._weather_cache import cache_path as weather_cache_path
+from energy_price_forecast.data.energy_charts import merge_existing_with_fresh
 from energy_price_forecast.data.weather_client import (
     WeatherRunUnavailable,
     fetch_run,
@@ -47,6 +48,8 @@ from energy_price_forecast.ops import store
 from energy_price_forecast.ops.store_sources import (
     COMMODITIES_DIR,
     COMMODITY_SOURCES,
+    ENERGY_CHARTS_DIR,
+    ENERGY_CHARTS_SOURCES,
     ENTSOE_SOURCES,
     EntsoeFetchFn,
     EntsoeSource,
@@ -351,6 +354,84 @@ def _sync_commodity_source(
     )
 
 
+def _sync_energy_charts_source(
+    name: str,
+    fetch: RowFetchFn,
+    column: str,
+    manifest: store.Manifest,
+    as_of: pd.Timestamp,
+    log: RunLog,
+) -> store.SourceManifestEntry | None:
+    """Energy-Charts as a permanent second source (spec 6.9 section 2.4/5.8).
+
+    Fetched every run, unlike _sync_commodity_source's once-a-day cadence
+    gate (spec section 2.8's cadence rule was written for Yahoo Finance's
+    own daily-close semantics -- Energy-Charts updates far more often than
+    that, and gating it the same way would silently starve it). Gap-only
+    fetch against this source's own single-file store cache
+    (ENERGY_CHARTS_DIR), merged via merge_existing_with_fresh (spec section
+    5.8: "Existierender Wert gewinnt beim Zusammenfügen, mit Verifikation
+    (Muster _merge_fresh)").
+
+    An EC failure -- unreachable, a merge conflict (merge_existing_with_
+    fresh raises ValueError/RuntimeError on a genuine disagreement or a
+    changed existing value), or (structurally shouldn't happen for a
+    fully-carried, grid_based=False expectation) a validation issue -- is
+    always a warning, never a run failure (spec section 2.4: "Ein EC-Fehler
+    im Pflege-Job ist nur eine Warnung, der Lauf bleibt grün") -- the one
+    deliberate difference from every other source in this script, which do
+    set log.any_failure on their own validation failure.
+    """
+    row = log.get(name)
+    previous = _previous_entry(manifest, name)
+
+    path = ENERGY_CHARTS_DIR / f"{name}.parquet"
+    existing = pd.read_parquet(path) if path.exists() else None
+
+    gap_start = _gap_start(previous, _COMMODITY_DEFAULT_LOOKBACK_DAYS, as_of)
+    try:
+        fresh = fetch(gap_start, as_of)
+        row.fetched = True
+        merged = merge_existing_with_fresh(existing, fresh[column], column=column)
+    except Exception as exc:  # noqa: BLE001 -- EC trouble is a warning, never a failure (spec 2.4)
+        logger.warning("Energy-Charts source %r unreachable or unmergeable this run: %s", name, exc)
+        row.validation = f"unreachable or unmergeable: {exc}"
+        log.warnings.append(f"{name}: unreachable or unmergeable this run ({exc})")
+        return dataclass_replace_attempt(previous, as_of)
+
+    expectation = store.EXPECTATION_TABLE[name]
+    result = store.validate_source(
+        name,
+        merged,
+        expectation,
+        period_start=merged.index.min() if len(merged) else as_of,
+        period_end=as_of,
+        as_of=as_of,
+        previous=previous,
+        mode="live",
+    )
+    row.validation = "ok" if result.ok else "; ".join(result.reasons)
+    row.hints = "; ".join(result.hints)
+
+    if not result.ok:
+        logger.warning(
+            "Energy-Charts source %r failed validation, not writing: %s", name, result.reasons
+        )
+        log.warnings.append(f"{name}: validation issue, not written ({'; '.join(result.reasons)})")
+        return dataclass_replace_attempt(previous, as_of)
+
+    store.write_if_valid(path, merged, result)
+    row.rows_added = len(merged) - (previous.count if previous is not None else 0)
+    return store.SourceManifestEntry(
+        covered_start_utc=merged.index.min().isoformat() if len(merged) else None,
+        covered_end_utc=merged.index.max().isoformat() if len(merged) else None,
+        count=len(merged),
+        last_success_utc=as_of.isoformat(),
+        last_attempt_utc=as_of.isoformat(),
+        live_nan_cell_counts=result.nan_cell_counts,
+    )
+
+
 def dataclass_replace_attempt(
     previous: store.SourceManifestEntry | None, as_of: pd.Timestamp
 ) -> store.SourceManifestEntry | None:
@@ -580,6 +661,13 @@ def run_sync(
         if only and name not in only:
             continue
         entry = _sync_commodity_source(name, fetch, column, manifest, as_of, log)
+        if entry is not None:
+            new_sources[name] = entry
+
+    for name, fetch, column in ENERGY_CHARTS_SOURCES:
+        if only and name not in only:
+            continue
+        entry = _sync_energy_charts_source(name, fetch, column, manifest, as_of, log)
         if entry is not None:
             new_sources[name] = entry
 

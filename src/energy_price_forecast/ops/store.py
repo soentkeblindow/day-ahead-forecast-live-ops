@@ -90,6 +90,10 @@ _SOURCE_GLOBS: Final[dict[str, tuple[str, ...]]] = {
     "weather_single_runs": ("data/cache/weather_single_runs/**/*.parquet",),
     "ttf_gas": ("data/raw/commodities/ttf_gas.parquet",),
     "eua_co2": ("data/raw/commodities/eua_co2.parquet",),
+    "day_ahead_price_ec": ("data/raw/energy_charts/store/day_ahead_price_ec.parquet",),
+    "load_forecast_day_ahead_ec": (
+        "data/raw/energy_charts/store/load_forecast_day_ahead_ec.parquet",
+    ),
 }
 
 _MANIFEST_NAME: Final[str] = "manifest.json"
@@ -679,6 +683,28 @@ EXPECTATION_TABLE: Final[dict[str, SourceExpectation]] = {
     ),
     "eua_co2": SourceExpectation(
         expected_columns=frozenset({"eua_co2_eur_per_t"}), grid_based=False
+    ),
+    # Energy-Charts, a permanent second source (6.9 spec section 2.4/2.5):
+    # "Ein EC-Fehler im Pflege-Job ist nur eine Warnung, der Lauf bleibt
+    # grün. Die EC-Quellen gelten als carried." -- entirely carried (no
+    # expected_columns at all), and grid_based=False deliberately, the same
+    # choice already made for ttf_gas/eua_co2 above: with grid_based=True,
+    # the coverage-gap check a few lines above runs unconditionally on the
+    # whole frame regardless of whether any column is CHECKED, which would
+    # reintroduce exactly the bug class 6.7.1a fixed for gen_hard_coal (a
+    # fully-carried source still blocking a sync). EC's own grid is
+    # measured and reported by its own scripts (build_grid_report,
+    # unchanged from 6.8) -- duplicating that here would be redundant, not
+    # a gap.
+    "day_ahead_price_ec": SourceExpectation(
+        expected_columns=frozenset(),
+        carried_columns=frozenset({"day_ahead_price_ec"}),
+        grid_based=False,
+    ),
+    "load_forecast_day_ahead_ec": SourceExpectation(
+        expected_columns=frozenset(),
+        carried_columns=frozenset({"load_forecast_day_ahead_ec"}),
+        grid_based=False,
     ),
 }
 

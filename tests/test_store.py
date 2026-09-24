@@ -1380,6 +1380,52 @@ def test_carried_columns_scan_negative_control_catches_a_misclassified_column() 
     assert "gen_solar" in hits
 
 
+# ---------------------------------------------------------------------------
+# Every real source that gets its own manifest entry must have a
+# _SOURCE_GLOBS entry too -- a real bug found live (spec 6.9 Schritt 6,
+# 2026-09-24): the two new Energy-Charts sources got EXPECTATION_TABLE
+# entries and real manifest rows via scripts/backfill_energy_charts_store.py,
+# but no _SOURCE_GLOBS entry, so pack_store silently packed zero bytes for
+# them -- a published store whose manifest claimed real row counts for data
+# that was never actually in the tar. Caught by an owner-observed byte-count
+# coincidence (three consecutive publishes reporting the identical store
+# size), not by any local check -- this test is that check.
+# ---------------------------------------------------------------------------
+
+
+def test_every_named_source_has_a_source_globs_entry() -> None:
+    from energy_price_forecast.ops.store_sources import (
+        COMMODITY_SOURCES,
+        ENERGY_CHARTS_SOURCES,
+        ENTSOE_SOURCES,
+    )
+
+    named_sources = (
+        {s.name for s in ENTSOE_SOURCES}
+        | {name for name, _fetch, _column in COMMODITY_SOURCES}
+        | {name for name, _fetch, _column in ENERGY_CHARTS_SOURCES}
+    )
+    missing = named_sources - set(store._SOURCE_GLOBS)
+    assert missing == set(), (
+        f"source(s) with no _SOURCE_GLOBS entry -- pack_store would silently pack zero "
+        f"bytes for them despite a real manifest entry: {sorted(missing)}"
+    )
+
+
+def test_source_globs_negative_control_catches_a_missing_entry() -> None:
+    """Proves the completeness check above genuinely fails on a missing
+    entry, reproducing the real 2026-09-24 bug shape (a named source with
+    no _SOURCE_GLOBS entry at all) rather than just asserting the removal
+    itself worked."""
+    named_sources = {"ttf_gas", "eua_co2"}
+    reduced_globs = dict(store._SOURCE_GLOBS)
+    del reduced_globs["ttf_gas"]
+
+    missing = named_sources - set(reduced_globs)
+
+    assert missing == {"ttf_gas"}
+
+
 def test_read_cached_range_concatenates_and_sorts_month_files(tmp_path: Path) -> None:
     """Moved here from scripts/sync_store.py::_read_cache_dir (spec 6.7.2,
     section 5.8) -- pure disk read, no client, no network."""
