@@ -355,16 +355,19 @@ def check_commodity_staleness(
     2.3) -- never blocking, purely a named entry for the protocol and the
     run summary (spec section 5.7: "protokolliert, nicht sperrend").
 
-    ``warn_days`` defaults to the OLD ffill limit (COMMODITY_STALENESS_WARN_DAYS
-    = 4, deliberately the value data/loaders.py::COMMODITY_FFILL_LIMIT used
-    before it was raised to 7) -- this marks exactly the cases that would
-    have been a silent day before that change, not an arbitrarily chosen
-    new threshold.
+    ``warn_days`` defaults to the ORIGINAL ffill limit (COMMODITY_STALENESS_
+    WARN_DAYS = 4, deliberately the value data/loaders.py::COMMODITY_
+    FFILL_LIMIT used before it was first raised to 7) -- this marks exactly
+    the cases that would have been a silent day before that first change,
+    not an arbitrarily chosen new threshold. Left unchanged by the second
+    raise (7 to 14, spec 6.9 section 2.11): the gap between this warning and
+    an actual silent day is now 10 days instead of 3, still deliberately
+    the same warn_days value, not re-derived from the new ffill limit.
 
     Columns absent from ``df`` or entirely NaN are silently skipped (nothing
     to measure an age from) -- a genuinely dead feed already shows up as NaN
-    in Check B once it exceeds the 7-day ffill limit, which is where it
-    actually blocks.
+    in Check B once it exceeds the 14-day ffill limit (spec 6.9 section
+    2.11, raised from 7), which is where it actually blocks.
     """
     warnings: dict[str, float] = {}
     for column in columns:

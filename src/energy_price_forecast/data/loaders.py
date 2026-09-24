@@ -18,17 +18,24 @@ from energy_price_forecast.data.quarterhourly import validate_delivery_day_slot_
 logger = logging.getLogger(__name__)
 
 _COMMODITY_COLUMNS = ["ttf_gas_eur_per_mwh", "eua_co2_eur_per_t"]
-# 7 days = 168 hours (spec 6.7.2, section 2.3). Raised from the original 4-day
-# limit after measuring every real gap >4 days in the full commodity history
-# (scripts/run_daily_submission.py's caller, arena/live_inputs.py, applies the
-# same limit): TTF gas has one 5-day gap (2024-03-28 to 2024-04-02), EUA CO2
-# has ten, all 5 days (clustered around Christmas/New Year and Easter each
-# year). Confirming this from the data rather than the owner's stated
-# expectation is deliberate -- it matched exactly, but it was measured, not
-# assumed. Public (not module-private) so the live path can reuse the exact
-# same number -- a different limit between backtest and live would be the
-# train/serve skew Entscheidung 10 forbids.
-COMMODITY_FFILL_LIMIT = 7 * 24
+# 14 days = 336 hours (spec 6.9, section 2.11). Raised from the original
+# 4-day limit (spec 6.7.2, section 2.3) after measuring every real gap >4
+# days in the full commodity history (scripts/run_daily_submission.py's
+# caller, arena/live_inputs.py, applies the same limit): TTF gas has one
+# 5-day gap (2024-03-28 to 2024-04-02), EUA CO2 has ten, all 5 days
+# (clustered around Christmas/New Year and Easter each year). Confirming
+# this from the data rather than the owner's stated expectation is
+# deliberate -- it matched exactly, but it was measured, not assumed.
+# Raised a second time, 7 to 14, per the owner's 6.9 finding that a TTF feed
+# dead longer than the ffill limit fails all three fallback-ladder rows at
+# once -- the owner's own re-check of the full history (2026-09-23) still
+# found no real gap longer than the original 4 days, so this second raise is
+# bounded headroom against a future outage, not new evidence of a longer
+# one; the feature values themselves stay bit-identical, nothing to
+# recompute. Public (not module-private) so the live path can reuse the
+# exact same number -- a different limit between backtest and live would be
+# the train/serve skew Entscheidung 10 forbids.
+COMMODITY_FFILL_LIMIT = 14 * 24
 # Kept at the OLD 4-day limit, non-blocking: a gap this deep would have been
 # a silent day before this change. Flagged in the submission run's protocol
 # and summary (spec 6.7.2, section 2.3) so it stays visible, without
@@ -81,8 +88,9 @@ def load_all_data(
     column is required: rows where the price is missing are dropped.
 
     Commodity prices (TTF gas, EUA CO2) come at daily granularity and are
-    forward-filled to hourly resolution with a 7-day limit (raised from 4
-    days, spec 6.7.2 section 2.3 -- see COMMODITY_FFILL_LIMIT). This bridges
+    forward-filled to hourly resolution with a 14-day limit (raised from 4
+    to 7 days, spec 6.7.2 section 2.3, then to 14, spec 6.9 section 2.11 --
+    see COMMODITY_FFILL_LIMIT). This bridges
     weekends and the real multi-day gaps measured in the full history but
     leaves genuine long outages visible as NaN for downstream data quality
     analysis.
