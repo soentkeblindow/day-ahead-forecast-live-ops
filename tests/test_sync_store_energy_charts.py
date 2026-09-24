@@ -64,9 +64,7 @@ def test_fetch_ec_price_converts_utc_timestamps_to_local_calendar_dates() -> Non
     assert captured["end"] == dt.date(2026, 9, 2)
 
 
-def test_fetch_ec_price_returns_empty_frame_for_a_reversed_range_without_calling_the_api() -> (
-    None
-):
+def test_fetch_ec_price_returns_empty_frame_for_a_reversed_range_without_calling_the_api() -> None:
     """Defensive only -- scripts/sync_store.py's own _gap_start never
     produces start > end, but a malformed range must not silently reach
     the API with backwards bounds either."""
