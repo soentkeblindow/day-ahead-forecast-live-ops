@@ -38,12 +38,15 @@ from energy_price_forecast.arena.live_inputs import (
 )
 from energy_price_forecast.arena.payload import build_payload, validate_payload
 from energy_price_forecast.arena.preflight import (
+    CapacityAnchorReport,
     PreflightResult,
+    check_capacity_anchor,
     check_commodity_staleness,
+    check_holiday_calendar,
     check_payload_plausibility,
-    check_reconstruction_inputs,
-    check_training_extent,
-    known_defect_tolerance_hours,
+    check_renewables_label_edge_age,
+    check_training_window,
+    check_weather_run,
 )
 from energy_price_forecast.arena.submit import SubmissionResult, submit
 from energy_price_forecast.config import PROJECT_ROOT
@@ -367,15 +370,44 @@ def holiday_calendar_covers_target(target_day: dt.date) -> bool:
     return len(de) > 0
 
 
-def check_a_inputs(target_day: dt.date, *, weather_root: Path = CACHE_ROOT) -> PreflightResult:
-    """Assemble Check A's already-loaded inputs and run it (spec section
+def check_a_global(target_day: dt.date) -> PreflightResult:
+    """spec 6.9 section 2.3/5.1 step 3 -- the one Check A question every
+    candidate row alike depends on. A failure here is total silence before
+    anything else runs (no renewables step, no fit): no future row can
+    recover from a holiday-calendar gap, since every row's calendar
+    feature depends on it.
+    """
+    return check_holiday_calendar(
+        target_day=target_day,
+        holiday_calendar_covers_target=holiday_calendar_covers_target(target_day),
+    )
+
+
+@dataclass(frozen=True)
+class NwpAvailability:
+    """spec 6.9 section 2.3/5.1 step 4: whether the renewables
+    reconstruction can be built for ``target_day`` at all -- the combined
+    result of the weather-run and capacity-anchor questions. Only
+    candidate rows that need the NWP reconstruction are gated by
+    ``ok`` (today, the only row; spec section 2.1's future gasfrei row will
+    not be). ``anchor`` is carried separately so a caller can act on its
+    ``warning``/expiry state even when ``ok`` is True.
+    """
+
+    ok: bool
+    reasons: tuple[str, ...]
+    anchor: CapacityAnchorReport
+
+
+def check_a_nwp(target_day: dt.date, *, weather_root: Path = CACHE_ROOT) -> NwpAvailability:
+    """Assemble Check A's NWP-dependent inputs and run them (spec section
     5.2) -- the cheap gate before any fit happens (spec section 2.1).
 
     Reads exactly one weather run (D-1's 00 UTC run, via the same pure disk
     reader arena.live_inputs.read_weather_runs uses internally) and the
     capacity anchor table's validity boundary. No fetch client, no network
     (spec section 4 rule 4) -- a missing or unreadable weather run surfaces
-    as ``weather_run=None``, itself a Check A failure, not an exception.
+    as ``weather_run=None``, itself a failure, not an exception.
 
     ``weather_root`` defaults to the real local cache (module-level
     ``CACHE_ROOT``, unchanged behaviour for every existing caller) --
@@ -390,11 +422,34 @@ def check_a_inputs(target_day: dt.date, *, weather_root: Path = CACHE_ROOT) -> P
     run_init = run_init_for_target_day(target_day)
     weather_run = read_cached_run(cache_path(run_init, DEFAULT_WEATHER_MODEL, root=weather_root))
     anchor_valid_until = anchor_table_valid_until(CapacitySource.PUBLIC_REGISTRY)
-    return check_reconstruction_inputs(
-        weather_run=weather_run,
-        target_day=target_day,
-        anchor_valid_until=anchor_valid_until,
-        holiday_calendar_covers_target=holiday_calendar_covers_target(target_day),
+
+    weather_result = check_weather_run(weather_run)
+    anchor_result, anchor_report = check_capacity_anchor(target_day, anchor_valid_until)
+
+    return NwpAvailability(
+        ok=weather_result.ok and anchor_result.ok,
+        reasons=weather_result.reasons + anchor_result.reasons,
+        anchor=anchor_report,
+    )
+
+
+def check_a_renewables_labels(df: pd.DataFrame, target_day: dt.date) -> tuple[PreflightResult, int]:
+    """spec 6.9 section 2.7: slices ``df`` to the renewables window's own
+    TARGET_COLUMNS and runs check_renewables_label_edge_age against it -- a
+    separate, named function (not inlined into run_submission_for_day) so
+    tests can mock this one unit the same way they already mock
+    check_a_nwp, rather than needing every ``df`` fixture to carry the
+    three NWP-target columns whenever the label edge itself isn't what is
+    under test.
+
+    ``must_reach`` mirrors check_training_window's own Soll-Rand convention
+    (target_day - 1): the renewables model's own most recent required
+    training day.
+    """
+    window_start, window_end = renewables_window(target_day)
+    target_hourly = df.loc[window_start:window_end, list(TARGET_COLUMNS.values())]
+    return check_renewables_label_edge_age(
+        target_hourly, must_reach=target_day - dt.timedelta(days=1)
     )
 
 
@@ -436,6 +491,20 @@ class SubmissionOutcome:
     # is_smoke in build_submission_record) is what actually marks the row, not this field.
     is_smoke: bool = False
     smoke_baseline_source_day: dt.date | None = None
+    # spec 6.9 section 5.7, protocol_version 4 fields this step (Schritt 8) computes -- all
+    # None/empty for any outcome returned before the corresponding check actually ran (spec
+    # section 2.3: nwp_available/capacity_anchor_days_left only once check_a_nwp ran;
+    # rnw_label_edge_age_days only once check_a_renewables_labels ran; the training-window
+    # fields only once check_training_window ran).
+    nwp_available: bool | None = None
+    nwp_unavailable_reason: str | None = None
+    capacity_anchor_days_left: float | None = None
+    rnw_label_edge_age_days: int | None = None
+    n_training_days: int | None = None
+    age_of_last_complete_day: int | None = None
+    training_tolerance_used: bool | None = None
+    training_missing_days: tuple[dt.date, ...] = ()
+    known_weather_defect_days: tuple[dt.date, ...] = ()
 
 
 def run_submission_for_day(
@@ -480,16 +549,52 @@ def run_submission_for_day(
     Injectable so tests never depend on real time.
 
     ``weather_root`` defaults to the real local cache, matching every
-    existing caller's behaviour unchanged -- see check_a_inputs's own
+    existing caller's behaviour unchanged -- see check_a_nwp's own
     docstring for why scripts/outage_drill.py (spec 6.9) needs to override it.
     """
-    check_a = check_a_inputs(target_day, weather_root=weather_root)
-    if not check_a.ok:
+    check_global = check_a_global(target_day)
+    if not check_global.ok:
         return SubmissionOutcome(
-            candidate_selected=None, skip_reason="Check A: " + "; ".join(check_a.reasons)
+            candidate_selected=None, skip_reason="Check A: " + "; ".join(check_global.reasons)
         )
 
     commodity_staleness_warnings = check_commodity_staleness(df, as_of)
+
+    nwp = check_a_nwp(target_day, weather_root=weather_root)
+    # spec 6.9 section 2.3: the anchor's own approaching-expiry warning is logged
+    # independently of whether Check A as a whole passes -- a Pflegeversäumnis must stay
+    # visible well before it can ever block anything.
+    if nwp.anchor.warning:
+        logger.warning(
+            "capacity anchor table expires in %.1f day(s) (CAPACITY_ANCHOR_WARN_DAYS)",
+            nwp.anchor.days_until_expiry,
+        )
+    if not nwp.ok:
+        # Schritt 8 still has only the one row, and it needs the NWP reconstruction
+        # unconditionally -- unavailability here is still silence, same as before this
+        # step. Only once a gasfrei row exists (spec 6.9 section 2.1, Schritt 11) does
+        # this stop being the end of the run.
+        return SubmissionOutcome(
+            candidate_selected=None,
+            skip_reason="Check A: " + "; ".join(nwp.reasons),
+            commodity_staleness_warnings=commodity_staleness_warnings,
+            nwp_available=False,
+            nwp_unavailable_reason="; ".join(nwp.reasons),
+            capacity_anchor_days_left=nwp.anchor.days_until_expiry,
+        )
+
+    # spec 6.9 section 2.7: a cheap guard before the walk-forward itself, mirroring
+    # check_weather_run/check_capacity_anchor's own "gate before the expensive work" shape.
+    label_result, rnw_label_edge_age_days = check_a_renewables_labels(df, target_day)
+    if not label_result.ok:
+        return SubmissionOutcome(
+            candidate_selected=None,
+            skip_reason="Check A: " + "; ".join(label_result.reasons),
+            commodity_staleness_warnings=commodity_staleness_warnings,
+            nwp_available=True,
+            capacity_anchor_days_left=nwp.anchor.days_until_expiry,
+            rnw_label_edge_age_days=rnw_label_edge_age_days,
+        )
 
     renewables_predictions, renewables_runtime_seconds = run_renewables_step(
         df, weather, target_day
@@ -503,21 +608,36 @@ def run_submission_for_day(
     # (spec section 2.4).
     training_matrix = matrix.loc[matrix.index.isin(fold.train_index)]
     last_train_day = fold.train_index.tz_convert(LOCAL_TZ).normalize().max().date()
-    excluded_in_training_window = {day for day in excluded if day <= last_train_day}
-    tolerance_hours = known_defect_tolerance_hours(excluded_in_training_window)
-    extent_result = check_training_extent(
+    window_result, window_report = check_training_window(
         training_matrix,
-        expected_days=PRICE_TRAIN_SPAN_DAYS,
+        df["day_ahead_price"],
+        frozenset(matrix.columns),
         must_reach=last_train_day,
-        tolerated_missing_hours=tolerance_hours,
+        window_days=PRICE_TRAIN_SPAN_DAYS,
     )
-    if not extent_result.ok:
+    # spec 6.9 section 5.7: these protocol_version 4 fields are this step's own job to fill in
+    # (docs/sprint6_step6_9_log.md step 3's schema-only scaffolding) -- training_tolerance_used
+    # is a coarse "was the window perfectly complete" flag, distinct from
+    # TrainingWindowReport.tolerance_used (the (min_training_days, max_edge_age_days) constants
+    # actually applied, which never vary at runtime and so add nothing new to log per run).
+    training_window_fields: dict[str, Any] = {
+        "nwp_available": True,
+        "capacity_anchor_days_left": nwp.anchor.days_until_expiry,
+        "rnw_label_edge_age_days": rnw_label_edge_age_days,
+        "n_training_days": window_report.n_training_days,
+        "age_of_last_complete_day": window_report.age_of_last_complete_day,
+        "training_tolerance_used": bool(window_report.missing_days),
+        "training_missing_days": window_report.missing_days,
+        "known_weather_defect_days": window_report.known_weather_defect_days,
+    }
+    if not window_result.ok:
         return SubmissionOutcome(
             candidate_selected=None,
-            skip_reason="training extent: " + "; ".join(extent_result.reasons),
+            skip_reason="training window: " + "; ".join(window_result.reasons),
             renewables_runtime_seconds=renewables_runtime_seconds,
             excluded_training_days=frozenset(excluded),
             commodity_staleness_warnings=commodity_staleness_warnings,
+            **training_window_fields,
         )
 
     # Check B / candidate selection look only at target_day's own row(s) -- required by
@@ -535,6 +655,7 @@ def run_submission_for_day(
             renewables_runtime_seconds=renewables_runtime_seconds,
             excluded_training_days=frozenset(excluded),
             commodity_staleness_warnings=commodity_staleness_warnings,
+            **training_window_fields,
         )
 
     quarterhourly_forecast, n_training_rows, n_training_labels = fit_predict_expand(
@@ -556,6 +677,7 @@ def run_submission_for_day(
             commodity_staleness_warnings=commodity_staleness_warnings,
             n_training_rows=n_training_rows,
             n_training_labels=n_training_labels,
+            **training_window_fields,
         )
 
     # spec 6.7.3 section 2.4: re-check the gate closure immediately before the POST -- a
@@ -572,6 +694,7 @@ def run_submission_for_day(
             commodity_staleness_warnings=commodity_staleness_warnings,
             n_training_rows=n_training_rows,
             n_training_labels=n_training_labels,
+            **training_window_fields,
         )
 
     submission_result = submit(challenge, payload, live=live)
@@ -586,6 +709,7 @@ def run_submission_for_day(
         commodity_staleness_warnings=commodity_staleness_warnings,
         n_training_rows=n_training_rows,
         n_training_labels=n_training_labels,
+        **training_window_fields,
     )
 
 
@@ -767,6 +891,15 @@ def build_submission_record(
         smoke_baseline_source_day=smoke_baseline_source_day,
         price_provenance=price_provenance or {},
         price_source_conflicts=price_source_conflicts,
+        nwp_available=outcome.nwp_available,
+        nwp_unavailable_reason=outcome.nwp_unavailable_reason,
+        capacity_anchor_days_left=outcome.capacity_anchor_days_left,
+        rnw_label_edge_age_days=outcome.rnw_label_edge_age_days,
+        n_training_days=outcome.n_training_days,
+        age_of_last_complete_day=outcome.age_of_last_complete_day,
+        training_tolerance_used=outcome.training_tolerance_used,
+        training_missing_days=[d.isoformat() for d in outcome.training_missing_days],
+        known_weather_defect_days=[d.isoformat() for d in outcome.known_weather_defect_days],
     )
 
 

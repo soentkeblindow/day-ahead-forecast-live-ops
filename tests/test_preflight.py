@@ -5,20 +5,31 @@ extent check, and the plausibility bands (spec 6.7.2, sections 2.1-2.6,
 
 from __future__ import annotations
 
+import datetime as dt
+
 import pandas as pd
 import pytest
 
+import energy_price_forecast.arena.preflight as preflight_module
 from energy_price_forecast.arena.preflight import (
+    CAPACITY_ANCHOR_WARN_DAYS,
+    MAX_RNW_LABEL_EDGE_AGE_DAYS,
+    MAX_TRAINING_EDGE_AGE_DAYS,
+    MIN_TRAINING_DAYS,
+    check_capacity_anchor,
     check_capacity_factor_bounds,
     check_commodity_staleness,
     check_daily_sum_plausibility,
+    check_holiday_calendar,
     check_payload_plausibility,
-    check_reconstruction_inputs,
+    check_renewables_label_edge_age,
     check_target_row,
-    check_training_extent,
-    known_defect_tolerance_hours,
+    check_training_window,
+    check_weather_run,
 )
+from energy_price_forecast.data.weather_client import run_init_for_target_day
 from energy_price_forecast.data.weather_grid import GRID_POINTS, HOURLY_VARIABLES
+from energy_price_forecast.ops.windows import local_day_bounds
 
 _RADIATION = {"shortwave_radiation", "direct_normal_irradiance"}
 
@@ -33,83 +44,86 @@ def _valid_weather_run() -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Check A -- check_reconstruction_inputs
+# Check A, split per spec 6.9 section 2.3: check_holiday_calendar (global),
+# check_weather_run/check_capacity_anchor (per-row, NWP-only).
 # ---------------------------------------------------------------------------
 
+_TARGET_DAY = pd.Timestamp("2026-09-13").date()
 
-def test_check_a_passes_with_valid_weather_anchor_and_holiday_coverage() -> None:
-    result = check_reconstruction_inputs(
-        weather_run=_valid_weather_run(),
-        target_day=pd.Timestamp("2026-09-13").date(),
-        anchor_valid_until=pd.Timestamp("2026-10-28", tz="UTC"),
-        holiday_calendar_covers_target=True,
-    )
+
+def test_check_holiday_calendar_passes_for_a_covered_year() -> None:
+    result = check_holiday_calendar(target_day=_TARGET_DAY, holiday_calendar_covers_target=True)
     assert result.ok is True
     assert result.reasons == ()
 
 
-def test_check_a_fails_when_weather_run_is_none() -> None:
-    result = check_reconstruction_inputs(
-        weather_run=None,
-        target_day=pd.Timestamp("2026-09-13").date(),
-        anchor_valid_until=pd.Timestamp("2026-10-28", tz="UTC"),
-        holiday_calendar_covers_target=True,
-    )
-    assert result.ok is False
-    assert any("weather run" in r for r in result.reasons)
-
-
-def test_check_a_fails_when_weather_run_is_invalid() -> None:
-    bad_run = _valid_weather_run()
-    non_radiation_col = f"{GRID_POINTS[0].point_id}__wind_speed_10m"
-    bad_run[non_radiation_col] = float("nan")
-    result = check_reconstruction_inputs(
-        weather_run=bad_run,
-        target_day=pd.Timestamp("2026-09-13").date(),
-        anchor_valid_until=pd.Timestamp("2026-10-28", tz="UTC"),
-        holiday_calendar_covers_target=True,
-    )
-    assert result.ok is False
-    assert any("failed validation" in r for r in result.reasons)
-
-
-def test_check_a_fails_when_anchor_table_expired() -> None:
-    result = check_reconstruction_inputs(
-        weather_run=_valid_weather_run(),
-        target_day=pd.Timestamp("2026-09-13").date(),
-        anchor_valid_until=pd.Timestamp("2026-09-01", tz="UTC"),  # already past
-        holiday_calendar_covers_target=True,
-    )
-    assert result.ok is False
-    assert any("anchor table" in r for r in result.reasons)
-
-
-def test_check_a_fails_when_holiday_calendar_does_not_cover_target() -> None:
-    result = check_reconstruction_inputs(
-        weather_run=_valid_weather_run(),
-        target_day=pd.Timestamp("2026-09-13").date(),
-        anchor_valid_until=pd.Timestamp("2026-10-28", tz="UTC"),
-        holiday_calendar_covers_target=False,
-    )
+def test_check_holiday_calendar_fails_when_not_covered() -> None:
+    result = check_holiday_calendar(target_day=_TARGET_DAY, holiday_calendar_covers_target=False)
     assert result.ok is False
     assert any("holiday calendar" in r for r in result.reasons)
 
 
-def test_check_a_covers_holiday_calendar_both_directions() -> None:
-    within = check_reconstruction_inputs(
-        weather_run=_valid_weather_run(),
-        target_day=pd.Timestamp("2026-09-13").date(),
-        anchor_valid_until=pd.Timestamp("2026-10-28", tz="UTC"),
-        holiday_calendar_covers_target=True,
+def test_check_weather_run_passes_with_a_valid_run() -> None:
+    assert check_weather_run(_valid_weather_run()).ok is True
+
+
+def test_check_weather_run_fails_when_none() -> None:
+    result = check_weather_run(None)
+    assert result.ok is False
+    assert any("weather run" in r for r in result.reasons)
+
+
+def test_check_weather_run_fails_when_invalid() -> None:
+    bad_run = _valid_weather_run()
+    non_radiation_col = f"{GRID_POINTS[0].point_id}__wind_speed_10m"
+    bad_run[non_radiation_col] = float("nan")
+    result = check_weather_run(bad_run)
+    assert result.ok is False
+    assert any("failed validation" in r for r in result.reasons)
+
+
+def test_check_capacity_anchor_passes_and_no_warning_when_far_from_expiry() -> None:
+    result, report = check_capacity_anchor(_TARGET_DAY, pd.Timestamp("2026-10-28", tz="UTC"))
+    assert result.ok is True
+    assert report.warning is False
+
+
+def test_check_capacity_anchor_warns_at_exactly_the_warn_window() -> None:
+    """spec 6.9 section 2.3: 'Ab 14 Tagen vor Ablauf: Warnung.'"""
+    run_init = run_init_for_target_day(_TARGET_DAY)
+    result, report = check_capacity_anchor(
+        _TARGET_DAY, run_init + pd.Timedelta(days=CAPACITY_ANCHOR_WARN_DAYS)
     )
-    beyond = check_reconstruction_inputs(
-        weather_run=_valid_weather_run(),
-        target_day=pd.Timestamp("2026-09-13").date(),
-        anchor_valid_until=pd.Timestamp("2026-10-28", tz="UTC"),
-        holiday_calendar_covers_target=False,
+    assert result.ok is True
+    assert report.warning is True
+
+
+def test_check_capacity_anchor_no_warning_one_day_beyond_the_warn_window() -> None:
+    run_init = run_init_for_target_day(_TARGET_DAY)
+    result, report = check_capacity_anchor(
+        _TARGET_DAY, run_init + pd.Timedelta(days=CAPACITY_ANCHOR_WARN_DAYS + 1)
     )
-    assert within.ok is True
-    assert beyond.ok is False
+    assert result.ok is True
+    assert report.warning is False
+
+
+def test_check_capacity_anchor_fails_when_expired() -> None:
+    result, report = check_capacity_anchor(_TARGET_DAY, pd.Timestamp("2026-09-01", tz="UTC"))
+    assert result.ok is False
+    assert any("anchor table" in r for r in result.reasons)
+    assert report.warning is False  # already expired, not merely approaching
+
+
+def test_known_defect_tolerance_hours_and_the_old_check_a_functions_are_removed() -> None:
+    """spec 6.9 section 2.6: known_defect_tolerance_hours and its chain
+    logic are removed, not patched -- and check_reconstruction_inputs/
+    check_training_extent are replaced by the split functions above."""
+    for name in (
+        "known_defect_tolerance_hours",
+        "check_training_extent",
+        "check_reconstruction_inputs",
+    ):
+        assert not hasattr(preflight_module, name)
 
 
 # ---------------------------------------------------------------------------
@@ -164,105 +178,204 @@ def test_check_b_passes_when_a_non_required_column_is_nan() -> None:
 
 
 # ---------------------------------------------------------------------------
-# check_training_extent
+# check_training_window (spec 6.9 section 2.6/5.4) -- replaces the former
+# check_training_extent/known_defect_tolerance_hours.
 # ---------------------------------------------------------------------------
 
 
-def _hourly_frame(start: str, n_hours: int) -> pd.DataFrame:
-    index = pd.date_range(start, periods=n_hours, freq="h", tz="UTC")
-    return pd.DataFrame({"x": range(n_hours)}, index=index)
+def _day_hours(day: dt.date) -> pd.DatetimeIndex:
+    start, end = local_day_bounds(day)
+    return pd.date_range(start.tz_convert("UTC"), end.tz_convert("UTC"), freq="h", inclusive="left")
 
 
-def test_training_extent_passes_for_a_full_90_day_window() -> None:
-    features = _hourly_frame("2026-06-15", 90 * 24)
-    result = check_training_extent(
-        features, expected_days=90, must_reach=pd.Timestamp("2026-09-12").date()
+def _full_window(
+    must_reach: dt.date, window_days: int, value: float = 1.0
+) -> tuple[pd.DataFrame, pd.Series]:
+    """A completely gap-free window_days-day window ending at must_reach,
+    one required feature column ("feat_a") plus a matching price label,
+    both constant-filled -- DST-free days only (a July window, matching
+    this project's existing test convention), so every day contributes
+    exactly 24 hours and day counts are simple integers."""
+    days = [must_reach - dt.timedelta(days=window_days - 1 - i) for i in range(window_days)]
+    hours = _day_hours(days[0]).append([_day_hours(d) for d in days[1:]])
+    features = pd.DataFrame({"feat_a": value}, index=hours)
+    labels = pd.Series(50.0, index=hours)
+    return features, labels
+
+
+def _drop_days(
+    features: pd.DataFrame, labels: pd.Series, days: list[dt.date]
+) -> tuple[pd.DataFrame, pd.Series]:
+    """Removes entire days' worth of rows -- simulates a day missing from
+    the built matrix/price history entirely, not a NaN cell."""
+    drop_hours = _day_hours(days[0]).append([_day_hours(d) for d in days[1:]])
+    return features.drop(index=drop_hours), labels.drop(index=drop_hours)
+
+
+_JULY_MUST_REACH = dt.date(2026, 7, 14)  # DST-free week, matches tests/test_run_daily_submission.py
+
+
+def test_training_window_passes_at_exactly_min_training_days() -> None:
+    features, labels = _full_window(_JULY_MUST_REACH, 90)
+    n_to_drop = 90 - MIN_TRAINING_DAYS
+    drop_days = [_JULY_MUST_REACH - dt.timedelta(days=10 + i) for i in range(n_to_drop)]
+    features, labels = _drop_days(features, labels, drop_days)
+
+    result, report = check_training_window(
+        features, labels, frozenset({"feat_a"}), must_reach=_JULY_MUST_REACH, window_days=90
     )
+
+    assert result.ok is True
+    assert report.n_training_days == MIN_TRAINING_DAYS
+
+
+def test_training_window_fails_one_day_below_min_training_days() -> None:
+    features, labels = _full_window(_JULY_MUST_REACH, 90)
+    n_to_drop = 90 - MIN_TRAINING_DAYS + 1
+    drop_days = [_JULY_MUST_REACH - dt.timedelta(days=10 + i) for i in range(n_to_drop)]
+    features, labels = _drop_days(features, labels, drop_days)
+
+    result, report = check_training_window(
+        features, labels, frozenset({"feat_a"}), must_reach=_JULY_MUST_REACH, window_days=90
+    )
+
+    assert result.ok is False
+    assert report.n_training_days == MIN_TRAINING_DAYS - 1
+    assert any("complete training day" in r for r in result.reasons)
+
+
+def test_training_window_passes_at_exactly_max_edge_age() -> None:
+    # A wide window (97 days) so dropping edge days never also trips the
+    # separate n_training_days floor -- isolates the age dimension.
+    window_days = 97
+    features, labels = _full_window(_JULY_MUST_REACH, window_days)
+    drop_days = [_JULY_MUST_REACH - dt.timedelta(days=i) for i in range(MAX_TRAINING_EDGE_AGE_DAYS)]
+    features, labels = _drop_days(features, labels, drop_days)
+
+    result, report = check_training_window(
+        features,
+        labels,
+        frozenset({"feat_a"}),
+        must_reach=_JULY_MUST_REACH,
+        window_days=window_days,
+    )
+
+    assert result.ok is True
+    assert report.age_of_last_complete_day == MAX_TRAINING_EDGE_AGE_DAYS
+
+
+def test_training_window_fails_one_day_beyond_max_edge_age() -> None:
+    window_days = 97
+    features, labels = _full_window(_JULY_MUST_REACH, window_days)
+    drop_days = [
+        _JULY_MUST_REACH - dt.timedelta(days=i) for i in range(MAX_TRAINING_EDGE_AGE_DAYS + 1)
+    ]
+    features, labels = _drop_days(features, labels, drop_days)
+
+    result, report = check_training_window(
+        features,
+        labels,
+        frozenset({"feat_a"}),
+        must_reach=_JULY_MUST_REACH,
+        window_days=window_days,
+    )
+
+    assert result.ok is False
+    assert report.age_of_last_complete_day == MAX_TRAINING_EDGE_AGE_DAYS + 1
+    assert any("last complete training day" in r for r in result.reasons)
+
+
+def test_training_window_a_missing_label_makes_its_day_incomplete() -> None:
+    features, labels = _full_window(_JULY_MUST_REACH, 90)
+    gap_day = _JULY_MUST_REACH - dt.timedelta(days=20)
+    labels = labels.copy()
+    labels.loc[_day_hours(gap_day)] = float("nan")
+
+    result, report = check_training_window(
+        features, labels, frozenset({"feat_a"}), must_reach=_JULY_MUST_REACH, window_days=90
+    )
+
+    assert gap_day in report.missing_days
+    assert report.n_training_days == 89
+
+
+def test_training_window_ignores_nan_in_a_column_not_required() -> None:
+    features, labels = _full_window(_JULY_MUST_REACH, 90)
+    features = features.copy()
+    features["unused_col"] = 1.0
+    gap_day = _JULY_MUST_REACH - dt.timedelta(days=20)
+    features.loc[_day_hours(gap_day), "unused_col"] = float("nan")
+
+    result, report = check_training_window(
+        features, labels, frozenset({"feat_a"}), must_reach=_JULY_MUST_REACH, window_days=90
+    )
+
+    assert result.ok is True
+    assert report.n_training_days == 90
+    assert gap_day not in report.missing_days
+
+
+def test_training_window_reports_a_known_weather_defect_day_but_grants_no_tolerance() -> None:
+    """spec 6.9 section 2.6: KNOWN_WEATHER_DEFECTS is reporting-only now --
+    2026-06-24 (D-1 run_init 2026-06-23 is a documented corrupt-run entry)
+    still counts against n_training_days like any other missing day, it is
+    just additionally named in known_weather_defect_days."""
+    features, labels = _full_window(_JULY_MUST_REACH, 90)
+    defect_day = dt.date(2026, 6, 24)
+    features, labels = _drop_days(features, labels, [defect_day])
+
+    result, report = check_training_window(
+        features, labels, frozenset({"feat_a"}), must_reach=_JULY_MUST_REACH, window_days=90
+    )
+
+    assert result.ok is True  # 89 of 90 -- well within MIN_TRAINING_DAYS regardless of cause
+    assert defect_day in report.missing_days
+    assert defect_day in report.known_weather_defect_days
+
+
+# ---------------------------------------------------------------------------
+# check_renewables_label_edge_age (spec 6.9 section 2.7)
+# ---------------------------------------------------------------------------
+
+_RNW_TARGET_COLUMNS = ("wind_onshore_forecast", "wind_offshore_forecast", "solar_forecast")
+
+
+def _renewables_window(must_reach: dt.date, n_days: int) -> pd.DataFrame:
+    days = [must_reach - dt.timedelta(days=n_days - 1 - i) for i in range(n_days)]
+    hours = _day_hours(days[0]).append([_day_hours(d) for d in days[1:]])
+    return pd.DataFrame({col: 1.0 for col in _RNW_TARGET_COLUMNS}, index=hours)
+
+
+def test_renewables_label_edge_age_zero_when_must_reach_is_complete() -> None:
+    target_hourly = _renewables_window(_JULY_MUST_REACH, 30)
+    result, age = check_renewables_label_edge_age(target_hourly, must_reach=_JULY_MUST_REACH)
+    assert age == 0
     assert result.ok is True
 
 
-def test_training_extent_fails_when_window_ends_too_early() -> None:
-    """The real 2026-09-11 shape: a source freezes, the window silently
-    shortens at the recent end, no NaN anywhere in what's left."""
-    features = _hourly_frame("2026-06-10", 85 * 24)  # ends 5 days early
-    result = check_training_extent(
-        features, expected_days=90, must_reach=pd.Timestamp("2026-09-12").date()
-    )
-    assert result.ok is False
-    assert any("must reach" in r for r in result.reasons)
+def test_renewables_label_edge_age_passes_at_exactly_the_limit() -> None:
+    target_hourly = _renewables_window(_JULY_MUST_REACH, 30)
+    for i in range(MAX_RNW_LABEL_EDGE_AGE_DAYS):
+        day = _JULY_MUST_REACH - dt.timedelta(days=i)
+        target_hourly.loc[_day_hours(day), :] = float("nan")
 
+    result, age = check_renewables_label_edge_age(target_hourly, must_reach=_JULY_MUST_REACH)
 
-def test_training_extent_fails_when_row_count_too_low() -> None:
-    index = pd.date_range("2026-06-15", periods=90, freq="D", tz="UTC")  # only 90 rows, not hours
-    features = pd.DataFrame({"x": range(90)}, index=index)
-    result = check_training_extent(features, expected_days=90, must_reach=index.max().date())
-    assert result.ok is False
-    assert any("row(s)" in r for r in result.reasons)
-
-
-def test_training_extent_tolerates_a_known_defect_gap() -> None:
-    """The real 2026-09-12 finding: a 90-day window missing exactly the
-    hours of a documented, permanent gap must still pass, given the
-    matching tolerance."""
-    features = _hourly_frame("2026-06-17", 88 * 24)  # 2 days short of 90
-    result = check_training_extent(
-        features,
-        expected_days=90,
-        must_reach=pd.Timestamp("2026-09-12").date(),
-        tolerated_missing_hours=48,
-    )
+    assert age == MAX_RNW_LABEL_EDGE_AGE_DAYS
     assert result.ok is True
 
 
-def test_training_extent_still_fails_beyond_the_granted_tolerance() -> None:
-    """Tolerance only covers what it explains -- an extra, unexplained
-    shortfall on top must still block."""
-    features = _hourly_frame("2026-06-17", 88 * 24)  # 2 days short of 90
-    result = check_training_extent(
-        features,
-        expected_days=90,
-        must_reach=pd.Timestamp("2026-09-12").date(),
-        tolerated_missing_hours=24,  # only explains 1 of the 2 missing days
-    )
+def test_renewables_label_edge_age_fails_one_day_beyond_the_limit() -> None:
+    target_hourly = _renewables_window(_JULY_MUST_REACH, 30)
+    for i in range(MAX_RNW_LABEL_EDGE_AGE_DAYS + 1):
+        day = _JULY_MUST_REACH - dt.timedelta(days=i)
+        target_hourly.loc[_day_hours(day), :] = float("nan")
+
+    result, age = check_renewables_label_edge_age(target_hourly, must_reach=_JULY_MUST_REACH)
+
+    assert age == MAX_RNW_LABEL_EDGE_AGE_DAYS + 1
     assert result.ok is False
-    assert any("row(s)" in r for r in result.reasons)
-
-
-# ---------------------------------------------------------------------------
-# known_defect_tolerance_hours
-# ---------------------------------------------------------------------------
-
-
-def test_known_defect_tolerance_hours_explains_a_direct_defect_day() -> None:
-    # KNOWN_WEATHER_DEFECTS keys 2026-06-23T00Z (corrupt) -> excludes delivery day 2026-06-24.
-    hours = known_defect_tolerance_hours({pd.Timestamp("2026-06-24").date()})
-    assert hours == 24
-
-
-def test_known_defect_tolerance_hours_explains_the_real_knock_on_chain() -> None:
-    """The real 2026-09-12 chain: 2026-06-24 is a documented defect day,
-    2026-06-25 is its knock-on (no D-1 persistence-lag value) -- both
-    excluded, both explained."""
-    hours = known_defect_tolerance_hours(
-        {pd.Timestamp("2026-06-24").date(), pd.Timestamp("2026-06-25").date()}
-    )
-    assert hours == 48
-
-
-def test_known_defect_tolerance_hours_does_not_explain_an_unrelated_gap() -> None:
-    """A local-cache gap not in KNOWN_WEATHER_DEFECTS (the real 2025-06-13
-    case found the same session) contributes zero hours -- it must still
-    block check_training_extent, not be silently tolerated."""
-    hours = known_defect_tolerance_hours({pd.Timestamp("2025-06-13").date()})
-    assert hours == 0
-
-
-def test_known_defect_tolerance_hours_does_not_explain_a_knock_on_without_its_root() -> None:
-    """A knock-on day alone, without the defect day it chains from also
-    present in the excluded set, is not explained -- the chain must be
-    unbroken back to a documented entry."""
-    hours = known_defect_tolerance_hours({pd.Timestamp("2026-06-25").date()})
-    assert hours == 0
+    assert any("last complete renewables label day" in r for r in result.reasons)
 
 
 # ---------------------------------------------------------------------------

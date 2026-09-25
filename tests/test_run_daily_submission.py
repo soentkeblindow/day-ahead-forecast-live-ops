@@ -27,7 +27,11 @@ from energy_price_forecast.arena.live_inputs import (
     read_weather_runs,
 )
 from energy_price_forecast.arena.payload import PayloadValidationError
-from energy_price_forecast.arena.preflight import PreflightResult
+from energy_price_forecast.arena.preflight import (
+    CapacityAnchorReport,
+    PreflightResult,
+    TrainingWindowReport,
+)
 from energy_price_forecast.arena.submit import SubmissionResult
 from energy_price_forecast.data._weather_cache import cache_path, write_cached_run
 from energy_price_forecast.data.capacity import CapacitySource
@@ -42,13 +46,15 @@ from energy_price_forecast.ops.windows import LOCAL_TZ, local_day_bounds
 from scripts.run_daily_submission import (
     PRICE_TRAIN_SPAN_DAYS,
     RENEWABLES_TRAIN_SPAN_DAYS,
+    NwpAvailability,
     SubmissionOutcome,
     _silence_turns_run_red,
     accepted_earlier_today,
     build_arena_payload,
     build_price_feature_matrix,
     build_submission_record,
-    check_a_inputs,
+    check_a_global,
+    check_a_nwp,
     fit_predict_expand,
     holiday_calendar_covers_target,
     is_past_gate_closure,
@@ -62,6 +68,28 @@ from scripts.run_daily_submission import (
     source_ages_from_manifest,
     write_payload_to_repo,
 )
+
+_OK_NWP = NwpAvailability(
+    ok=True, reasons=(), anchor=CapacityAnchorReport(warning=False, days_until_expiry=999.0)
+)
+_OK_LABEL = (PreflightResult(ok=True), 0)
+
+
+def _ok_training_window(n_days: int) -> tuple[PreflightResult, TrainingWindowReport]:
+    """A passing check_training_window() result, for tests that patch
+    PRICE_TRAIN_SPAN_DAYS down to a small value for speed -- the real
+    function's MIN_TRAINING_DAYS=83 is an absolute spec constant (spec 6.9
+    section 2.6), not scaled to whatever window_days a test happens to
+    pass, so a shrunk window would otherwise always fail it for a reason
+    unrelated to what these tests actually exercise."""
+    return PreflightResult(ok=True), TrainingWindowReport(
+        n_training_days=n_days,
+        age_of_last_complete_day=0,
+        missing_days=(),
+        known_weather_defect_days=(),
+        tolerance_used=(83, 7),
+    )
+
 
 CHALLENGE = ChallengeSpec(
     challenge_id="2",
@@ -365,11 +393,18 @@ def test_holiday_calendar_does_not_cover_an_implausible_year() -> None:
 
 
 # ---------------------------------------------------------------------------
-# check_a_inputs
+# check_a_global / check_a_nwp
 # ---------------------------------------------------------------------------
 
 
-def test_check_a_inputs_assembles_reads_and_delegates_to_check_reconstruction_inputs() -> None:
+def test_check_a_global_delegates_to_check_holiday_calendar() -> None:
+    assert check_a_global(_TARGET_DAY).ok is True
+    assert check_a_global(dt.date(1500, 1, 1)).ok is False
+
+
+def test_check_a_nwp_assembles_reads_and_delegates_to_check_weather_run_and_check_capacity_anchor() -> (
+    None
+):
     fake_weather_run = pd.DataFrame({"col": [1.0]})
     fake_anchor_valid_until = pd.Timestamp("2099-01-01", tz="UTC")
 
@@ -382,27 +417,30 @@ def test_check_a_inputs_assembles_reads_and_delegates_to_check_reconstruction_in
             return_value=fake_anchor_valid_until,
         ) as mock_anchor,
         patch(
-            "scripts.run_daily_submission.check_reconstruction_inputs",
+            "scripts.run_daily_submission.check_weather_run",
             return_value=PreflightResult(ok=True),
-        ) as mock_check,
+        ) as mock_weather,
+        patch(
+            "scripts.run_daily_submission.check_capacity_anchor",
+            return_value=(
+                PreflightResult(ok=True),
+                CapacityAnchorReport(warning=False, days_until_expiry=45.0),
+            ),
+        ) as mock_anchor_check,
     ):
-        result = check_a_inputs(_TARGET_DAY)
+        result = check_a_nwp(_TARGET_DAY)
 
     assert result.ok
     mock_read.assert_called_once()
     mock_anchor.assert_called_once_with(CapacitySource.PUBLIC_REGISTRY)
-    mock_check.assert_called_once_with(
-        weather_run=fake_weather_run,
-        target_day=_TARGET_DAY,
-        anchor_valid_until=fake_anchor_valid_until,
-        holiday_calendar_covers_target=True,
-    )
+    mock_weather.assert_called_once_with(fake_weather_run)
+    mock_anchor_check.assert_called_once_with(_TARGET_DAY, fake_anchor_valid_until)
 
 
-def test_check_a_inputs_weather_root_override_actually_reads_from_it(tmp_path: Path) -> None:
+def test_check_a_nwp_weather_root_override_actually_reads_from_it(tmp_path: Path) -> None:
     """Spec 6.9 section 2.12: scripts/outage_drill.py needs to point Check A
     at a store copy instead of this machine's own local weather cache --
-    found live 2026-09-23 that check_a_inputs was the one read in the whole
+    found live 2026-09-23 that this was the one read in the whole
     pipeline not already parameterized like this. Real files on disk, no
     mocking of the read function itself, so this proves the override is
     genuinely honoured rather than just accepted and ignored. Both roots
@@ -422,12 +460,35 @@ def test_check_a_inputs_weather_root_override_actually_reads_from_it(tmp_path: P
         "scripts.run_daily_submission.anchor_table_valid_until",
         return_value=pd.Timestamp("2099-01-01", tz="UTC"),
     ):
-        result_empty = check_a_inputs(_TARGET_DAY, weather_root=empty_root)
+        result_empty = check_a_nwp(_TARGET_DAY, weather_root=empty_root)
         assert not result_empty.ok
         assert any("weather run" in r for r in result_empty.reasons)
 
-        result_populated = check_a_inputs(_TARGET_DAY, weather_root=populated_root)
+        result_populated = check_a_nwp(_TARGET_DAY, weather_root=populated_root)
         assert result_populated.ok
+
+
+def test_check_a_nwp_reports_an_expiry_warning_without_blocking() -> None:
+    """spec 6.9 section 2.3: an anchor table within CAPACITY_ANCHOR_WARN_DAYS
+    of expiry must still report ok=True (a warning, not a block) -- the
+    Pflegeversäumnis principle only turns into an actual failure once the
+    table has genuinely expired."""
+    run_init = run_init_for_target_day(_TARGET_DAY)
+
+    with (
+        patch(
+            "scripts.run_daily_submission.read_cached_run",
+            return_value=_synthetic_weather_frame(run_init),
+        ),
+        patch(
+            "scripts.run_daily_submission.anchor_table_valid_until",
+            return_value=run_init + pd.Timedelta(days=3),
+        ),
+    ):
+        result = check_a_nwp(_TARGET_DAY)
+
+    assert result.ok is True
+    assert result.anchor.warning is True
 
 
 # ---------------------------------------------------------------------------
@@ -450,11 +511,43 @@ def _fake_fold(target_day: dt.date, train_days: int = PRICE_TRAIN_SPAN_DAYS) -> 
     )
 
 
-def test_run_submission_for_day_stops_at_check_a_without_running_renewables() -> None:
+def test_run_submission_for_day_stops_at_the_global_check_without_running_renewables() -> None:
+    """spec 6.9 section 2.3/5.1 step 3: a global Check A failure (the
+    holiday calendar) is total silence before anything else runs -- not
+    even the cheap NWP checks."""
     with (
         patch(
-            "scripts.run_daily_submission.check_a_inputs",
-            return_value=PreflightResult(ok=False, reasons=("no weather run for D-1",)),
+            "scripts.run_daily_submission.check_a_global",
+            return_value=PreflightResult(ok=False, reasons=("holiday calendar gap",)),
+        ),
+        patch("scripts.run_daily_submission.check_a_nwp") as mock_nwp,
+        patch("scripts.run_daily_submission.run_renewables_step") as mock_renewables,
+    ):
+        outcome = run_submission_for_day(
+            pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), _TARGET_DAY, as_of=_AS_OF
+        )
+
+    assert outcome.candidate_selected is None
+    assert outcome.skip_reason is not None
+    assert "Check A" in outcome.skip_reason
+    assert "holiday calendar gap" in outcome.skip_reason
+    mock_nwp.assert_not_called()
+    mock_renewables.assert_not_called()
+
+
+def test_run_submission_for_day_stops_at_the_nwp_check_without_running_renewables() -> None:
+    """spec 6.9 section 2.3/5.1 step 4: today's one-row table still needs
+    the NWP reconstruction unconditionally -- unavailability here is still
+    silence (Schritt 8, before a gasfrei row exists)."""
+    with (
+        patch("scripts.run_daily_submission.check_a_global", return_value=PreflightResult(ok=True)),
+        patch(
+            "scripts.run_daily_submission.check_a_nwp",
+            return_value=NwpAvailability(
+                ok=False,
+                reasons=("weather run for D-1 00 UTC could not be loaded",),
+                anchor=CapacityAnchorReport(warning=False, days_until_expiry=45.0),
+            ),
         ),
         patch("scripts.run_daily_submission.run_renewables_step") as mock_renewables,
     ):
@@ -465,11 +558,66 @@ def test_run_submission_for_day_stops_at_check_a_without_running_renewables() ->
     assert outcome.candidate_selected is None
     assert outcome.skip_reason is not None
     assert "Check A" in outcome.skip_reason
-    assert "no weather run for D-1" in outcome.skip_reason
+    assert "weather run for D-1 00 UTC could not be loaded" in outcome.skip_reason
     mock_renewables.assert_not_called()
 
 
-def test_run_submission_for_day_stops_at_training_extent() -> None:
+def test_run_submission_for_day_logs_an_anchor_warning_without_blocking(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """spec 6.9 section 2.3: an approaching anchor expiry must surface as a
+    warning even on a run that otherwise proceeds normally."""
+    warning_anchor = CapacityAnchorReport(warning=True, days_until_expiry=10.0)
+    with (
+        patch("scripts.run_daily_submission.check_a_global", return_value=PreflightResult(ok=True)),
+        patch(
+            "scripts.run_daily_submission.check_a_nwp",
+            return_value=NwpAvailability(ok=True, reasons=(), anchor=warning_anchor),
+        ),
+        patch("scripts.run_daily_submission.check_a_renewables_labels", return_value=_OK_LABEL),
+        patch("scripts.run_daily_submission.run_renewables_step") as mock_renewables,
+    ):
+        mock_renewables.side_effect = RuntimeError("stop here, only the warning is under test")
+        with caplog.at_level("WARNING"), pytest.raises(RuntimeError):
+            run_submission_for_day(
+                pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), _TARGET_DAY, as_of=_AS_OF
+            )
+
+    assert any("capacity anchor table expires" in record.message for record in caplog.records)
+
+
+def test_run_submission_for_day_stops_at_the_renewables_label_edge_check() -> None:
+    """spec 6.9 section 2.7: a stale renewables label edge is a Check A
+    -style failure too, before the (expensive) walk-forward ever runs."""
+    with (
+        patch("scripts.run_daily_submission.check_a_global", return_value=PreflightResult(ok=True)),
+        patch("scripts.run_daily_submission.check_a_nwp", return_value=_OK_NWP),
+        patch(
+            "scripts.run_daily_submission.check_a_renewables_labels",
+            return_value=(
+                PreflightResult(
+                    ok=False, reasons=("last complete renewables label day is 9 day(s)",)
+                ),
+                9,
+            ),
+        ),
+        patch("scripts.run_daily_submission.run_renewables_step") as mock_renewables,
+    ):
+        outcome = run_submission_for_day(
+            pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), _TARGET_DAY, as_of=_AS_OF
+        )
+
+    assert outcome.candidate_selected is None
+    assert outcome.skip_reason is not None
+    assert "Check A" in outcome.skip_reason
+    assert "last complete renewables label day is 9 day(s)" in outcome.skip_reason
+    mock_renewables.assert_not_called()
+
+
+def test_run_submission_for_day_stops_at_the_training_window_check() -> None:
+    """spec 6.9 section 2.6: check_training_window replaces the former
+    check_training_extent -- a 10-day gap drops n_training_days to 80,
+    below MIN_TRAINING_DAYS=83, regardless of cause."""
     fold = _fake_fold(_TARGET_DAY)
     # Drop the first 10 training days entirely -- simulates a frozen source
     # silently shortening the window (spec section 2.4), never filled with NaN.
@@ -479,7 +627,9 @@ def test_run_submission_for_day_stops_at_training_extent() -> None:
     df = pd.DataFrame({"day_ahead_price": 50.0}, index=matrix_index)
 
     with (
-        patch("scripts.run_daily_submission.check_a_inputs", return_value=PreflightResult(ok=True)),
+        patch("scripts.run_daily_submission.check_a_global", return_value=PreflightResult(ok=True)),
+        patch("scripts.run_daily_submission.check_a_nwp", return_value=_OK_NWP),
+        patch("scripts.run_daily_submission.check_a_renewables_labels", return_value=_OK_LABEL),
         patch(
             "scripts.run_daily_submission.run_renewables_step",
             return_value=(pd.DataFrame(), 1.5),
@@ -496,19 +646,21 @@ def test_run_submission_for_day_stops_at_training_extent() -> None:
 
     assert outcome.candidate_selected is None
     assert outcome.skip_reason is not None
-    assert "training extent" in outcome.skip_reason
+    assert "training window" in outcome.skip_reason
     assert outcome.renewables_runtime_seconds == 1.5
     mock_fit.assert_not_called()
 
 
-def test_run_submission_for_day_tolerates_a_known_defect_gap_in_training_window() -> None:
-    """The real 2026-09-12 finding: a training window missing exactly the
-    hours of a documented, permanent weather defect (2026-06-24, its own
-    D-1 run_init 2026-06-23 is a KNOWN_WEATHER_DEFECTS entry) plus its
-    real knock-on (2026-06-25, no D-1 persistence-lag value) must NOT be
-    treated as a frozen source -- unlike
-    test_run_submission_for_day_stops_at_training_extent's unexplained
-    10-day gap, which must still block.
+def test_run_submission_for_day_tolerates_a_small_gap_in_the_training_window() -> None:
+    """spec 6.9 section 2.6: check_training_window's measured tolerance
+    (MIN_TRAINING_DAYS=83 of 90) naturally absorbs a small gap -- unlike
+    test_run_submission_for_day_stops_at_the_training_window_check's
+    unexplained 10-day gap, which must still block. Unlike the removed
+    known_defect_tolerance_hours(), no chain-explanation is needed: a
+    2-day gap (even one that happens to match a documented
+    KNOWN_WEATHER_DEFECTS entry, 2026-06-24/its 2026-06-25 knock-on) is
+    tolerated simply because 88 of 90 days still clears the floor, not
+    because its cause is recognised.
     """
     fold = _fake_fold(_TARGET_DAY)
     gap_days = {dt.date(2026, 6, 24), dt.date(2026, 6, 25)}
@@ -526,7 +678,9 @@ def test_run_submission_for_day_tolerates_a_known_defect_gap_in_training_window(
     }
 
     with (
-        patch("scripts.run_daily_submission.check_a_inputs", return_value=PreflightResult(ok=True)),
+        patch("scripts.run_daily_submission.check_a_global", return_value=PreflightResult(ok=True)),
+        patch("scripts.run_daily_submission.check_a_nwp", return_value=_OK_NWP),
+        patch("scripts.run_daily_submission.check_a_renewables_labels", return_value=_OK_LABEL),
         patch(
             "scripts.run_daily_submission.run_renewables_step",
             return_value=(pd.DataFrame(), 1.5),
@@ -570,7 +724,9 @@ def test_run_submission_for_day_stops_at_check_b_with_named_missing_feature() ->
     df = pd.DataFrame({"day_ahead_price": 50.0}, index=matrix_index)
 
     with (
-        patch("scripts.run_daily_submission.check_a_inputs", return_value=PreflightResult(ok=True)),
+        patch("scripts.run_daily_submission.check_a_global", return_value=PreflightResult(ok=True)),
+        patch("scripts.run_daily_submission.check_a_nwp", return_value=_OK_NWP),
+        patch("scripts.run_daily_submission.check_a_renewables_labels", return_value=_OK_LABEL),
         patch(
             "scripts.run_daily_submission.run_renewables_step",
             return_value=(pd.DataFrame(), 1.5),
@@ -603,7 +759,9 @@ def test_run_submission_for_day_stops_at_payload_plausibility() -> None:
     }
 
     with (
-        patch("scripts.run_daily_submission.check_a_inputs", return_value=PreflightResult(ok=True)),
+        patch("scripts.run_daily_submission.check_a_global", return_value=PreflightResult(ok=True)),
+        patch("scripts.run_daily_submission.check_a_nwp", return_value=_OK_NWP),
+        patch("scripts.run_daily_submission.check_a_renewables_labels", return_value=_OK_LABEL),
         patch(
             "scripts.run_daily_submission.run_renewables_step",
             return_value=(pd.DataFrame(), 1.5),
@@ -648,7 +806,9 @@ def test_run_submission_for_day_happy_path_submits_dry_run() -> None:
     fake_submission_result = SubmissionResult(sent=False, challenge_id="2")
 
     with (
-        patch("scripts.run_daily_submission.check_a_inputs", return_value=PreflightResult(ok=True)),
+        patch("scripts.run_daily_submission.check_a_global", return_value=PreflightResult(ok=True)),
+        patch("scripts.run_daily_submission.check_a_nwp", return_value=_OK_NWP),
+        patch("scripts.run_daily_submission.check_a_renewables_labels", return_value=_OK_LABEL),
         patch(
             "scripts.run_daily_submission.run_renewables_step",
             return_value=(pd.DataFrame(), 1.5),
@@ -684,6 +844,15 @@ def test_run_submission_for_day_happy_path_submits_dry_run() -> None:
     assert outcome.excluded_training_days == frozenset({dt.date(2026, 4, 20)})
     mock_submit.assert_called_once()
     assert mock_submit.call_args.kwargs["live"] is False
+    # spec 6.9 section 5.7: the protocol_version 4 fields this step (Schritt 8) computes.
+    assert outcome.nwp_available is True
+    assert outcome.capacity_anchor_days_left == 999.0
+    assert outcome.rnw_label_edge_age_days == 0
+    assert outcome.n_training_days == PRICE_TRAIN_SPAN_DAYS
+    assert outcome.age_of_last_complete_day == 0
+    assert outcome.training_tolerance_used is False
+    assert outcome.training_missing_days == ()
+    assert outcome.known_weather_defect_days == ()
 
 
 def test_run_submission_for_day_carries_commodity_staleness_warnings_through() -> None:
@@ -707,7 +876,9 @@ def test_run_submission_for_day_carries_commodity_staleness_warnings_through() -
     }
 
     with (
-        patch("scripts.run_daily_submission.check_a_inputs", return_value=PreflightResult(ok=True)),
+        patch("scripts.run_daily_submission.check_a_global", return_value=PreflightResult(ok=True)),
+        patch("scripts.run_daily_submission.check_a_nwp", return_value=_OK_NWP),
+        patch("scripts.run_daily_submission.check_a_renewables_labels", return_value=_OK_LABEL),
         patch(
             "scripts.run_daily_submission.run_renewables_step",
             return_value=(pd.DataFrame(), 1.5),
@@ -748,7 +919,7 @@ def test_run_submission_for_day_carries_commodity_staleness_warnings_through() -
 # must produce a payload with today inside the training window. Unlike the
 # other run_submission_for_day tests in this file, build_price_feature_matrix
 # and fit_predict_expand run for REAL here (not mocked) -- that is the whole
-# point: only the real features/build.py + check_training_extent + LightGBM
+# point: only the real features/build.py + check_training_window + LightGBM
 # fit path can prove today's row survives.
 #
 # Deliberately does NOT re-derive df via the real assemble_price_model_inputs
@@ -894,7 +1065,13 @@ def test_run_submission_for_day_includes_the_real_morning_state_of_today() -> No
 
     with (
         patch("scripts.run_daily_submission.PRICE_TRAIN_SPAN_DAYS", _SMALL_PRICE_TRAIN_SPAN_DAYS),
-        patch("scripts.run_daily_submission.check_a_inputs", return_value=PreflightResult(ok=True)),
+        patch("scripts.run_daily_submission.check_a_global", return_value=PreflightResult(ok=True)),
+        patch("scripts.run_daily_submission.check_a_nwp", return_value=_OK_NWP),
+        patch("scripts.run_daily_submission.check_a_renewables_labels", return_value=_OK_LABEL),
+        patch(
+            "scripts.run_daily_submission.check_training_window",
+            return_value=_ok_training_window(_SMALL_PRICE_TRAIN_SPAN_DAYS),
+        ),
         patch(
             "scripts.run_daily_submission.run_renewables_step",
             return_value=(renewables_predictions, 1.5),
@@ -981,7 +1158,13 @@ def test_run_submission_for_day_is_deterministic_on_identical_inputs() -> None:
 
     with (
         patch("scripts.run_daily_submission.PRICE_TRAIN_SPAN_DAYS", _SMALL_PRICE_TRAIN_SPAN_DAYS),
-        patch("scripts.run_daily_submission.check_a_inputs", return_value=PreflightResult(ok=True)),
+        patch("scripts.run_daily_submission.check_a_global", return_value=PreflightResult(ok=True)),
+        patch("scripts.run_daily_submission.check_a_nwp", return_value=_OK_NWP),
+        patch("scripts.run_daily_submission.check_a_renewables_labels", return_value=_OK_LABEL),
+        patch(
+            "scripts.run_daily_submission.check_training_window",
+            return_value=_ok_training_window(_SMALL_PRICE_TRAIN_SPAN_DAYS),
+        ),
         patch(
             "scripts.run_daily_submission.run_renewables_step",
             return_value=(renewables_predictions, 1.5),
@@ -1170,6 +1353,46 @@ def test_build_submission_record_reads_the_actual_payload_and_merges_staleness()
     assert record.source_ages["ttf_gas_eur_per_mwh"] == pytest.approx(5.0 * 24)
     assert record.candidate_selected == "full_live_set"
     assert record.runtime_seconds == 12.3
+
+
+def test_build_submission_record_maps_the_schritt_8_protocol_fields() -> None:
+    """spec 6.9 section 5.7: the protocol_version 4 fields
+    docs/sprint6_step6_9_log.md step 3 scaffolded as schema-only, this step
+    (Schritt 8) actually computes and threads through."""
+    manifest = _manifest({})
+    outcome = SubmissionOutcome(
+        candidate_selected=None,
+        skip_reason="training window: only 80 complete training day(s)",
+        nwp_available=True,
+        capacity_anchor_days_left=32.5,
+        rnw_label_edge_age_days=0,
+        n_training_days=80,
+        age_of_last_complete_day=0,
+        training_tolerance_used=True,
+        training_missing_days=(dt.date(2026, 6, 24), dt.date(2026, 6, 25)),
+        known_weather_defect_days=(dt.date(2026, 6, 24),),
+    )
+    as_of = pd.Timestamp("2026-07-14T10:00:00", tz="UTC")
+
+    record = build_submission_record(
+        outcome,
+        manifest,
+        target_day=_TARGET_DAY,
+        nominal_slot="10:40",
+        gate_closure_ok=True,
+        as_of=as_of,
+        runtime_seconds=1.0,
+    )
+
+    assert record.nwp_available is True
+    assert record.nwp_unavailable_reason is None
+    assert record.capacity_anchor_days_left == 32.5
+    assert record.rnw_label_edge_age_days == 0
+    assert record.n_training_days == 80
+    assert record.age_of_last_complete_day == 0
+    assert record.training_tolerance_used is True
+    assert record.training_missing_days == ["2026-06-24", "2026-06-25"]
+    assert record.known_weather_defect_days == ["2026-06-24"]
 
 
 def test_build_submission_record_for_a_skip_has_no_payload_stats() -> None:
@@ -1686,9 +1909,10 @@ def test_run_submission_for_day_completes_without_calling_any_fetch_client(
 
         with (
             patch(
-                "scripts.run_daily_submission.check_a_inputs",
-                return_value=PreflightResult(ok=True),
+                "scripts.run_daily_submission.check_a_global", return_value=PreflightResult(ok=True)
             ),
+            patch("scripts.run_daily_submission.check_a_nwp", return_value=_OK_NWP),
+            patch("scripts.run_daily_submission.check_a_renewables_labels", return_value=_OK_LABEL),
             patch(
                 "scripts.run_daily_submission.run_renewables_step",
                 return_value=(pd.DataFrame(), 1.5),
@@ -1696,6 +1920,15 @@ def test_run_submission_for_day_completes_without_calling_any_fetch_client(
             patch(
                 "scripts.run_daily_submission.build_price_feature_matrix",
                 return_value=(matrix, fold, set()),
+            ),
+            # df's own day_ahead_price is a tiny 2024-01-01 synthetic fixture (this test's
+            # point is the fetch-client guarantee, not training-window completeness) -- real
+            # coverage against the 2026 fold window is check_training_window's own dedicated
+            # tests' job (tests/test_preflight.py), so it is bypassed here like every other
+            # heavy per-day computation step in this test.
+            patch(
+                "scripts.run_daily_submission.check_training_window",
+                return_value=_ok_training_window(PRICE_TRAIN_SPAN_DAYS),
             ),
             patch(
                 "scripts.run_daily_submission.fit_predict_expand",
@@ -1760,7 +1993,9 @@ def test_run_submission_for_day_defaults_to_dry_run_without_explicit_live() -> N
         return SubmissionResult(sent=False, challenge_id=challenge.challenge_id)
 
     with (
-        patch("scripts.run_daily_submission.check_a_inputs", return_value=PreflightResult(ok=True)),
+        patch("scripts.run_daily_submission.check_a_global", return_value=PreflightResult(ok=True)),
+        patch("scripts.run_daily_submission.check_a_nwp", return_value=_OK_NWP),
+        patch("scripts.run_daily_submission.check_a_renewables_labels", return_value=_OK_LABEL),
         patch(
             "scripts.run_daily_submission.run_renewables_step",
             return_value=(pd.DataFrame(), 1.5),
@@ -1804,7 +2039,9 @@ def test_run_submission_for_day_passes_live_true_through_to_submit_when_requeste
         return SubmissionResult(sent=True, challenge_id=challenge.challenge_id, accepted=True)
 
     with (
-        patch("scripts.run_daily_submission.check_a_inputs", return_value=PreflightResult(ok=True)),
+        patch("scripts.run_daily_submission.check_a_global", return_value=PreflightResult(ok=True)),
+        patch("scripts.run_daily_submission.check_a_nwp", return_value=_OK_NWP),
+        patch("scripts.run_daily_submission.check_a_renewables_labels", return_value=_OK_LABEL),
         patch(
             "scripts.run_daily_submission.run_renewables_step",
             return_value=(pd.DataFrame(), 1.5),
@@ -1851,7 +2088,9 @@ def test_run_submission_for_day_live_with_missing_api_key_raises_never_posts(
     forecast = _quarterhourly_series(_TARGET_DAY)
 
     with (
-        patch("scripts.run_daily_submission.check_a_inputs", return_value=PreflightResult(ok=True)),
+        patch("scripts.run_daily_submission.check_a_global", return_value=PreflightResult(ok=True)),
+        patch("scripts.run_daily_submission.check_a_nwp", return_value=_OK_NWP),
+        patch("scripts.run_daily_submission.check_a_renewables_labels", return_value=_OK_LABEL),
         patch(
             "scripts.run_daily_submission.run_renewables_step",
             return_value=(pd.DataFrame(), 1.5),
@@ -1899,7 +2138,9 @@ def test_run_submission_for_day_skips_post_if_gate_closed_between_start_and_post
         raise AssertionError("submit() must not be called once the gate has closed")
 
     with (
-        patch("scripts.run_daily_submission.check_a_inputs", return_value=PreflightResult(ok=True)),
+        patch("scripts.run_daily_submission.check_a_global", return_value=PreflightResult(ok=True)),
+        patch("scripts.run_daily_submission.check_a_nwp", return_value=_OK_NWP),
+        patch("scripts.run_daily_submission.check_a_renewables_labels", return_value=_OK_LABEL),
         patch(
             "scripts.run_daily_submission.run_renewables_step",
             return_value=(pd.DataFrame(), 1.5),

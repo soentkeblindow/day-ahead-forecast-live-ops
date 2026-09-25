@@ -241,7 +241,7 @@ def read_weather_runs(
     cache miss). A target_day whose run is not cached is silently omitted,
     not an error here: features/nwp_fundamentals.py's whole-day-out policy
     (spec 6.5.3) is what turns a missing day into a skipped one downstream,
-    and arena/preflight.py::check_reconstruction_inputs is what turns a
+    and arena/preflight.py::check_weather_run is what turns a
     missing *target* day's run into a silent day at the top of a run --
     this function only assembles what is actually on disk.
 

@@ -239,7 +239,7 @@ class SubmissionRecord:
     target_day_fills: list[dict[str, Any]] = field(default_factory=list)
     downgrade_blocked: bool | None = None
     best_accepted_rank_before: int | None = None
-    capacity_anchor_days_left: int | None = None
+    capacity_anchor_days_left: float | None = None
     protocol_version: int = PROTOCOL_VERSION
 
     def to_dict(self) -> dict[str, Any]:

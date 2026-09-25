@@ -1,5 +1,5 @@
 """Preflight checks for the daily submission job (spec 6.7.2, sections
-2.1-2.6, 5.2, 5.5).
+2.1-2.6, 5.2, 5.5; restructured by spec 6.9, sections 2.3, 2.6, 2.7).
 
 Every function here is pure: no network, no file I/O (spec section 3.2 --
 "Kein Netz, keine Dateien" -- fully testable without a store or a live
@@ -9,33 +9,70 @@ already-loaded values in; a short signature sketch in the spec itself
 takes a StoreState directly, but this project's own precedent (6.7.1 A6:
 "die Kurzsignaturen der Spec sind Skizzen, keine woertlichen Vertraege")
 is to implement the fully testable, I/O-free version when the two are in
-tension, not the literal pseudocode.
+tension, not the literal pseudocode. The same precedent applies to spec
+6.9 section 5.4's check_training_window sketch, which takes a full
+Candidate: this module accepts ``required_features: frozenset[str]``
+instead, since arena/candidates.py already imports from this module --
+taking the dataclass itself would be a circular import for no benefit
+check_target_row does not already need.
 
 Two stages, and they cannot be fully upfront (spec section 2.1):
 
-- Check A (check_reconstruction_inputs) -- cheap, before any fit. Can the
-  renewables reconstruction for D even be built?
+- Check A -- cheap, before any fit. Can the renewables reconstruction for
+  D even be built? Spec 6.9 section 2.3 splits this into a **global**
+  question (check_holiday_calendar, spec section 5.1 step 3: a failure
+  here means every candidate row is unreachable, so the run is silent
+  before anything else runs) and a **per-row** question that only rows
+  needing the NWP reconstruction care about (check_weather_run,
+  check_capacity_anchor, spec section 5.1 step 4: their combined result is
+  what the caller calls ``nwp_available``). A row without an NWP
+  dependency (the still-unbuilt gasfrei fallback row, spec 6.9 section
+  2.1) is not gated by the per-row half at all.
 - Check B (check_target_row) -- after the feature matrix is built. Is the
   built row for D complete? This is the derived, not described, freshness
   check (spec section 2.2/2.3): staleness shows up as NaN exactly where
   it bites, not against a guessed per-source age table.
 
-check_training_extent guards the one failure mode neither check sees: a
+check_capacity_anchor deliberately separates an expired anchor table from
+every other Check A failure (spec 6.9 section 2.3): its own expiry
+(currently 2026-10-28, data.capacity.anchor_table_valid_until) is a
+maintenance lapse, not a data outage, and must stay visible
+(``CAPACITY_ANCHOR_WARN_DAYS`` warning window) well before it can ever
+block a run -- callers should treat its ``warning``/expiry state as
+something to surface regardless of whether Check A as a whole passes.
+
+check_training_window guards the one failure mode neither check sees: a
 frozen source that silently shortens the training window's recent end
 with no NaN anywhere (spec section 2.4 -- happened for real on
-2026-09-11, see docs/sprint6_step6_7_1a_log.md). Its own zero-tolerance
-row-count band would otherwise permanently block every training window
-touching a documented, permanent gap (data.weather_grid.KNOWN_WEATHER_DEFECTS)
--- found live during the 6.7.2 wiring probe (2026-09-12): the 90-day window
-for 2026-09-11 failed here purely because of the already-known 2026-06-23
-corrupt weather run and its 2026-06-25 persistence-lag knock-on, both
-already tracked, neither a new anomaly. known_defect_tolerance_hours()
-extends the band by exactly the hours a documented defect (or a knock-on
-chain rooted in one) explains -- never a blanket allowance for any
-excluded day, which would mask a genuinely new, undocumented gap the same
-way this check's zero-tolerance design exists to catch (the 2025-06-13
-local-cache gap found the same session is exactly that kind of case, and
-must still block).
+2026-09-11, see docs/sprint6_step6_7_1a_log.md). It replaces the former
+check_training_extent's exact row-count band with measured tolerances
+(spec 6.9 section 2.6): a training day counts only if every required
+feature cell AND the (post-coalesce) price label are present for all of
+that day's local hours, and the two thresholds
+(``MIN_TRAINING_DAYS``/``MAX_TRAINING_EDGE_AGE_DAYS``) are checked
+against that day-level count rather than an hour-count band. The former
+known_defect_tolerance_hours() and its recursive chain-explanation logic
+are removed rather than patched -- that recursion is the real, root
+cause of the 2026-09-22 training-extent chain bug (docs/bugs_in_live_
+system.md section 1, closed by this change): it broke whenever a chain's
+own root defect day rolled out of the training window while a day
+depending on it was still inside. data.weather_grid.KNOWN_WEATHER_DEFECTS
+still has a place here, but purely as a reporting cross-reference
+(``TrainingWindowReport.known_weather_defect_days``, a simple
+intersection with the missing days found) -- it grants no tolerance of
+its own any more.
+
+check_renewables_label_edge_age (spec 6.9 section 2.7) is a second,
+narrower edge-age guard, not a generalisation of check_training_window:
+it asks whether the renewables reconstruction's own 14.1.D training
+labels (evaluation.renewables_walkforward.TARGET_COLUMNS -- read, not
+imported for modification, so this stays inside spec section 3.3's "models/,
+evaluation/ unverändert" boundary) reach close enough to be usable at all.
+Deliberately NOT an extension of run_renewables_backtest's own 365-day
+rolling window check (there isn't one -- see this spec step's own log,
+Schritt 1 point 4): that gap is explicitly out of this spec's scope.
+MAX_RNW_LABEL_EDGE_AGE_DAYS is NOT measured (spec section 2.7 says so
+explicitly), unlike check_training_window's two constants.
 
 The remaining functions implement the three-layer defence against a
 plausible-looking, wrong result (spec section 2.6): capacity-factor
@@ -56,6 +93,7 @@ from __future__ import annotations
 import datetime as dt
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Final
 
 import pandas as pd
 
@@ -63,6 +101,21 @@ from energy_price_forecast.data.loaders import COMMODITY_STALENESS_WARN_DAYS
 from energy_price_forecast.data.weather_client import run_init_for_target_day
 from energy_price_forecast.data.weather_grid import KNOWN_WEATHER_DEFECTS
 from energy_price_forecast.ops.store import validate_weather_run
+from energy_price_forecast.ops.windows import LOCAL_TZ, local_day_bounds
+
+# spec 6.9 section 2.6: replaces the former check_training_extent's exact
+# row-count band. Not derived from KNOWN_WEATHER_DEFECTS or any other
+# measurement -- MIN_TRAINING_DAYS is simply "83 of the nominal 90",
+# MAX_TRAINING_EDGE_AGE_DAYS mirrors the k=7 already used informally
+# before this step (Messung B).
+MIN_TRAINING_DAYS: Final[int] = 83
+MAX_TRAINING_EDGE_AGE_DAYS: Final[int] = 7
+
+# spec 6.9 section 2.3: a Pflegeversäumnis warning window, not a measurement.
+CAPACITY_ANCHOR_WARN_DAYS: Final[float] = 14
+
+# spec 6.9 section 2.7: explicitly NOT measured (unlike the two constants above).
+MAX_RNW_LABEL_EDGE_AGE_DAYS: Final[int] = 7
 
 
 @dataclass(frozen=True)
@@ -81,58 +134,95 @@ class PreflightResult:
     missing_features: tuple[str, ...] = ()
 
 
-def check_reconstruction_inputs(
-    *,
-    weather_run: pd.DataFrame | None,
+def check_holiday_calendar(
+    *, target_day: dt.date, holiday_calendar_covers_target: bool
+) -> PreflightResult:
+    """spec 6.9 section 2.3, row 1 -- the one Check A question that applies
+    to every candidate row alike (spec section 5.1 step 3). A failure here
+    means total silence before anything else runs: no row can recover from
+    a holiday-calendar gap, since every candidate's calendar feature
+    depends on it. The one calendar input that can go wrong silently: a
+    table that ends turns a real holiday into an ordinary weekday with no
+    NaN and no error.
+    """
+    if not holiday_calendar_covers_target:
+        return PreflightResult(
+            ok=False, reasons=(f"holiday calendar does not cover target day {target_day}",)
+        )
+    return PreflightResult(ok=True)
+
+
+def check_weather_run(weather_run: pd.DataFrame | None) -> PreflightResult:
+    """spec 6.9 section 2.3, row 2 -- only candidate rows that need the NWP
+    reconstruction are gated by this (today, the only row; spec section
+    2.1's future gasfrei row will not be).
+
+    Reuses ops.store.validate_weather_run() (spec section 2.6 layer 1) --
+    the same function that would have caught the real
+    HTTP-200-but-all-NaN weather file found in 6.7.1 A9.
+    ``weather_run=None`` means the caller could not load it at all
+    (missing file, or a raised WeatherRunUnavailable) -- itself a failure
+    here, not a separate case to special-case.
+    """
+    if weather_run is None:
+        return PreflightResult(
+            ok=False, reasons=("weather run for D-1 00 UTC could not be loaded",)
+        )
+    weather_result = validate_weather_run(weather_run)
+    if not weather_result.ok:
+        return PreflightResult(
+            ok=False,
+            reasons=(
+                f"weather run for D-1 00 UTC failed validation: {'; '.join(weather_result.reasons)}",
+            ),
+        )
+    return PreflightResult(ok=True)
+
+
+@dataclass(frozen=True)
+class CapacityAnchorReport:
+    """spec 6.9 section 2.3: split out from PreflightResult because an
+    expired anchor table is a maintenance lapse, not a data outage -- its
+    ``warning``/``days_until_expiry`` state should stay visible to a
+    caller well before ``ok`` ever turns False, and unlike an ordinary
+    Check A failure it must not quietly disappear into whatever fallback
+    a later row provides (see run_daily_submission.py's own handling)."""
+
+    warning: bool
+    days_until_expiry: float
+
+
+def check_capacity_anchor(
     target_day: dt.date,
     anchor_valid_until: pd.Timestamp,
-    holiday_calendar_covers_target: bool,
-) -> PreflightResult:
-    """Cheap gate before any fitting happens (spec section 2.1).
+    *,
+    warn_days: float = CAPACITY_ANCHOR_WARN_DAYS,
+) -> tuple[PreflightResult, CapacityAnchorReport]:
+    """spec 6.9 section 2.3, row 3 -- is the capacity anchor table still
+    valid for this run_init, i.e. is ``anchor_valid_until`` beyond it?
+    Past that boundary the capacity denominator is extrapolated beyond its
+    documented limit (currently 2026-10-28,
+    data.capacity.anchor_table_valid_until).
 
-    Three binary questions, no guessed thresholds:
-
-    1. Is the 00 UTC run of D-1 present AND does it pass
-       ops.store.validate_weather_run()? Reusing that function is the
-       point (spec section 2.6 layer 1) -- it is what would have caught
-       the real HTTP-200-but-all-NaN weather file found in 6.7.1 A9.
-       ``weather_run=None`` means the caller could not load it at all
-       (missing file, or a raised WeatherRunUnavailable) -- itself a
-       failure here, not a separate case to special-case.
-    2. Is the capacity anchor table still valid for this run_init, i.e.
-       is ``anchor_valid_until`` beyond it? Past that boundary the
-       capacity denominator is extrapolated beyond its documented limit
-       (currently 2026-10-28, data.capacity.anchor_table_valid_until).
-    3. Does the holiday source cover the target day (spec section 2.11)?
-       The one calendar input that can go wrong silently: a table that
-       ends turns a real holiday into an ordinary weekday with no NaN and
-       no error.
-
-    Returns a result rather than raising: a failure here is a silent day,
-    an expected operating state, not an error (spec section 2.7).
+    Returns both a PreflightResult (``ok=False`` only once actually
+    expired) and a CapacityAnchorReport carrying the warning state, so a
+    caller can log the approaching-expiry warning independently of
+    whether this check currently blocks anything.
     """
-    reasons: list[str] = []
-
-    if weather_run is None:
-        reasons.append("weather run for D-1 00 UTC could not be loaded")
-    else:
-        weather_result = validate_weather_run(weather_run)
-        if not weather_result.ok:
-            reasons.append(
-                f"weather run for D-1 00 UTC failed validation: {'; '.join(weather_result.reasons)}"
-            )
-
     run_init = run_init_for_target_day(target_day)
-    if run_init >= anchor_valid_until:
-        reasons.append(
+    days_until_expiry = (anchor_valid_until - run_init) / pd.Timedelta(days=1)
+    expired = run_init >= anchor_valid_until
+    warning = (not expired) and days_until_expiry <= warn_days
+    reasons: tuple[str, ...] = ()
+    if expired:
+        reasons = (
             f"capacity anchor table not valid for run_init {run_init} "
-            f"(valid until {anchor_valid_until})"
+            f"(valid until {anchor_valid_until})",
         )
-
-    if not holiday_calendar_covers_target:
-        reasons.append(f"holiday calendar does not cover target day {target_day}")
-
-    return PreflightResult(ok=not reasons, reasons=tuple(reasons))
+    return (
+        PreflightResult(ok=not expired, reasons=reasons),
+        CapacityAnchorReport(warning=warning, days_until_expiry=days_until_expiry),
+    )
 
 
 def check_target_row(
@@ -163,95 +253,172 @@ def check_target_row(
     return PreflightResult(ok=True)
 
 
-def known_defect_tolerance_hours(excluded_days: Sequence[dt.date] | set[dt.date]) -> int:
-    """Hours of extra tolerance check_training_extent's row-count band
-    should grant for training days already excluded by the whole-day-out
-    policy AND already explained by a documented, permanent gap (spec
-    2.4's own extent check would otherwise block every window touching
-    one of these forever -- found live 2026-09-12, see this module's
-    check_training_extent docstring).
-
-    A day is explained if either its own D-1 run_init is a
-    data.weather_grid.KNOWN_WEATHER_DEFECTS entry, or it is a knock-on of
-    an immediately preceding day that is itself explained (the observed
-    real chain: the 2026-06-23 corrupt run excludes delivery day
-    2026-06-24, which then starves 2026-06-25's own persistence-lag
-    feature of a D-1 value, excluding it too, with no weather defect of
-    its own).
-
-    Deliberately NOT a blanket allowance for any excluded day -- an
-    excluded day whose chain never reaches a documented entry (e.g. the
-    2025-06-13 local-cache gap found the same session, an operational
-    hole, not a provider defect) contributes zero hours here and still
-    trips check_training_extent, exactly as intended.
-    """
-    excluded = set(excluded_days)
-
-    def _explained(day: dt.date) -> bool:
-        run_init = pd.Timestamp(day - dt.timedelta(days=1), tz="UTC")
-        if run_init in KNOWN_WEATHER_DEFECTS:
-            return True
-        previous_day = day - dt.timedelta(days=1)
-        return previous_day in excluded and _explained(previous_day)
-
-    return sum(24 for day in excluded if _explained(day))
+def _local_hours(day: dt.date) -> pd.DatetimeIndex:
+    """The exact UTC hourly index for one Europe/Berlin calendar day --
+    23/24/25 hours across DST, the same boundary convention
+    ops.windows.local_day_bounds/features.build already use (spec 6.9
+    section 2.6: a training day's completeness is judged hour by hour, so
+    a 23-hour spring-forward day must not look one hour short)."""
+    start, end = local_day_bounds(day)
+    return pd.date_range(start.tz_convert("UTC"), end.tz_convert("UTC"), freq="h", inclusive="left")
 
 
-def check_training_extent(
+def _is_day_complete(day: dt.date, frame: pd.DataFrame, columns: Sequence[str]) -> bool:
+    """Every one of ``columns`` is present and non-NaN for every local
+    hour of ``day`` -- a day missing from ``frame``'s index entirely
+    reindexes to all-NaN rows here, so it fails the same way a day with a
+    genuine NaN gap does (spec 6.9 section 2.6/2.7: the whole-day-out
+    policy and a frozen source both look identical from this function's
+    point of view, which is the point)."""
+    hours = _local_hours(day)
+    if not columns:
+        return True
+    return not frame.reindex(index=hours, columns=list(columns)).isna().any().any()
+
+
+@dataclass(frozen=True)
+class TrainingWindowReport:
+    """spec 6.9 section 2.6/5.4: returned alongside a PreflightResult on
+    both pass and failure (unlike PreflightResult's own reasons-only-on-
+    failure convention), since the protocol/run-summary need these
+    numbers regardless of outcome (spec section 5.7)."""
+
+    n_training_days: int
+    age_of_last_complete_day: int
+    missing_days: tuple[dt.date, ...]
+    known_weather_defect_days: tuple[dt.date, ...]
+    tolerance_used: tuple[int, int]
+
+
+def check_training_window(
     features: pd.DataFrame,
+    labels: pd.Series,
+    required_features: frozenset[str],
     *,
-    expected_days: int,
     must_reach: dt.date,
-    tolerated_missing_hours: int = 0,
-    tz: str = "Europe/Berlin",
-) -> PreflightResult:
-    """The training window must reach as far as it should and carry the
-    expected number of rows (spec section 2.4).
+    window_days: int,
+    min_training_days: int = MIN_TRAINING_DAYS,
+    max_edge_age_days: int = MAX_TRAINING_EDGE_AGE_DAYS,
+) -> tuple[PreflightResult, TrainingWindowReport]:
+    """Measured tolerances instead of an exact row count (spec 6.9 section
+    2.6), replacing the former check_training_extent.
 
-    Guards the one failure mode check_target_row cannot see: a frozen
-    source silently shortens the window's recent end with no NaN
-    anywhere. Happened for real on 2026-09-11 (a carried-column
-    validation failure froze `generation`, pre-6.7.1a) -- a 90-day window
-    that quietly became 85 days would have trained without a single NaN
-    to show for it.
+    A calendar day (Europe/Berlin) in the ``window_days``-day window
+    ending at ``must_reach`` counts as a complete training day only if
+    every cell of every column in ``required_features`` AND ``labels``
+    (the post-coalesce price series, spec section 2.6: "das Preis-Label
+    nach Zusammenführung") are present for all of that day's local hours.
+    A column in ``features`` that is not in ``required_features`` is never
+    consulted -- a NaN there does not count against the day.
 
-    Two numbers, not a second full inspection (spec section 2.4): does
-    the window's last local day reach ``must_reach``, and is the row
-    count within a DST-tolerant band of ``expected_days * 24`` (a
-    difference of more than 2 hours cannot be explained by a single DST
-    transition inside the window and means real rows are missing) --
-    widened by ``tolerated_missing_hours`` (the caller's own
-    known_defect_tolerance_hours() result) for training days already
-    excluded and already explained by a documented, permanent gap.
+    ``n_training_days`` is the count of such complete days.
+    ``age_of_last_complete_day`` is 0 when ``must_reach`` itself is
+    complete, otherwise the number of days back from ``must_reach`` to the
+    first complete day found (capped at the window's own start if none
+    is found inside it). The rule (spec section 2.6): ``n_training_days >=
+    min_training_days`` AND ``age_of_last_complete_day <=
+    max_edge_age_days``; a violation fails this candidate.
 
-    ``expected_days``/``must_reach`` are read from the feature
-    configuration and the run's own calendar by the caller, never set
-    here (spec section 2.4: "aus der Konfiguration abzulesen").
+    ``known_weather_defect_days`` is a simple intersection of the missing
+    days with data.weather_grid.KNOWN_WEATHER_DEFECTS (matched on each
+    missing day's own D-1 00 UTC run_init) -- reporting only, grants no
+    tolerance (spec section 2.6: "nur im Bericht").
     """
-    index = pd.DatetimeIndex(features.index)
-    local_days = index.tz_convert(tz).normalize().unique()
-    max_day = local_days.max().date()
-    n_rows = len(features)
-    expected_rows_nominal = expected_days * 24
+    window_start = must_reach - dt.timedelta(days=window_days - 1)
+    all_days = [window_start + dt.timedelta(days=i) for i in range(window_days)]
+    required_sorted = sorted(required_features)
+
+    def _complete(day: dt.date) -> bool:
+        if not _is_day_complete(day, features, required_sorted):
+            return False
+        return not labels.reindex(_local_hours(day)).isna().any()
+
+    complete = {day: _complete(day) for day in all_days}
+    n_training_days = sum(complete.values())
+    missing_days = tuple(day for day in all_days if not complete[day])
+
+    age = 0
+    cursor = must_reach
+    while cursor >= window_start and not complete.get(cursor, False):
+        age += 1
+        cursor -= dt.timedelta(days=1)
+    if cursor < window_start:
+        age = (must_reach - window_start).days + 1
+
+    known_weather_defect_days = tuple(
+        day
+        for day in missing_days
+        if pd.Timestamp(day - dt.timedelta(days=1), tz="UTC") in KNOWN_WEATHER_DEFECTS
+    )
 
     reasons: list[str] = []
-    if max_day < must_reach:
+    if n_training_days < min_training_days:
         reasons.append(
-            f"training window ends at {max_day}, but must reach {must_reach} -- "
-            "a source may have silently frozen (the real 2026-09-11 incident this "
-            "check exists for)"
+            f"only {n_training_days} complete training day(s) in the {window_days}-day window "
+            f"ending {must_reach}, need >= {min_training_days}"
         )
-    if abs(n_rows - expected_rows_nominal) > 2 + tolerated_missing_hours:
-        extra = (
-            f", +{tolerated_missing_hours}h for known weather defects"
-            if tolerated_missing_hours
-            else ""
-        )
+    if age > max_edge_age_days:
         reasons.append(
-            f"training window has {n_rows} row(s), expected ~{expected_rows_nominal} "
-            f"for a {expected_days}-day window (tolerance: 2h, one DST transition{extra})"
+            f"last complete training day is {age} day(s) before {must_reach}, "
+            f"exceeds {max_edge_age_days}"
         )
-    return PreflightResult(ok=not reasons, reasons=tuple(reasons))
+
+    report = TrainingWindowReport(
+        n_training_days=n_training_days,
+        age_of_last_complete_day=age,
+        missing_days=missing_days,
+        known_weather_defect_days=known_weather_defect_days,
+        tolerance_used=(min_training_days, max_edge_age_days),
+    )
+    return PreflightResult(ok=not reasons, reasons=tuple(reasons)), report
+
+
+def check_renewables_label_edge_age(
+    target_hourly: pd.DataFrame,
+    *,
+    must_reach: dt.date,
+    max_edge_age_days: int = MAX_RNW_LABEL_EDGE_AGE_DAYS,
+) -> tuple[PreflightResult, int]:
+    """spec 6.9 section 2.7: whether the renewables reconstruction's own
+    14.1.D training labels (``target_hourly``'s columns -- the caller
+    passes evaluation.renewables_walkforward.TARGET_COLUMNS's values,
+    read not imported for modification) reach close enough to
+    ``must_reach`` for the walk-forward to have anything current to train
+    on. Cheap (only reads already-in-memory actuals), so it runs before
+    the walk-forward itself is attempted (spec section 5.1 step 5), the
+    same "gate before the expensive work" shape as check_weather_run/
+    check_capacity_anchor.
+
+    A day is a complete label day when every one of ``target_hourly``'s
+    columns is non-NaN for all of that day's local hours -- the same
+    day-completeness definition as check_training_window's, applied to
+    the raw actuals instead of a built feature matrix. Scans backward
+    from ``must_reach``.
+
+    ``MAX_RNW_LABEL_EDGE_AGE_DAYS`` is explicitly NOT measured (spec
+    section 2.7), unlike check_training_window's two constants.
+    """
+    columns = list(target_hourly.columns)
+    earliest_day = (
+        pd.DatetimeIndex(target_hourly.index).tz_convert(LOCAL_TZ).normalize().min().date()
+    )
+
+    age = 0
+    cursor = must_reach
+    while cursor >= earliest_day and not _is_day_complete(cursor, target_hourly, columns):
+        age += 1
+        cursor -= dt.timedelta(days=1)
+    if cursor < earliest_day:
+        age = (must_reach - earliest_day).days + 1
+
+    ok = age <= max_edge_age_days
+    reasons: tuple[str, ...] = ()
+    if not ok:
+        reasons = (
+            f"last complete renewables label day is {age} day(s) before {must_reach}, "
+            f"exceeds MAX_RNW_LABEL_EDGE_AGE_DAYS={max_edge_age_days}",
+        )
+    return PreflightResult(ok=ok, reasons=reasons), age
 
 
 def check_capacity_factor_bounds(capacity_factor: pd.Series) -> PreflightResult:
