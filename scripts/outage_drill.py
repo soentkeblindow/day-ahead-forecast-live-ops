@@ -45,13 +45,15 @@ from typing import Any, Final
 import pandas as pd
 
 from energy_price_forecast.arena.live_inputs import (
+    DEFAULT_WEATHER_MODEL,
     assemble_price_model_inputs,
     price_provenance_report,
     read_quarterhourly_prices,
     read_weather_runs,
 )
 from energy_price_forecast.config import PROJECT_ROOT
-from energy_price_forecast.data._weather_cache import CACHE_ROOT
+from energy_price_forecast.data._weather_cache import CACHE_ROOT, cache_path
+from energy_price_forecast.data.weather_client import run_init_for_target_day
 from energy_price_forecast.ops import store
 from energy_price_forecast.ops.protocol import append_submission_record
 from energy_price_forecast.ops.store_sources import (
@@ -133,10 +135,10 @@ def _scenario_load_missing(copied: CopiedStore, target_day: dt.date) -> None:
     over via the Similar-Day-Patch (arena/load_patch.py).
     """
     load_source = next(s for s in copied.entsoe_sources if s.name == "load")
-    cache_path = (
+    load_cache_path = (
         load_source.cache_dir / f"DE_LU_{target_day.year:04d}-{target_day.month:02d}.parquet"
     )
-    df = pd.read_parquet(cache_path)
+    df = pd.read_parquet(load_cache_path)
     index = pd.DatetimeIndex(df.index)
     if index.tz is None:
         index = index.tz_localize("UTC")
@@ -144,12 +146,30 @@ def _scenario_load_missing(copied: CopiedStore, target_day: dt.date) -> None:
     start, end = local_day_bounds(target_day)
     mask = (index >= start.tz_convert("UTC")) & (index < end.tz_convert("UTC"))
     df.loc[mask, "load_forecast_day_ahead"] = float("nan")
-    df.to_parquet(cache_path)
+    df.to_parquet(load_cache_path)
+
+
+def _scenario_weather_missing(copied: CopiedStore, target_day: dt.date) -> None:
+    """Spec section 6.3's "Wetterlauf für D entfernt" drill (pulled forward
+    to this step for the same reason _scenario_load_missing was, see its
+    own docstring): deletes the D-1 00 UTC weather run file from the copied
+    store -- read_cached_run returns None for a missing file, check_a_nwp
+    treats that as a Check A NWP failure, so both row 1 (core_gas) and row
+    2 (core_gas_loadpatch) are unreachable (both require_nwp) and row 3
+    (base, no NWP dependency at all) is the only one left standing. Exists
+    to prove row 3's own build/fit/predict/payload path -- never exercised
+    by the "none" or "load_missing" scenarios, both of which resolve at
+    rank 1 or 2 -- actually works end to end against real data.
+    """
+    run_init = run_init_for_target_day(target_day)
+    path = cache_path(run_init, DEFAULT_WEATHER_MODEL, root=copied.weather_root)
+    path.unlink()
 
 
 SCENARIOS: Final[dict[str, ScenarioFn]] = {
     "none": _scenario_none,
     "load_missing": _scenario_load_missing,
+    "weather_missing": _scenario_weather_missing,
 }
 
 
