@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from energy_price_forecast.arena.candidates import Candidate, FeatureGroup, GapPolicy
 from energy_price_forecast.arena.catalog import ChallengeSpec
 from energy_price_forecast.arena.live_inputs import (
     DEFAULT_WEATHER_MODEL,
@@ -66,6 +67,7 @@ from scripts.run_daily_submission import (
     run_submission_for_day,
     smoke_target_day,
     source_ages_from_manifest,
+    target_day_fold,
     write_payload_to_repo,
 )
 
@@ -215,11 +217,12 @@ def _hourly_price_df(start: str, end_exclusive: pd.Timestamp) -> pd.DataFrame:
 def test_build_price_feature_matrix_covers_training_window_and_target_day() -> None:
     df = _hourly_price_df("2026-01-01", pd.Timestamp(_TARGET_DAY, tz="UTC") + pd.Timedelta(days=1))
     renewables_predictions = pd.DataFrame()
+    fold = target_day_fold(df, _TARGET_DAY)
 
     with patch(
         "scripts.run_daily_submission.build_feature_set_for_day", side_effect=_fake_feature_row
     ) as mock_builder:
-        matrix, fold, excluded = build_price_feature_matrix(df, renewables_predictions, _TARGET_DAY)
+        matrix, excluded = build_price_feature_matrix(df, renewables_predictions, _TARGET_DAY, fold)
 
     assert fold.delivery_day.date() == _TARGET_DAY
     assert excluded == set()
@@ -235,6 +238,7 @@ def test_build_price_feature_matrix_excludes_a_day_with_incomplete_reconstructio
     df = _hourly_price_df("2026-01-01", pd.Timestamp(_TARGET_DAY, tz="UTC") + pd.Timedelta(days=1))
     renewables_predictions = pd.DataFrame()
     bad_day = _TARGET_DAY - dt.timedelta(days=5)
+    fold = target_day_fold(df, _TARGET_DAY)
 
     def builder_with_one_bad_day(
         day: dt.date, df_arg: pd.DataFrame, renewables_arg: pd.DataFrame
@@ -247,7 +251,7 @@ def test_build_price_feature_matrix_excludes_a_day_with_incomplete_reconstructio
         "scripts.run_daily_submission.build_feature_set_for_day",
         side_effect=builder_with_one_bad_day,
     ):
-        matrix, fold, excluded = build_price_feature_matrix(df, renewables_predictions, _TARGET_DAY)
+        matrix, excluded = build_price_feature_matrix(df, renewables_predictions, _TARGET_DAY, fold)
 
     assert excluded == {bad_day}
     first_train_day = fold.train_index.tz_convert(LOCAL_TZ).normalize().min().date()
@@ -265,12 +269,13 @@ def test_build_price_feature_matrix_excludes_a_day_with_incomplete_reconstructio
 def test_fit_predict_expand_returns_a_full_quarterhourly_day() -> None:
     df = _hourly_price_df("2026-01-01", pd.Timestamp(_TARGET_DAY, tz="UTC") + pd.Timedelta(days=1))
     renewables_predictions = pd.DataFrame()
+    fold = target_day_fold(df, _TARGET_DAY)
 
     with patch(
         "scripts.run_daily_submission.build_feature_set_for_day", side_effect=_fake_feature_row
     ):
-        matrix, fold, _excluded = build_price_feature_matrix(
-            df, renewables_predictions, _TARGET_DAY
+        matrix, _excluded = build_price_feature_matrix(
+            df, renewables_predictions, _TARGET_DAY, fold
         )
 
     # 30 days of quarter-hourly history ending the day before target_day --
@@ -308,12 +313,13 @@ def test_fit_predict_expand_drops_a_training_day_with_missing_price() -> None:
     gap_end = gap_start + pd.Timedelta(hours=24)
     df.loc[(df.index >= gap_start) & (df.index < gap_end), "day_ahead_price"] = float("nan")
     renewables_predictions = pd.DataFrame()
+    fold = target_day_fold(df, _TARGET_DAY)
 
     with patch(
         "scripts.run_daily_submission.build_feature_set_for_day", side_effect=_fake_feature_row
     ):
-        matrix, fold, _excluded = build_price_feature_matrix(
-            df, renewables_predictions, _TARGET_DAY
+        matrix, _excluded = build_price_feature_matrix(
+            df, renewables_predictions, _TARGET_DAY, fold
         )
 
     qh_start = pd.Timestamp(_TARGET_DAY, tz="UTC") - pd.Timedelta(days=30)
@@ -511,6 +517,27 @@ def _fake_fold(target_day: dt.date, train_days: int = PRICE_TRAIN_SPAN_DAYS) -> 
     )
 
 
+def _one_row_ladder(required: frozenset[str] = frozenset({"feat_a"})) -> tuple[Candidate, ...]:
+    """A single-row, rank-1, NWP-dependent ladder standing in for the real
+    three_row_ladder() (spec 6.9 section 5.2) -- used by tests that mock
+    scripts.run_daily_submission.build_ladder to isolate run_submission_for_
+    day's own orchestration from the real per-group column derivation
+    (build_calendar_features/build_price_lags/build_commodity_features),
+    which needs a much more complete ``df`` than these tests otherwise
+    build. arena/candidates.py's own test suite (tests/test_candidates.py)
+    covers the real three_row_ladder()'s own shape."""
+    return (
+        Candidate(
+            name="core_gas",
+            rank=1,
+            groups=(FeatureGroup("all", required, GapPolicy.STRICT),),
+            requires_nwp=True,
+            load_source="entsoe",
+            measured_as="test",
+        ),
+    )
+
+
 def test_run_submission_for_day_stops_at_the_global_check_without_running_renewables() -> None:
     """spec 6.9 section 2.3/5.1 step 3: a global Check A failure (the
     holiday calendar) is total silence before anything else runs -- not
@@ -536,9 +563,15 @@ def test_run_submission_for_day_stops_at_the_global_check_without_running_renewa
 
 
 def test_run_submission_for_day_stops_at_the_nwp_check_without_running_renewables() -> None:
-    """spec 6.9 section 2.3/5.1 step 4: today's one-row table still needs
-    the NWP reconstruction unconditionally -- unavailability here is still
-    silence (Schritt 8, before a gasfrei row exists)."""
+    """spec 6.9 section 2.3/5.1 step 4/7a: NWP unavailable means rows 1/2
+    are skipped without ever running the renewables step -- but (unlike
+    Schritt 8) this is no longer automatically total silence, since row 3
+    (gasfrei, no NWP dependency) is still tried. With only a one-row,
+    NWP-dependent ladder in play (build_ladder mocked, see _one_row_ladder's
+    own docstring), that row fails and the run IS silent here -- the
+    real three-row ladder's own row-3 fallback is covered by the dedicated
+    fallback tests below."""
+    fold = _fake_fold(_TARGET_DAY)
     with (
         patch("scripts.run_daily_submission.check_a_global", return_value=PreflightResult(ok=True)),
         patch(
@@ -550,6 +583,8 @@ def test_run_submission_for_day_stops_at_the_nwp_check_without_running_renewable
             ),
         ),
         patch("scripts.run_daily_submission.run_renewables_step") as mock_renewables,
+        patch("scripts.run_daily_submission.target_day_fold", return_value=fold),
+        patch("scripts.run_daily_submission.build_ladder", return_value=_one_row_ladder()),
     ):
         outcome = run_submission_for_day(
             pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), _TARGET_DAY, as_of=_AS_OF
@@ -557,7 +592,7 @@ def test_run_submission_for_day_stops_at_the_nwp_check_without_running_renewable
 
     assert outcome.candidate_selected is None
     assert outcome.skip_reason is not None
-    assert "Check A" in outcome.skip_reason
+    assert "NWP unavailable" in outcome.skip_reason
     assert "weather run for D-1 00 UTC could not be loaded" in outcome.skip_reason
     mock_renewables.assert_not_called()
 
@@ -568,6 +603,7 @@ def test_run_submission_for_day_logs_an_anchor_warning_without_blocking(
     """spec 6.9 section 2.3: an approaching anchor expiry must surface as a
     warning even on a run that otherwise proceeds normally."""
     warning_anchor = CapacityAnchorReport(warning=True, days_until_expiry=10.0)
+    fold = _fake_fold(_TARGET_DAY)
     with (
         patch("scripts.run_daily_submission.check_a_global", return_value=PreflightResult(ok=True)),
         patch(
@@ -576,6 +612,7 @@ def test_run_submission_for_day_logs_an_anchor_warning_without_blocking(
         ),
         patch("scripts.run_daily_submission.check_a_renewables_labels", return_value=_OK_LABEL),
         patch("scripts.run_daily_submission.run_renewables_step") as mock_renewables,
+        patch("scripts.run_daily_submission.target_day_fold", return_value=fold),
     ):
         mock_renewables.side_effect = RuntimeError("stop here, only the warning is under test")
         with caplog.at_level("WARNING"), pytest.raises(RuntimeError):
@@ -587,11 +624,15 @@ def test_run_submission_for_day_logs_an_anchor_warning_without_blocking(
 
 
 def test_run_submission_for_day_stops_at_the_renewables_label_edge_check() -> None:
-    """spec 6.9 section 2.7: a stale renewables label edge is a Check A
-    -style failure too, before the (expensive) walk-forward ever runs."""
+    """spec 6.9 section 2.7: a stale renewables label edge fails rows 1/2
+    without ever running the (expensive) walk-forward -- same "only a
+    one-row ladder in play" scoping as the NWP test above."""
+    fold = _fake_fold(_TARGET_DAY)
     with (
         patch("scripts.run_daily_submission.check_a_global", return_value=PreflightResult(ok=True)),
         patch("scripts.run_daily_submission.check_a_nwp", return_value=_OK_NWP),
+        patch("scripts.run_daily_submission.target_day_fold", return_value=fold),
+        patch("scripts.run_daily_submission.build_ladder", return_value=_one_row_ladder()),
         patch(
             "scripts.run_daily_submission.check_a_renewables_labels",
             return_value=(
@@ -609,7 +650,7 @@ def test_run_submission_for_day_stops_at_the_renewables_label_edge_check() -> No
 
     assert outcome.candidate_selected is None
     assert outcome.skip_reason is not None
-    assert "Check A" in outcome.skip_reason
+    assert "NWP unavailable" in outcome.skip_reason
     assert "last complete renewables label day is 9 day(s)" in outcome.skip_reason
     mock_renewables.assert_not_called()
 
@@ -634,9 +675,18 @@ def test_run_submission_for_day_stops_at_the_training_window_check() -> None:
             "scripts.run_daily_submission.run_renewables_step",
             return_value=(pd.DataFrame(), 1.5),
         ),
+        patch("scripts.run_daily_submission.target_day_fold", return_value=fold),
+        patch(
+            "scripts.run_daily_submission.nwp_group_columns_for_day",
+            return_value=(frozenset(), frozenset()),
+        ),
+        patch(
+            "scripts.run_daily_submission.build_ladder",
+            return_value=_one_row_ladder(required=frozenset(matrix.columns)),
+        ),
         patch(
             "scripts.run_daily_submission.build_price_feature_matrix",
-            return_value=(matrix, fold, set()),
+            return_value=(matrix, set()),
         ),
         patch("scripts.run_daily_submission.fit_predict_expand") as mock_fit,
     ):
@@ -646,7 +696,7 @@ def test_run_submission_for_day_stops_at_the_training_window_check() -> None:
 
     assert outcome.candidate_selected is None
     assert outcome.skip_reason is not None
-    assert "training window" in outcome.skip_reason
+    assert "core_gas" in outcome.skip_reason
     assert outcome.renewables_runtime_seconds == 1.5
     mock_fit.assert_not_called()
 
@@ -685,9 +735,18 @@ def test_run_submission_for_day_tolerates_a_small_gap_in_the_training_window() -
             "scripts.run_daily_submission.run_renewables_step",
             return_value=(pd.DataFrame(), 1.5),
         ),
+        patch("scripts.run_daily_submission.target_day_fold", return_value=fold),
+        patch(
+            "scripts.run_daily_submission.nwp_group_columns_for_day",
+            return_value=(frozenset(), frozenset()),
+        ),
+        patch(
+            "scripts.run_daily_submission.build_ladder",
+            return_value=_one_row_ladder(required=frozenset(matrix.columns)),
+        ),
         patch(
             "scripts.run_daily_submission.build_price_feature_matrix",
-            return_value=(matrix, fold, gap_days),
+            return_value=(matrix, gap_days),
         ),
         patch(
             "scripts.run_daily_submission.fit_predict_expand", return_value=(forecast, 2160, 2160)
@@ -710,7 +769,7 @@ def test_run_submission_for_day_tolerates_a_small_gap_in_the_training_window() -
         )
 
     assert outcome.skip_reason is None
-    assert outcome.candidate_selected == "full_live_set"
+    assert outcome.candidate_selected == "core_gas"
     assert outcome.excluded_training_days == frozenset(gap_days)
 
 
@@ -731,9 +790,18 @@ def test_run_submission_for_day_stops_at_check_b_with_named_missing_feature() ->
             "scripts.run_daily_submission.run_renewables_step",
             return_value=(pd.DataFrame(), 1.5),
         ),
+        patch("scripts.run_daily_submission.target_day_fold", return_value=fold),
+        patch(
+            "scripts.run_daily_submission.nwp_group_columns_for_day",
+            return_value=(frozenset(), frozenset()),
+        ),
+        patch(
+            "scripts.run_daily_submission.build_ladder",
+            return_value=_one_row_ladder(required=frozenset(matrix.columns)),
+        ),
         patch(
             "scripts.run_daily_submission.build_price_feature_matrix",
-            return_value=(matrix, fold, set()),
+            return_value=(matrix, set()),
         ),
     ):
         outcome = run_submission_for_day(
@@ -766,9 +834,18 @@ def test_run_submission_for_day_stops_at_payload_plausibility() -> None:
             "scripts.run_daily_submission.run_renewables_step",
             return_value=(pd.DataFrame(), 1.5),
         ),
+        patch("scripts.run_daily_submission.target_day_fold", return_value=fold),
+        patch(
+            "scripts.run_daily_submission.nwp_group_columns_for_day",
+            return_value=(frozenset(), frozenset()),
+        ),
+        patch(
+            "scripts.run_daily_submission.build_ladder",
+            return_value=_one_row_ladder(required=frozenset(matrix.columns)),
+        ),
         patch(
             "scripts.run_daily_submission.build_price_feature_matrix",
-            return_value=(matrix, fold, set()),
+            return_value=(matrix, set()),
         ),
         patch(
             "scripts.run_daily_submission.fit_predict_expand",
@@ -813,9 +890,18 @@ def test_run_submission_for_day_happy_path_submits_dry_run() -> None:
             "scripts.run_daily_submission.run_renewables_step",
             return_value=(pd.DataFrame(), 1.5),
         ),
+        patch("scripts.run_daily_submission.target_day_fold", return_value=fold),
+        patch(
+            "scripts.run_daily_submission.nwp_group_columns_for_day",
+            return_value=(frozenset(), frozenset()),
+        ),
+        patch(
+            "scripts.run_daily_submission.build_ladder",
+            return_value=_one_row_ladder(required=frozenset(matrix.columns)),
+        ),
         patch(
             "scripts.run_daily_submission.build_price_feature_matrix",
-            return_value=(matrix, fold, {dt.date(2026, 4, 20)}),
+            return_value=(matrix, {dt.date(2026, 4, 20)}),
         ),
         patch(
             "scripts.run_daily_submission.fit_predict_expand", return_value=(forecast, 2160, 2160)
@@ -836,7 +922,7 @@ def test_run_submission_for_day_happy_path_submits_dry_run() -> None:
             now=lambda: _BEFORE_GATE_CLOSURE,
         )
 
-    assert outcome.candidate_selected == "full_live_set"
+    assert outcome.candidate_selected == "core_gas"
     assert outcome.skip_reason is None
     assert outcome.payload == payload
     assert outcome.submission_result is fake_submission_result
@@ -883,9 +969,18 @@ def test_run_submission_for_day_carries_commodity_staleness_warnings_through() -
             "scripts.run_daily_submission.run_renewables_step",
             return_value=(pd.DataFrame(), 1.5),
         ),
+        patch("scripts.run_daily_submission.target_day_fold", return_value=fold),
+        patch(
+            "scripts.run_daily_submission.nwp_group_columns_for_day",
+            return_value=(frozenset(), frozenset()),
+        ),
+        patch(
+            "scripts.run_daily_submission.build_ladder",
+            return_value=_one_row_ladder(required=frozenset(matrix.columns)),
+        ),
         patch(
             "scripts.run_daily_submission.build_price_feature_matrix",
-            return_value=(matrix, fold, set()),
+            return_value=(matrix, set()),
         ),
         patch(
             "scripts.run_daily_submission.fit_predict_expand", return_value=(forecast, 2160, 2160)
@@ -1097,7 +1192,7 @@ def test_run_submission_for_day_includes_the_real_morning_state_of_today() -> No
         )
 
     assert outcome.skip_reason is None, outcome.skip_reason
-    assert outcome.candidate_selected == "full_live_set"
+    assert outcome.candidate_selected == "core_gas"
     assert outcome.payload is not None
     assert len(outcome.payload["values"]) == 96
     # The actual point: today is NOT excluded from the training window,
@@ -1917,9 +2012,18 @@ def test_run_submission_for_day_completes_without_calling_any_fetch_client(
                 "scripts.run_daily_submission.run_renewables_step",
                 return_value=(pd.DataFrame(), 1.5),
             ),
+            patch("scripts.run_daily_submission.target_day_fold", return_value=fold),
+            patch(
+                "scripts.run_daily_submission.nwp_group_columns_for_day",
+                return_value=(frozenset(), frozenset()),
+            ),
+            patch(
+                "scripts.run_daily_submission.build_ladder",
+                return_value=_one_row_ladder(required=frozenset(matrix.columns)),
+            ),
             patch(
                 "scripts.run_daily_submission.build_price_feature_matrix",
-                return_value=(matrix, fold, set()),
+                return_value=(matrix, set()),
             ),
             # df's own day_ahead_price is a tiny 2024-01-01 synthetic fixture (this test's
             # point is the fetch-client guarantee, not training-window completeness) -- real
@@ -1955,7 +2059,7 @@ def test_run_submission_for_day_completes_without_calling_any_fetch_client(
         mock_fetch_run.assert_not_called()
 
     assert outcome.skip_reason is None
-    assert outcome.candidate_selected == "full_live_set"
+    assert outcome.candidate_selected == "core_gas"
 
 
 # ---------------------------------------------------------------------------
@@ -2000,9 +2104,18 @@ def test_run_submission_for_day_defaults_to_dry_run_without_explicit_live() -> N
             "scripts.run_daily_submission.run_renewables_step",
             return_value=(pd.DataFrame(), 1.5),
         ),
+        patch("scripts.run_daily_submission.target_day_fold", return_value=fold),
+        patch(
+            "scripts.run_daily_submission.nwp_group_columns_for_day",
+            return_value=(frozenset(), frozenset()),
+        ),
+        patch(
+            "scripts.run_daily_submission.build_ladder",
+            return_value=_one_row_ladder(required=frozenset(matrix.columns)),
+        ),
         patch(
             "scripts.run_daily_submission.build_price_feature_matrix",
-            return_value=(matrix, fold, set()),
+            return_value=(matrix, set()),
         ),
         patch(
             "scripts.run_daily_submission.fit_predict_expand", return_value=(forecast, 2160, 2160)
@@ -2046,9 +2159,18 @@ def test_run_submission_for_day_passes_live_true_through_to_submit_when_requeste
             "scripts.run_daily_submission.run_renewables_step",
             return_value=(pd.DataFrame(), 1.5),
         ),
+        patch("scripts.run_daily_submission.target_day_fold", return_value=fold),
+        patch(
+            "scripts.run_daily_submission.nwp_group_columns_for_day",
+            return_value=(frozenset(), frozenset()),
+        ),
+        patch(
+            "scripts.run_daily_submission.build_ladder",
+            return_value=_one_row_ladder(required=frozenset(matrix.columns)),
+        ),
         patch(
             "scripts.run_daily_submission.build_price_feature_matrix",
-            return_value=(matrix, fold, set()),
+            return_value=(matrix, set()),
         ),
         patch(
             "scripts.run_daily_submission.fit_predict_expand", return_value=(forecast, 2160, 2160)
@@ -2095,9 +2217,18 @@ def test_run_submission_for_day_live_with_missing_api_key_raises_never_posts(
             "scripts.run_daily_submission.run_renewables_step",
             return_value=(pd.DataFrame(), 1.5),
         ),
+        patch("scripts.run_daily_submission.target_day_fold", return_value=fold),
+        patch(
+            "scripts.run_daily_submission.nwp_group_columns_for_day",
+            return_value=(frozenset(), frozenset()),
+        ),
+        patch(
+            "scripts.run_daily_submission.build_ladder",
+            return_value=_one_row_ladder(required=frozenset(matrix.columns)),
+        ),
         patch(
             "scripts.run_daily_submission.build_price_feature_matrix",
-            return_value=(matrix, fold, set()),
+            return_value=(matrix, set()),
         ),
         patch(
             "scripts.run_daily_submission.fit_predict_expand", return_value=(forecast, 2160, 2160)
@@ -2145,9 +2276,18 @@ def test_run_submission_for_day_skips_post_if_gate_closed_between_start_and_post
             "scripts.run_daily_submission.run_renewables_step",
             return_value=(pd.DataFrame(), 1.5),
         ),
+        patch("scripts.run_daily_submission.target_day_fold", return_value=fold),
+        patch(
+            "scripts.run_daily_submission.nwp_group_columns_for_day",
+            return_value=(frozenset(), frozenset()),
+        ),
+        patch(
+            "scripts.run_daily_submission.build_ladder",
+            return_value=_one_row_ladder(required=frozenset(matrix.columns)),
+        ),
         patch(
             "scripts.run_daily_submission.build_price_feature_matrix",
-            return_value=(matrix, fold, set()),
+            return_value=(matrix, set()),
         ),
         patch(
             "scripts.run_daily_submission.fit_predict_expand", return_value=(forecast, 2160, 2160)
@@ -2166,7 +2306,7 @@ def test_run_submission_for_day_skips_post_if_gate_closed_between_start_and_post
             now=lambda: _AS_OF,  # _AS_OF == gate closure moment exactly (>= closes it)
         )
 
-    assert outcome.candidate_selected == "full_live_set"
+    assert outcome.candidate_selected == "core_gas"
     assert outcome.skip_reason == "gate closure passed before POST"
     # spec section 5.4 step 11: the payload archive still runs even though nothing sent.
     assert outcome.payload == payload

@@ -441,14 +441,34 @@ def test_naive_index_is_rejected() -> None:
 
 
 def _generation_full_frame(index: pd.DatetimeIndex) -> pd.DataFrame:
-    """A generation frame with BOTH checked and carried columns present --
-    the shape a real ENTSO-E response has (the API returns the whole
-    breakdown regardless of which types are actually used downstream)."""
+    """A generation frame with all of its (now entirely carried) columns
+    present -- the shape a real ENTSO-E response has (the API returns the
+    whole breakdown regardless of which types are actually used
+    downstream)."""
     expectation = store.EXPECTATION_TABLE["generation"]
     all_columns = expectation.expected_columns | expectation.carried_columns
     return pd.DataFrame(
         {col: np.arange(len(index), dtype=float) for col in all_columns}, index=index
     )
+
+
+# spec 6.9 section 2.5 moved every CHECKED, live_settling_columns/known_low_
+# resolution_windows-using column (load_actual, generation's 3, both border
+# flow groups) to fully-CARRIED-plus-grid_based=False -- so as of this step,
+# NO entry in the real EXPECTATION_TABLE exercises either mechanism on a
+# CHECKED column any more (both are still real, correct code -- just
+# currently unreached by any live source). The tests below that are
+# specifically ABOUT those two mechanisms use this synthetic fixture rather
+# than a real EXPECTATION_TABLE entry, so the mechanism itself stays covered
+# independent of which real source happens to use it this month.
+_SYNTHETIC_ACTUAL_EXPECTATION = store.SourceExpectation(
+    expected_columns=frozenset({"synthetic_actual"}),
+    max_nan_fraction={"synthetic_actual": 0.001},
+    live_settling_columns=frozenset({"synthetic_actual"}),
+    known_low_resolution_windows={
+        "synthetic_actual": ("2022-01-01T00:00:00+00:00", "2022-02-01T00:00:00+00:00")
+    },
+)
 
 
 def test_gen_nuclear_permanent_nan_never_blocks_as_a_carried_column() -> None:
@@ -477,16 +497,22 @@ def test_gen_nuclear_permanent_nan_never_blocks_as_a_carried_column() -> None:
 
 
 def test_unexpected_nan_in_a_checked_column_is_rejected() -> None:
-    expectation = store.EXPECTATION_TABLE["generation"]
+    """load_forecast_day_ahead (spec 6.9 section 2.5: still CHECKED -- row 1
+    and the row 2 Similar-Day-Patch both need it) -- a real gap there, not
+    exempt."""
+    expectation = store.EXPECTATION_TABLE["load"]
     period_start = pd.Timestamp("2026-08-01", tz="UTC")
     period_end = pd.Timestamp("2026-09-01", tz="UTC")
     index = pd.date_range(period_start, period_end, freq="15min", inclusive="left")
-    frame = _generation_full_frame(index)
-    frame["gen_wind_onshore"] = np.nan  # a CHECKED column -- a real gap, not exempt
-    assert "gen_wind_onshore" in expectation.expected_columns
+    frame = pd.DataFrame(
+        {col: np.arange(len(index), dtype=float) for col in expectation.expected_columns},
+        index=index,
+    )
+    frame["load_forecast_day_ahead"] = np.nan
+    assert "load_forecast_day_ahead" in expectation.expected_columns
 
     result = store.validate_source(
-        "generation",
+        "load",
         frame,
         expectation,
         period_start=period_start,
@@ -495,24 +521,36 @@ def test_unexpected_nan_in_a_checked_column_is_rejected() -> None:
     )
 
     assert result.ok is False
-    assert any("gen_wind_onshore" in r for r in result.reasons)
+    assert any("load_forecast_day_ahead" in r for r in result.reasons)
 
 
 def test_carried_column_full_nan_never_blocks_in_rebuild_mode() -> None:
     """spec 6.7.1a section 3.6/5.3: a carried column is never a blocking
     reason in EITHER mode -- this is the direct fix for the real C4 finding
     (2026-09-11): two automatic maintenance runs went red on a gen_hard_coal
-    gap the price model never reads."""
-    expectation = store.EXPECTATION_TABLE["generation"]
+    gap the price model never reads.
+
+    Uses "load" (grid_based=True, spec 6.9 section 2.5: load_actual moved to
+    carried but load_forecast_day_ahead stays checked) rather than
+    "generation": as of this step, "generation" is entirely carried and
+    grid_based=False (the coverage/NaN block -- including the carried-column
+    hint reporting this test itself checks -- never runs at all there, see
+    validate_source; the same accepted trade-off the two EC sources already
+    have). "load" still exercises the real reporting path this test is
+    about."""
+    expectation = store.EXPECTATION_TABLE["load"]
     period_start = pd.Timestamp("2026-08-01", tz="UTC")
     period_end = pd.Timestamp("2026-09-01", tz="UTC")
     index = pd.date_range(period_start, period_end, freq="15min", inclusive="left")
-    frame = _generation_full_frame(index)
-    frame["gen_hard_coal"] = np.nan
-    assert "gen_hard_coal" in expectation.carried_columns
+    all_columns = expectation.expected_columns | expectation.carried_columns
+    frame = pd.DataFrame(
+        {col: np.arange(len(index), dtype=float) for col in all_columns}, index=index
+    )
+    frame["load_actual"] = np.nan
+    assert "load_actual" in expectation.carried_columns
 
     result = store.validate_source(
-        "generation",
+        "load",
         frame,
         expectation,
         period_start=period_start,
@@ -521,7 +559,7 @@ def test_carried_column_full_nan_never_blocks_in_rebuild_mode() -> None:
     )
 
     assert result.ok is True
-    assert any("gen_hard_coal" in h for h in result.hints)  # reported, not gated (rebuild mode)
+    assert any("load_actual" in h for h in result.hints)  # reported, not gated (rebuild mode)
 
 
 def test_carried_column_full_nan_never_blocks_in_live_mode() -> None:
@@ -641,20 +679,26 @@ def test_live_tail_nan_within_settling_buffer_is_not_rejected() -> None:
 
 
 def test_live_mode_gross_nan_at_or_above_threshold_blocks() -> None:
-    """A genuine, near-total gap in a CHECKED column, well outside the
-    settling buffer, must still block -- LIVE_GROSS_NAN_FRACTION exists for
-    exactly this (spec 6.7.1a section 3.4), even though the old, laxer
-    LIVE_MAX_NAN_FRACTION mechanism is gone."""
-    expectation = store.EXPECTATION_TABLE["generation"]
+    """A genuine, near-total gap in a CHECKED column must still block --
+    LIVE_GROSS_NAN_FRACTION exists for exactly this (spec 6.7.1a section
+    3.4), even though the old, laxer LIVE_MAX_NAN_FRACTION mechanism is gone.
+    Uses "load"/load_forecast_day_ahead (spec 6.9 section 2.5: the one
+    remaining CHECKED, grid_based column with no live_settling_columns
+    treatment -- a day-ahead schedule has no live-tail dynamic to begin
+    with, so this test needs no settling buffer either)."""
+    expectation = store.EXPECTATION_TABLE["load"]
     as_of = pd.Timestamp("2026-09-10T13:42:00", tz="UTC")
     index = pd.date_range(
         as_of - pd.Timedelta(days=7), as_of - pd.Timedelta(days=2), freq="15min", inclusive="left"
     )
-    frame = _generation_full_frame(index)
-    frame["gen_wind_onshore"] = np.nan  # settled, well before as_of - 24h -- a real gap
+    frame = pd.DataFrame(
+        {col: np.arange(len(index), dtype=float) for col in expectation.expected_columns},
+        index=index,
+    )
+    frame["load_forecast_day_ahead"] = np.nan
 
     result = store.validate_source(
-        "generation",
+        "load",
         frame,
         expectation,
         period_start=as_of - pd.Timedelta(days=7),
@@ -664,7 +708,7 @@ def test_live_mode_gross_nan_at_or_above_threshold_blocks() -> None:
     )
 
     assert result.ok is False
-    assert any("gen_wind_onshore" in r for r in result.reasons)
+    assert any("load_forecast_day_ahead" in r for r in result.reasons)
     assert any("gross-corruption" in r for r in result.reasons)
 
 
@@ -673,15 +717,20 @@ def test_live_mode_partial_nan_below_gross_threshold_is_a_hint_not_a_failure() -
     settled, non-trivial gap in a CHECKED column that is NOT gross must no
     longer block -- it is recorded as a hint with an absolute cell count
     and left for 6.7.2's own per-column freshness check to judge."""
-    expectation = store.EXPECTATION_TABLE["generation"]
+    expectation = store.EXPECTATION_TABLE["load"]
     as_of = pd.Timestamp("2026-09-10T13:42:00", tz="UTC")
     index = pd.date_range(as_of - pd.Timedelta(days=7), as_of, freq="h", inclusive="left")
-    frame = _generation_full_frame(index)
+    frame = pd.DataFrame(
+        {col: np.arange(len(index), dtype=float) for col in expectation.expected_columns},
+        index=index,
+    )
     gap = (index >= as_of - pd.Timedelta(days=2)) & (index < as_of - pd.Timedelta(days=1))
-    frame["gen_wind_onshore"] = np.where(gap, np.nan, frame["gen_wind_onshore"])  # 24/168h, ~14%
+    frame["load_forecast_day_ahead"] = np.where(
+        gap, np.nan, frame["load_forecast_day_ahead"]
+    )  # 24/168h, ~14%
 
     result = store.validate_source(
-        "generation",
+        "load",
         frame,
         expectation,
         period_start=as_of - pd.Timedelta(days=7),
@@ -691,28 +740,34 @@ def test_live_mode_partial_nan_below_gross_threshold_is_a_hint_not_a_failure() -
     )
 
     assert result.ok is True
-    assert result.nan_cell_counts["gen_wind_onshore"] == 24
-    assert any("gen_wind_onshore" in h for h in result.hints)
+    assert result.nan_cell_counts["load_forecast_day_ahead"] == 24
+    assert any("load_forecast_day_ahead" in h for h in result.hints)
 
 
 def test_rebuild_mode_applies_no_settling_buffer_and_the_strict_tolerance() -> None:
     """mode="rebuild" (the default) never excludes a live tail and never
     applies the live gross threshold -- a live-tail-shaped gap right at
-    as_of, in a CHECKED column, must still be judged against the strict
-    rebuild tolerance."""
-    expectation = store.EXPECTATION_TABLE["generation"]
+    as_of, in a CHECKED column with live-settling treatment, must still be
+    judged against the strict rebuild tolerance. Uses the synthetic
+    actuals-shaped fixture (see its own comment above): as of spec 6.9
+    section 2.5, no real EXPECTATION_TABLE entry is both CHECKED and in
+    live_settling_columns any more (every TSO-actuals-type checked column
+    moved to fully-carried-plus-grid_based=False in this step) -- the
+    mechanism itself stays real and correct, just currently unreached by any
+    live source."""
+    expectation = _SYNTHETIC_ACTUAL_EXPECTATION
     as_of = pd.Timestamp("2026-09-10T13:42:00", tz="UTC")
     period_start = pd.Timestamp("2026-09-08", tz="UTC")
     period_end = as_of.floor("D") + pd.Timedelta(days=1)
     index = pd.date_range(
         period_start, as_of - pd.Timedelta(hours=1), freq="15min", inclusive="left"
     )
-    frame = _generation_full_frame(index)
+    frame = pd.DataFrame({"synthetic_actual": np.arange(len(index), dtype=float)}, index=index)
     tail_mask = index >= (as_of - pd.Timedelta(hours=2))
-    frame["gen_wind_onshore"] = np.where(tail_mask, np.nan, frame["gen_wind_onshore"])
+    frame["synthetic_actual"] = np.where(tail_mask, np.nan, frame["synthetic_actual"])
 
     result = store.validate_source(
-        "generation",
+        "synthetic",
         frame,
         expectation,
         period_start=period_start,
@@ -721,7 +776,7 @@ def test_rebuild_mode_applies_no_settling_buffer_and_the_strict_tolerance() -> N
     )
 
     assert result.ok is False
-    assert any("gen_wind_onshore" in r for r in result.reasons)
+    assert any("synthetic_actual" in r for r in result.reasons)
 
 
 def test_live_mode_fixed_window_is_independent_of_the_sync_gap_width() -> None:
@@ -767,18 +822,20 @@ def test_live_mode_settling_cut_leaves_most_of_the_fixed_window_evaluated() -> N
     hours-wide live window could consume almost the entire checked range.
     Against the new fixed 7-day window, the same 24h cut only ever removes
     1/7 of it -- a gap 3 days before as_of (well outside the 24h buffer,
-    well inside the fixed window) must still be measured."""
-    expectation = store.EXPECTATION_TABLE["generation"]
+    well inside the fixed window) must still be measured. Synthetic fixture,
+    see its own comment above: no real CHECKED column has live_settling
+    treatment any more as of spec 6.9 section 2.5."""
+    expectation = _SYNTHETIC_ACTUAL_EXPECTATION
     as_of = pd.Timestamp("2026-09-11T10:00", tz="UTC")
     index = pd.date_range(as_of - pd.Timedelta(days=7), as_of, freq="h", inclusive="left")
-    frame = _generation_full_frame(index)
+    frame = pd.DataFrame({"synthetic_actual": np.arange(len(index), dtype=float)}, index=index)
     gap = (index >= as_of - pd.Timedelta(days=3)) & (
         index < as_of - pd.Timedelta(days=3) + pd.Timedelta(hours=2)
     )
-    frame["gen_wind_onshore"] = np.where(gap, np.nan, frame["gen_wind_onshore"])
+    frame["synthetic_actual"] = np.where(gap, np.nan, frame["synthetic_actual"])
 
     result = store.validate_source(
-        "generation",
+        "synthetic",
         frame,
         expectation,
         period_start=as_of - pd.Timedelta(days=7),
@@ -788,7 +845,7 @@ def test_live_mode_settling_cut_leaves_most_of_the_fixed_window_evaluated() -> N
     )
 
     assert result.ok is True  # 2/168h is far below the gross threshold
-    assert result.nan_cell_counts["gen_wind_onshore"] == 2  # not cut away by the settling buffer
+    assert result.nan_cell_counts["synthetic_actual"] == 2  # not cut away by the settling buffer
 
 
 def test_live_mode_isolated_cell_in_a_non_settling_column_is_a_hint() -> None:
@@ -817,20 +874,23 @@ def test_live_mode_isolated_cell_in_a_non_settling_column_is_a_hint() -> None:
     assert any("load_forecast_day_ahead" in h for h in result.hints)
 
 
-def test_cross_border_flows_tolerates_an_isolated_settled_gap() -> None:
-    """A9 probe finding: physical_net_de_to_pl had one isolated settled gap
-    (2026-09-02 03:00 UTC), the same kind of permanent small ENTSO-E gap as
-    generation's -- extended the same 0.001 tolerance here."""
-    expectation = store.EXPECTATION_TABLE["cross_border_flows"]
+def test_isolated_settled_gap_in_a_checked_column_is_tolerated() -> None:
+    """A9 probe finding (originally physical_net_de_to_pl -- cross_border_
+    flows is entirely carried as of spec 6.9 section 2.5, so this now uses
+    "load"/load_forecast_day_ahead, the one remaining checked, tolerance-
+    bearing column): one isolated settled gap, the same kind of permanent
+    small ENTSO-E gap generation's own finding had -- extended the same
+    0.001 tolerance here."""
+    expectation = store.EXPECTATION_TABLE["load"]
     period_start = pd.Timestamp("2026-08-01", tz="UTC")
     period_end = pd.Timestamp("2026-09-01", tz="UTC")
     index = pd.date_range(period_start, period_end, freq="15min", inclusive="left")
     data = {col: np.arange(len(index), dtype=float) for col in expectation.expected_columns}
-    data["physical_net_de_to_pl"][100] = np.nan  # one isolated settled cell
+    data["load_forecast_day_ahead"][100] = np.nan  # one isolated settled cell
     frame = pd.DataFrame(data, index=index)
 
     result = store.validate_source(
-        "cross_border_flows",
+        "load",
         frame,
         expectation,
         period_start=period_start,
@@ -841,17 +901,17 @@ def test_cross_border_flows_tolerates_an_isolated_settled_gap() -> None:
     assert result.ok is True
 
 
-def test_cross_border_flows_still_rejects_a_large_settled_gap() -> None:
-    expectation = store.EXPECTATION_TABLE["cross_border_flows"]
+def test_large_settled_gap_in_a_checked_column_is_still_rejected() -> None:
+    expectation = store.EXPECTATION_TABLE["load"]
     period_start = pd.Timestamp("2026-08-01", tz="UTC")
     period_end = pd.Timestamp("2026-09-01", tz="UTC")
     index = pd.date_range(period_start, period_end, freq="15min", inclusive="left")
     data = {col: np.arange(len(index), dtype=float) for col in expectation.expected_columns}
-    data["physical_net_de_to_pl"] = np.full(len(index), np.nan)
+    data["load_forecast_day_ahead"] = np.full(len(index), np.nan)
     frame = pd.DataFrame(data, index=index)
 
     result = store.validate_source(
-        "cross_border_flows",
+        "load",
         frame,
         expectation,
         period_start=period_start,
@@ -860,26 +920,27 @@ def test_cross_border_flows_still_rejects_a_large_settled_gap() -> None:
     )
 
     assert result.ok is False
-    assert any("physical_net_de_to_pl" in r for r in result.reasons)
+    assert any("load_forecast_day_ahead" in r for r in result.reasons)
 
 
 def test_known_low_resolution_window_absorbs_the_structural_75pct_gap() -> None:
-    """A9 finding: physical_net_de_to_fr genuinely reported hourly (not
-    quarter-hourly) 2021-08..2025-04 -- merging it against an already-15min
-    grid produces a structural 75% NaN there, not a real gap."""
-    expectation = store.EXPECTATION_TABLE["cross_border_flows"]
+    """A9 finding (originally physical_net_de_to_fr -- cross_border_flows is
+    entirely carried as of spec 6.9 section 2.5, so this uses the synthetic
+    actuals-shaped fixture, see its own comment above): a column genuinely
+    reporting hourly, not quarter-hourly, for a known window produces a
+    structural 75% NaN there, not a real gap."""
+    expectation = _SYNTHETIC_ACTUAL_EXPECTATION
     period_start = pd.Timestamp("2022-01-01", tz="UTC")
     period_end = pd.Timestamp("2022-02-01", tz="UTC")
     index = pd.date_range(period_start, period_end, freq="15min", inclusive="left")
-    data = {col: np.arange(len(index), dtype=float) for col in expectation.expected_columns}
     hourly_only = index.minute != 0
-    data["physical_net_de_to_fr"] = np.where(
-        hourly_only, np.nan, np.arange(len(index), dtype=float)
+    frame = pd.DataFrame(
+        {"synthetic_actual": np.where(hourly_only, np.nan, np.arange(len(index), dtype=float))},
+        index=index,
     )
-    frame = pd.DataFrame(data, index=index)
 
     result = store.validate_source(
-        "cross_border_flows",
+        "synthetic",
         frame,
         expectation,
         period_start=period_start,
@@ -893,16 +954,17 @@ def test_known_low_resolution_window_absorbs_the_structural_75pct_gap() -> None:
 def test_known_low_resolution_window_does_not_hide_a_gap_after_the_window() -> None:
     """The window must not swallow a genuine, unrelated gap once the column
     is back to full quarter-hourly resolution."""
-    expectation = store.EXPECTATION_TABLE["cross_border_flows"]
-    period_start = pd.Timestamp("2026-01-01", tz="UTC")  # well after the FR window ends
+    expectation = _SYNTHETIC_ACTUAL_EXPECTATION
+    period_start = pd.Timestamp("2026-01-01", tz="UTC")  # well after the synthetic window ends
     period_end = pd.Timestamp("2026-02-01", tz="UTC")
     index = pd.date_range(period_start, period_end, freq="15min", inclusive="left")
-    data = {col: np.arange(len(index), dtype=float) for col in expectation.expected_columns}
-    data["physical_net_de_to_fr"] = np.full(len(index), np.nan)
-    frame = pd.DataFrame(data, index=index)
+    frame = pd.DataFrame(
+        {"synthetic_actual": np.full(len(index), np.nan)},
+        index=index,
+    )
 
     result = store.validate_source(
-        "cross_border_flows",
+        "synthetic",
         frame,
         expectation,
         period_start=period_start,
@@ -911,7 +973,7 @@ def test_known_low_resolution_window_does_not_hide_a_gap_after_the_window() -> N
     )
 
     assert result.ok is False
-    assert any("physical_net_de_to_fr" in r for r in result.reasons)
+    assert any("synthetic_actual" in r for r in result.reasons)
 
 
 def test_shrinking_covered_range_is_rejected() -> None:
@@ -1358,16 +1420,85 @@ def _find_consumer_hits(columns: frozenset[str]) -> dict[str, list[str]]:
     return hits
 
 
+def _unrequired_feature_columns() -> frozenset[str]:
+    """spec 6.9 section 2.5: the five carried-column families that ARE
+    genuinely read by features/lags.py (actual/forecast-error/cross-border
+    lag functions) or features/fundamentals.py (the full, unsliced
+    commodity block) -- build_feature_set_for_day still computes them
+    unconditionally (spec section 2.1: "Feature-Bau bleibt vollständig"),
+    but no live fallback-ladder candidate's own required-column set
+    (arena/candidates.py) includes their OUTPUT features any more (Schritt
+    1's own code-reading finding, Schritt 10's Parity Check: 0.0 diff
+    against core_gas/base's real built columns). This is a different,
+    weaker "carried" than 6.7.1a's original gen_hard_coal case (never read
+    by ANY code at all) -- checked below against a narrower claim, not the
+    original blanket "read by nothing" bar.
+    """
+    return (
+        frozenset({"load_actual", "gen_wind_onshore", "gen_wind_offshore", "gen_solar"})
+        | store.EXPECTATION_TABLE["scheduled_exchanges"].carried_columns
+        | store.EXPECTATION_TABLE["cross_border_flows"].carried_columns
+        | store.EXPECTATION_TABLE["eua_co2"].carried_columns
+    )
+
+
+_ALLOWED_UNREQUIRED_FEATURE_FILES: frozenset[str] = frozenset(
+    {
+        "lags.py",
+        "fundamentals.py",
+        # evaluation/regimes.py labels BACKTEST folds by realised load/generation for
+        # reporting (compare_objectives.py and similar one-off scripts) -- it is never called
+        # by scripts/run_daily_submission.py (spec section 3.3: evaluation/ stays untouched),
+        # so a raw column it reads has no bearing on what any live candidate requires.
+        "regimes.py",
+    }
+)
+
+
 def test_carried_columns_are_not_read_by_any_consumer() -> None:
+    """The original, strict 6.7.1a claim -- for every carried column EXCEPT
+    the five families spec 6.9 section 2.5 knowingly moved to carried while
+    still-complete feature builders keep computing (unrequired) features
+    from them, see _unrequired_feature_columns' own docstring."""
     all_carried = frozenset(
         col
         for expectation in store.EXPECTATION_TABLE.values()
         for col in expectation.carried_columns
     )
-    hits = _find_consumer_hits(all_carried)
+    orphan_carried = all_carried - _unrequired_feature_columns()
+    hits = _find_consumer_hits(orphan_carried)
     assert hits == {}, (
         f"carried column(s) actually read under features/models/evaluation -- "
         f"must be moved to expected_columns (checked), not carried_columns: {hits}"
+    )
+
+
+def test_unrequired_feature_columns_are_read_only_where_expected() -> None:
+    """The weaker spec 6.9 section 2.5 claim for the five families above:
+    still read (confirmed, not just assumed), but ONLY inside the two files
+    whose functions no live candidate's required columns depend on. A hit
+    anywhere else would mean some other code -- plausibly a live candidate
+    -- has started requiring one of these again, which is exactly what
+    would need the column moved back to CHECKED."""
+    all_carried = frozenset(
+        col
+        for expectation in store.EXPECTATION_TABLE.values()
+        for col in expectation.carried_columns
+    )
+    columns = _unrequired_feature_columns() & all_carried
+    # sanity: every one of these five families really is a real, currently-carried column --
+    # otherwise this test would trivially pass by checking an empty set.
+    assert len(columns) > 0
+
+    hits = _find_consumer_hits(columns)
+    stray = {
+        col: [f for f in files if Path(f).name not in _ALLOWED_UNREQUIRED_FEATURE_FILES]
+        for col, files in hits.items()
+    }
+    stray = {col: files for col, files in stray.items() if files}
+    assert stray == {}, (
+        f"carried column(s) read outside features/lags.py|fundamentals.py -- a live candidate "
+        f"may now require them, check arena/candidates.py's real required_columns(): {stray}"
     )
 
 

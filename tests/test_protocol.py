@@ -74,6 +74,9 @@ _EXPECTED_KEY_ORDER = [
     "downgrade_blocked",
     "best_accepted_rank_before",
     "capacity_anchor_days_left",
+    "load_patch_reference_day",
+    "load_patch_weeks_back",
+    "load_patch_skipped",
 ]
 
 _SECTION_5_7_FIELDS = (
@@ -368,5 +371,51 @@ def test_section_5_7_fields_default_and_round_trip(tmp_path: Path) -> None:
     assert r["capacity_anchor_days_left"] == 35
 
 
-def test_protocol_version_is_4() -> None:
-    assert PROTOCOL_VERSION == 4
+def test_reader_tolerates_a_real_protocol_version_4_line_without_v5_fields(
+    tmp_path: Path,
+) -> None:
+    """Same compatibility guarantee as the earlier version-jump tests, for
+    the 6.9 Schritt 11 jump from protocol_version 4 to 5."""
+    path = tmp_path / "submissions.jsonl"
+    v4_line = _sample_record().to_dict()
+    v4_line["protocol_version"] = 4
+    for field_name in ("load_patch_reference_day", "load_patch_weeks_back", "load_patch_skipped"):
+        del v4_line[field_name]
+    path.write_text(json.dumps(v4_line) + "\n", encoding="utf-8")
+
+    records = read_submission_records(path)
+    assert len(records) == 1
+    assert records[0]["protocol_version"] == 4
+    assert records[0].get("load_patch_reference_day") is None
+    assert records[0].get("load_patch_weeks_back") is None
+    assert records[0].get("load_patch_skipped") is None
+
+
+def test_v5_load_patch_fields_default_and_round_trip(tmp_path: Path) -> None:
+    """spec 6.9 section 5.7 -- defaults first, then a real value round-trip,
+    same discipline as test_section_5_7_fields_default_and_round_trip."""
+    default_record = _sample_record()
+    assert default_record.load_patch_reference_day is None
+    assert default_record.load_patch_weeks_back is None
+    assert default_record.load_patch_skipped == []
+
+    path = tmp_path / "submissions.jsonl"
+    append_submission_record(
+        path,
+        _sample_record(
+            load_patch_reference_day="2026-10-01",
+            load_patch_weeks_back=1,
+            load_patch_skipped=[["2026-10-08", "holiday"]],
+        ),
+    )
+    records = read_submission_records(path)
+    r = records[0]
+    assert r["load_patch_reference_day"] == "2026-10-01"
+    assert r["load_patch_weeks_back"] == 1
+    assert r["load_patch_skipped"] == [["2026-10-08", "holiday"]]
+
+
+def test_protocol_version_is_5() -> None:
+    """spec 6.9 section 5.7, Schritt 11: v5 adds load_patch_reference_day/
+    weeks_back/skipped, appended to the end of _KEY_ORDER."""
+    assert PROTOCOL_VERSION == 5

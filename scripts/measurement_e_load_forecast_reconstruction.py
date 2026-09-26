@@ -8,9 +8,11 @@ it, compared to the real (settled) value Messung A was measured against?
 Reuses, unchanged: scripts.measurement_a_candidate_intake._prepare (window,
 folds, matrices), features.nwp_fundamentals.build_nwp_forecast_fundamentals/
 build_residual_load_nwp/build_renewable_share_nwp, features.build._build_day_
-matrix (the exact Bausteinliste `live` uses), and scripts.measurement_d_
+matrix (the exact Bausteinliste `live` uses), scripts.measurement_d_
 ec_load._renamed (same rename-after-combine helper the EC-load patch already
-needed).
+needed), and (step 10 addition) scripts.compare_arena.gate_verdict (the
+literal Entscheidung-24 criterion, spec 6.6/6.9) for the FINAL variant's
+official go-live check.
 
 Four reconstruction variants (owner-specified 2026-09-24), one lookback
 table per target-day weekday type. "Forecast" reads load_forecast_day_ahead
@@ -56,6 +58,19 @@ trailing hour(s) repeat the last available source value. A heuristic
 reconstruction has no exact answer for this edge case either way; this is a
 documented, deliberate simplification, not a silent gap.
 
+Sprint 6.9 step 10 addition (spec section 2.2/10): re-measures `core_gas_only`
+with the "Endregel" -- the real arena.load_patch package functions
+(choose_reference_day/build_patched_load), which add the holiday/
+availability escalation chain and the exact 2-o'clock DST table that this
+module's own Variant A never had (a plain D-1 lookback with no fallback, and
+a crude "repeat the last value" pad for a length mismatch). Only
+`core_gas_only` is re-measured (the row this feeds, `core_gas_loadpatch`,
+per the 6.9 spec) -- `live`/`core_no_commodities` stay unmeasured against the
+final rule, same as the original four variants. The FINAL variant is
+computed inline in the existing per-fold loop (same fit models as the A-D
+variants, since row 2 is explicitly the same model as row 1, spec 2.1), not
+a separate run.
+
 Usage:
   python -m scripts.measurement_e_load_forecast_reconstruction --sanity-check
   python -m scripts.measurement_e_load_forecast_reconstruction --probe-folds 10
@@ -75,6 +90,11 @@ import mlflow
 import numpy as np
 import pandas as pd
 
+from energy_price_forecast.arena.load_patch import (
+    LoadPatchReference,
+    build_patched_load,
+    choose_reference_day,
+)
 from energy_price_forecast.data.loaders import load_interim_hourly, load_renewables_predictions
 from energy_price_forecast.evaluation.dm_test import DMResult, dm_test
 from energy_price_forecast.evaluation.metrics import mae, rmse
@@ -92,6 +112,7 @@ from energy_price_forecast.features.nwp_fundamentals import (
 from energy_price_forecast.market_time import gate_closure_for_index
 from energy_price_forecast.models.bridge import expand_to_quarterhour, fit_shape_profile
 from energy_price_forecast.models.lgbm import LGBMForecaster
+from scripts.compare_arena import gate_verdict
 from scripts.measurement_a_candidate_intake import (
     _DAILY_HAC_LAG,
     _DAILY_HORIZON,
@@ -112,6 +133,13 @@ log = logging.getLogger("measurement_e")
 _MLFLOW_EXPERIMENT = "live_robustness_6_8"
 _OUT_PATH = Path("data/processed/measurement_e_load_forecast_reconstruction_predictions.parquet")
 _SUMMARY_PATH = Path("outputs/results/measurement_e_load_forecast_reconstruction_summary.csv")
+_DIVERGENCE_PATH = Path("outputs/results/measurement_e_final_rule_reference_divergence.csv")
+
+# spec 6.9 section 2.1/10: the provisional RMSE from this module's original Variant A
+# (no holiday/availability escalation, no DST table) -- Rückfrage-Anlass 1 if the
+# Endregel re-measurement deviates from it by more than the threshold below.
+_PROVISIONAL_VARIANT_A_RMSE = 29.70
+_PROVISIONAL_DEVIATION_RUECKFRAGE_THRESHOLD = 0.5
 
 _CANDIDATES = ("live", "core_no_commodities", "core_gas_only")
 _VARIANTS = ("A", "B", "C", "D")
@@ -186,6 +214,38 @@ def reconstruct_load_forecast(target_day: dt.date, df: pd.DataFrame, variant: st
         source_values = source_values[:n_target]
 
     return pd.Series(source_values, index=target_index, name=_FORECAST_COL)
+
+
+_FINAL_RULE_CANDIDATE = "core_gas_only"  # spec 6.9 section 2.1: the only row this re-measures
+
+
+def _entsoe_load_forecast_complete(day: dt.date, df: pd.DataFrame) -> bool:
+    """Spec 2.2 point 2: a reference day is unusable if its ENTSO-E day-ahead
+    load forecast isn't present for every one of its own local hours."""
+    index = _hourly_index_for_local_day(day)
+    return bool(df[_FORECAST_COL].reindex(index).notna().all())
+
+
+def reconstruct_load_forecast_final_rule(
+    target_day: dt.date, df: pd.DataFrame
+) -> tuple[pd.Series, LoadPatchReference]:
+    """The "Endregel" reconstruction (spec 2.2/5.5): the real
+    arena.load_patch package functions, not a copy -- holiday/availability
+    escalation chain plus the exact 2-o'clock DST table, unlike this
+    module's own Variant A (module docstring)."""
+    reference = choose_reference_day(
+        target_day,
+        is_holiday=_is_holiday,
+        is_complete=lambda day: _entsoe_load_forecast_complete(day, df),
+    )
+    if reference is None:
+        raise ValueError(
+            f"no usable reference day for target_day={target_day} within "
+            f"MAX_LOAD_PATCH_WEEKS_BACK -- unexpected for real historical data, "
+            f"see spec 2.2's own Rückfrage-Anlässe"
+        )
+    patched = build_patched_load(df[_FORECAST_COL], reference.reference_day, target_day)
+    return patched, reference
 
 
 def _patch_fundamentals(
@@ -294,7 +354,12 @@ def run_measurement_e(
     cfg: FeatureConfig,
     *,
     refit_every: int,
+    divergences: list[dict[str, object]] | None = None,
 ) -> pd.DataFrame:
+    """`divergences`, if given, is appended to (spec 2.2: "Im Log stehen
+    außerdem die Tage im Fenster, an denen die Endregel eine andere Referenz
+    wählt als die alte Variante A") -- one row per evaluated target_day for
+    `_FINAL_RULE_CANDIDATE`, whether or not the reference actually differs."""
     restricted = {name: matrices[name] for name in _CANDIDATES}
     qh_index = pd.DatetimeIndex(prices_qh.index)
     models = {
@@ -344,6 +409,30 @@ def run_measurement_e(
                 pred_qh = _predict_qh(models[name], x_test, fold, history, profile)
                 row[f"pred_{name}_{variant}"] = pred_qh.reindex(y_true_day.index).to_numpy()
 
+        # Endregel (spec 6.9 section 2.2/5.5), the real package functions -- only for the one
+        # row this re-measures, same fitted model as the A-D variants above (no extra fit).
+        name = _FINAL_RULE_CANDIDATE
+        reconstructed_final, patch_reference = reconstruct_load_forecast_final_rule(target_day, df)
+        x_test_final = build_reconstructed_row(
+            name, target_day, df, renewables, cfg, reconstructed_final
+        )
+        x_test_final = x_test_final[restricted[name].columns]
+        pred_qh_final = _predict_qh(models[name], x_test_final, fold, history, profile)
+        row[f"pred_{name}_FINAL"] = pred_qh_final.reindex(y_true_day.index).to_numpy()
+
+        if divergences is not None:
+            old_source_day = source_day_for_variant(target_day, "A")
+            divergences.append(
+                {
+                    "target_day": target_day,
+                    "old_variant_a_source_day": old_source_day,
+                    "final_rule_reference_day": patch_reference.reference_day,
+                    "final_rule_weeks_back": patch_reference.weeks_back,
+                    "final_rule_skipped": patch_reference.skipped,
+                    "differs": old_source_day != patch_reference.reference_day,
+                }
+            )
+
         records.append(pd.DataFrame(row, index=y_true_day.index))
         if (i + 1) % max(1, n_folds // 10) == 0 or i == n_folds - 1:
             log.info("progress: %d/%d folds", i + 1, n_folds)
@@ -381,8 +470,17 @@ def main() -> None:
     folds_to_run = evaluable_folds[: args.probe_folds] if args.probe_folds else evaluable_folds
 
     t0 = time.monotonic()
+    divergences: list[dict[str, object]] = []
     out = run_measurement_e(
-        df, renewables, matrices, y_hourly, prices_qh, folds_to_run, cfg, refit_every=_REFIT_EVERY
+        df,
+        renewables,
+        matrices,
+        y_hourly,
+        prices_qh,
+        folds_to_run,
+        cfg,
+        refit_every=_REFIT_EVERY,
+        divergences=divergences,
     )
     elapsed = time.monotonic() - t0
 
@@ -423,7 +521,10 @@ def main() -> None:
 
     metrics: dict[str, dict[str, float]] = {}
     for name in _CANDIDATES:
-        for suffix in ("real", *_VARIANTS):
+        suffixes = (
+            ("real", *_VARIANTS, "FINAL") if name == _FINAL_RULE_CANDIDATE else ("real", *_VARIANTS)
+        )
+        for suffix in suffixes:
             col = f"pred_{name}_{suffix}"
             key = f"{name}_{suffix}"
             metrics[key] = {
@@ -443,13 +544,15 @@ def main() -> None:
     mlflow.set_experiment(_MLFLOW_EXPERIMENT)
     summary_rows: list[dict[str, object]] = []
     log_metrics: dict[str, float] = {}
+    final_gate_native_p: float | None = None
     with mlflow.start_run(run_name="measurement_e_load_forecast_reconstruction"):
         mlflow.log_params({"n_folds": len(folds_to_run), "refit_every": _REFIT_EVERY})
         mlflow.set_tags({"spec": "sprint6_step6_8_followup", "measurement": "E"})
 
         print("\n--- DM per variant vs 'real' (own candidate reference) and vs baseline ---\n")
         for name in _CANDIDATES:
-            for variant in _VARIANTS:
+            variants = (*_VARIANTS, "FINAL") if name == _FINAL_RULE_CANDIDATE else _VARIANTS
+            for variant in variants:
                 arm_key = f"{name}_{variant}"
                 print(f"{arm_key}:")
                 for reference_name in (f"{name}_real", "baseline"):
@@ -457,11 +560,22 @@ def main() -> None:
                     loss_b = (out[f"pred_{reference_name}"] - out["y_true"]) ** 2
                     native, daily = _run_dm(loss_a, loss_b, out["delivery_day"])
                     better = "better" if native.mean_loss_diff < 0 else "worse"
+                    # Entscheidung 24's literal criterion (spec 6.6/6.9), not just an
+                    # RMSE-only comparison -- reused via scripts.compare_arena.gate_verdict.
                     gate_pass = (
-                        metrics[arm_key]["rmse"] < metrics["baseline"]["rmse"]
+                        gate_verdict(
+                            metrics[arm_key]["rmse"], metrics["baseline"]["rmse"], native.p_value
+                        )
+                        == "PASS"
                         if reference_name == "baseline"
                         else None
                     )
+                    if (
+                        name == _FINAL_RULE_CANDIDATE
+                        and variant == "FINAL"
+                        and reference_name == "baseline"
+                    ):
+                        final_gate_native_p = native.p_value
                     print(
                         f"  vs {reference_name:18s} loss_diff={native.mean_loss_diff:+.4f} "
                         f"p={native.p_value:.4f} ({better})"
@@ -502,6 +616,45 @@ def main() -> None:
             summary.to_csv(f, index=False, lineterminator="\n")
         mlflow.log_artifact(str(_SUMMARY_PATH))
         mlflow.log_artifact(str(_OUT_PATH))
+
+        # Step 10 addition (spec 2.2): the official go-live check for row 2, and the
+        # provisional-value sanity band from the Rückfrage-Anlässe (spec section 10).
+        assert final_gate_native_p is not None  # set inside the DM loop above, always reached
+        final_key = f"{_FINAL_RULE_CANDIDATE}_FINAL"
+        final_rmse = metrics[final_key]["rmse"]
+        final_native_p = final_gate_native_p
+        final_verdict = gate_verdict(final_rmse, metrics["baseline"]["rmse"], final_native_p)
+        deviation_from_provisional = final_rmse - _PROVISIONAL_VARIANT_A_RMSE
+        print(
+            f"\n=== OFFICIAL GATE for row 2 ({final_key}), spec 6.9 Entscheidung 24: "
+            f"{final_verdict} ===\n"
+            f"RMSE(final)={final_rmse:.4f}  RMSE(baseline)={metrics['baseline']['rmse']:.4f}  "
+            f"DM p={final_native_p:.4f}\n"
+            f"deviation from provisional 29.70 (Messung E Variante A, ohne Endregel): "
+            f"{deviation_from_provisional:+.4f}"
+            + (
+                "  -- exceeds the 0.5 Rückfrage-Anlass, flag to owner"
+                if abs(deviation_from_provisional) > _PROVISIONAL_DEVIATION_RUECKFRAGE_THRESHOLD
+                else ""
+            )
+        )
+        mlflow.log_metrics(
+            {
+                f"{final_key}_gate_pass": float(final_verdict == "PASS"),
+                f"{final_key}_deviation_from_provisional": deviation_from_provisional,
+            }
+        )
+
+        divergence_days = pd.DataFrame(divergences)
+        n_differs = int(divergence_days["differs"].sum())
+        print(
+            f"\nEndregel weicht an {n_differs}/{len(divergence_days)} Tagen von der alten "
+            f"Variante A ab (vollständige Liste: {_DIVERGENCE_PATH})."
+        )
+        _DIVERGENCE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        divergence_days.to_csv(_DIVERGENCE_PATH, index=False)
+        mlflow.log_artifact(str(_DIVERGENCE_PATH))
+        mlflow.log_metric(f"{final_key}_n_reference_divergence_days", n_differs)
 
     print(f"\nTotal elapsed: {elapsed:.1f}s ({elapsed / 60:.1f} min)")
 

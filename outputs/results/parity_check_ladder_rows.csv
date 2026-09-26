@@ -1,0 +1,11 @@
+target_day,day_label,row,n_columns_compared,nan_pattern_matches,max_abs_diff
+2025-11-03,Monday,core_gas,23,True,0.0
+2025-11-03,Monday,base_gas,16,True,0.0
+2025-12-25,holiday (1. Weihnachtsfeiertag),core_gas,23,True,0.0
+2025-12-25,holiday (1. Weihnachtsfeiertag),base_gas,16,True,0.0
+2026-07-01,day after a month boundary (June->July),core_gas,23,True,0.0
+2026-07-01,day after a month boundary (June->July),base_gas,16,True,0.0
+2026-04-14,ordinary Tuesday,core_gas,23,True,0.0
+2026-04-14,ordinary Tuesday,base_gas,16,True,0.0
+2026-01-18,Sunday,core_gas,23,True,0.0
+2026-01-18,Sunday,base_gas,16,True,0.0

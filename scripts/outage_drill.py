@@ -60,7 +60,7 @@ from energy_price_forecast.ops.store_sources import (
     ENTSOE_SOURCES,
     EntsoeSource,
 )
-from energy_price_forecast.ops.windows import LOCAL_TZ, next_delivery_day
+from energy_price_forecast.ops.windows import LOCAL_TZ, local_day_bounds, next_delivery_day
 from scripts.run_daily_submission import (
     PAYLOADS_DIR,
     build_submission_record,
@@ -110,19 +110,47 @@ def _copy_sources_for_workdir(workdir: Path) -> CopiedStore:
     )
 
 
-ScenarioFn = Callable[[CopiedStore], None]
+ScenarioFn = Callable[[CopiedStore, dt.date], None]
 
 
-def _scenario_none(copied: CopiedStore) -> None:
+def _scenario_none(copied: CopiedStore, target_day: dt.date) -> None:
     """No fault injected -- the baseline drill and the As-of-Lauf gate
-    every build step in this spec's rollout uses (spec section 2.12). The
-    eleven named fault scenarios from spec section 6.3 (ENTSO-E cutoffs,
-    a removed weather run, target-day gaps, a frozen source, an expired
-    anchor table, ...) are step 13's own job -- adding a new entry to
-    SCENARIOS below, never a change to run_outage_drill itself."""
+    every build step in this spec's rollout uses (spec section 2.12). Most
+    of spec section 6.3's eleven named fault scenarios (ENTSO-E cutoffs, a
+    removed weather run, a frozen source, an expired anchor table, ...) are
+    step 13's own job -- adding a new entry to SCENARIOS below, never a
+    change to run_outage_drill itself."""
 
 
-SCENARIOS: Final[dict[str, ScenarioFn]] = {"none": _scenario_none}
+def _scenario_load_missing(copied: CopiedStore, target_day: dt.date) -> None:
+    """Spec section 10, Schritt 11's own As-of-Lauf requirement ("Zusätzlich
+    die Übung 'Last für D fehlt' -> Zeile 2", one of spec section 6.3's
+    eleven drills, pulled forward to this step since Schritt 11's own gate
+    needs it now rather than waiting for step 13's full suite): NaNs out
+    target_day's own local hours of ``load_forecast_day_ahead`` in the
+    copied "load" source's monthly cache file -- the whole-day gap that
+    makes row 1 (core_gas) fail Check B and row 2 (core_gas_loadpatch) take
+    over via the Similar-Day-Patch (arena/load_patch.py).
+    """
+    load_source = next(s for s in copied.entsoe_sources if s.name == "load")
+    cache_path = (
+        load_source.cache_dir / f"DE_LU_{target_day.year:04d}-{target_day.month:02d}.parquet"
+    )
+    df = pd.read_parquet(cache_path)
+    index = pd.DatetimeIndex(df.index)
+    if index.tz is None:
+        index = index.tz_localize("UTC")
+        df.index = index
+    start, end = local_day_bounds(target_day)
+    mask = (index >= start.tz_convert("UTC")) & (index < end.tz_convert("UTC"))
+    df.loc[mask, "load_forecast_day_ahead"] = float("nan")
+    df.to_parquet(cache_path)
+
+
+SCENARIOS: Final[dict[str, ScenarioFn]] = {
+    "none": _scenario_none,
+    "load_missing": _scenario_load_missing,
+}
 
 
 def resolve_as_of(real_now: pd.Timestamp) -> tuple[pd.Timestamp, dt.date]:
@@ -230,7 +258,7 @@ def run_outage_drill(
     if scenario not in SCENARIOS:
         raise ValueError(
             f"unknown scenario {scenario!r} -- available: {sorted(SCENARIOS)} "
-            "(the eleven named outage drills from spec section 6.3 are added in step 13)"
+            "(most of spec section 6.3's eleven named outage drills are added in step 13)"
         )
 
     real_now = now if now is not None else pd.Timestamp.now("UTC")
@@ -243,7 +271,7 @@ def run_outage_drill(
         log.info("loading a copy of the published store into %s ...", workdir)
         store_state = store.load_store(workdir)
         copied = _copy_sources_for_workdir(workdir)
-        SCENARIOS[scenario](copied)
+        SCENARIOS[scenario](copied, target_day)
 
         df = assemble_price_model_inputs(
             entsoe_sources=copied.entsoe_sources,

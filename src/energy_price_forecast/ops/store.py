@@ -52,10 +52,6 @@ from typing import Any, Final, Literal, cast
 import pandas as pd
 
 from energy_price_forecast.data.entsoe_client import NEIGHBORS
-from energy_price_forecast.data.entsoe_resolution_windows import (
-    CROSS_BORDER_FLOWS_LOW_RESOLUTION_WINDOWS,
-    SCHEDULED_EXCHANGES_LOW_RESOLUTION_WINDOWS,
-)
 from energy_price_forecast.data.weather_grid import (
     HOURLY_VARIABLES,
     KNOWN_WEATHER_DEFECTS,
@@ -528,18 +524,19 @@ class SourceExpectation:
 EXPECTATION_TABLE: Final[dict[str, SourceExpectation]] = {
     "day_ahead_price": SourceExpectation(expected_columns=frozenset({"day_ahead_price"})),
     "load": SourceExpectation(
-        expected_columns=frozenset({"load_actual", "load_forecast_day_ahead"}),
-        # A9's real full-history run (2026-09-10): load_actual had 4 live-tail
-        # cells; load_forecast_day_ahead had two full missing calendar days
-        # (2022-02-xx, 2022-03-xx, 96 quarter-hours each) plus known DST
-        # fall-back hours -- same small/isolated/permanent-gap category as
-        # generation's finding, same 0.001 tolerance for the same reason
-        # (rebuild-mode only -- see validate_source's mode parameter).
-        max_nan_fraction={"load_actual": 0.001, "load_forecast_day_ahead": 0.001},
-        # load_actual is a TSO actual (measured after the fact, variable
-        # reporting lag) -- load_forecast_day_ahead is published once, in
-        # advance, for the whole day; no live-tail dynamic to account for.
-        live_settling_columns=frozenset({"load_actual"}),
+        # CHECKED (6.9 spec section 2.5, Owner 2026-09-24): only
+        # load_forecast_day_ahead -- row 1 reads it, and row 2's Similar-Day-
+        # Patch (arena/load_patch.py) needs it for the reference-day
+        # completeness check. load_actual moved to carried below: no live
+        # price-model row reads it directly (the actual-load lags spec
+        # section 2.1 already dropped from every row's own requirement).
+        expected_columns=frozenset({"load_forecast_day_ahead"}),
+        # A9's real full-history run (2026-09-10): load_forecast_day_ahead had
+        # two full missing calendar days (2022-02-xx, 2022-03-xx, 96
+        # quarter-hours each) plus known DST fall-back hours -- same small/
+        # isolated/permanent-gap category as generation's finding.
+        max_nan_fraction={"load_forecast_day_ahead": 0.001},
+        carried_columns=frozenset({"load_actual"}),
     ),
     "wind_solar": SourceExpectation(
         expected_columns=frozenset(
@@ -557,26 +554,23 @@ EXPECTATION_TABLE: Final[dict[str, SourceExpectation]] = {
         },
     ),
     "generation": SourceExpectation(
-        # CHECKED (6.7.1a, spec section 3.6/4.1 point 5): a real code search
-        # over features/, models/, evaluation/ found exactly these three
-        # gen_* columns read -- features/lags.py's _ERROR_PAIRS, the
-        # realised side of the wind/solar forecast-error lags -- plus
-        # evaluation/regimes.py reading the same three for regime labeling.
-        # Nothing else under gen_* appears anywhere in that search.
-        expected_columns=frozenset({"gen_wind_onshore", "gen_wind_offshore", "gen_solar"}),
-        # CARRIED (6.7.1a): fetched (ENTSO-E returns the whole generation-by-
-        # type breakdown in one response regardless, data/entsoe_client.py's
-        # own docstring/A9 measurement -- filtering to only the 3 checked
-        # types would cost 3 API calls instead of 1, for zero benefit) and
-        # stored, but read by no consumer under features/, models/,
-        # evaluation/ as of 2026-09-11 (the code search above). Never a
-        # blocking reason in either mode (spec section 3.6) -- this is the
-        # concrete fix for the C4 finding: two real automatic maintenance
-        # runs (2026-09-11) went red on a gen_hard_coal gap the price model
-        # never reads, freezing gen_wind_onshore/_offshore/_solar along with
-        # it (spec section 2.4).
+        # Entirely CARRIED (6.9 spec section 2.5, Owner 2026-09-24): the three
+        # gen_wind_onshore/_offshore/_solar columns 6.7.1a checked (they fed
+        # features/lags.py's forecast-error lags) join the eight already-
+        # carried gen_* types below, since spec 6.9 section 2.1 drops the
+        # forecast-error-lag track from every fallback-ladder row entirely
+        # ("Keine Zeile verlangt diese Spalten mehr"). grid_based=False for
+        # the same reason the two EC sources need it (see their own comment
+        # below): with grid_based=True, the row-count coverage-gap check
+        # would still block a sync on this now-fully-carried source
+        # regardless of which columns are checked, reintroducing exactly the
+        # C4 gen_hard_coal bug class this table already fixed once.
+        expected_columns=frozenset(),
         carried_columns=frozenset(
             {
+                "gen_wind_onshore",
+                "gen_wind_offshore",
+                "gen_solar",
                 "gen_nuclear",
                 "gen_lignite",
                 "gen_hard_coal",
@@ -587,102 +581,51 @@ EXPECTATION_TABLE: Final[dict[str, SourceExpectation]] = {
                 "gen_other",
             }
         ),
-        max_nan_fraction={
-            # A9's first-ever full 2020-2026 history fetch found isolated
-            # single-interval gaps, not reproducible as a fetch/network
-            # issue (unrelated to the as_of tail, both well in the past):
-            # gen_solar/gen_wind_onshore missing exactly one row at
-            # 2025-07-09 18:00-18:45 UTC. 0.001 gives ~12x headroom over the
-            # observed rate without waving through a real large-scale
-            # failure (owner decision 2026-09-10). gen_wind_offshore had no
-            # observed gap in that run but gets the same tolerance, since
-            # the same reporting-gap phenomenon could equally hit it.
-            # gen_nuclear's former 1.0 entry (permanently ~100% NaN since
-            # the April 2023 phase-out -- spec section 2.4's own example) is
-            # gone: it moved to carried_columns above, where NaN is never
-            # gated in any mode, making a dedicated exemption unnecessary.
-            "gen_wind_onshore": 0.001,
-            "gen_wind_offshore": 0.001,
-            "gen_solar": 0.001,
-        },
-        # generation-by-type is a TSO actual, reported after the fact.
-        live_settling_columns=frozenset({"gen_wind_onshore", "gen_wind_offshore", "gen_solar"}),
+        grid_based=False,
     ),
     "scheduled_exchanges": SourceExpectation(
-        # All 12 neighbor columns across scheduled_exchanges and
-        # cross_border_flows are CHECKED, not split (6.7.1a, spec section
-        # 3.6/4.1 point 5) -- a real code search found features/lags.py's
-        # _total_flow_lag summing EVERY column matching the
-        # scheduled_net_de_to_/physical_net_de_to_ prefix (build_cross_
-        # border_lags), not a subset. The spec's own open question ("kann
-        # dasselbe Muster [wie bei gen_*] liegen") resolves to no for this
-        # fetch group -- confirmed, not assumed.
-        expected_columns=frozenset(f"scheduled_net_de_to_{n.lower()}" for n in NEIGHBORS),
-        # Same 0.001 backstop tolerance as "generation", for isolated
-        # settled gaps -- applied to every neighbor column since the
-        # mechanism applies to all of them, not just the ones observed so
-        # far. No live_settling_columns here: scheduled exchanges are a
-        # day-ahead schedule, published once in advance for the whole
-        # delivery day, not a TSO actual with a variable after-the-fact
-        # reporting lag -- there is no live tail to exclude.
-        max_nan_fraction={f"scheduled_net_de_to_{n.lower()}": 0.001 for n in NEIGHBORS},
-        # A9's real full-history rebuild (2026-09-10) found scheduled_net_
-        # de_to_{at,ch,nl,pl,dk_1} genuinely reported hourly, not
-        # quarter-hourly, for a shared multi-month stretch (scheduled_net_
-        # de_to_fr stayed quarter-hourly throughout, hence no entry here) --
-        # merging an hourly column against an already-15-minute one via
-        # pd.concat's outer join produces a structural 75% NaN for the
-        # hourly column, not a data-quality problem. Windows are the exact
-        # observed first/last affected calendar month per neighbor
-        # (start/end of month, not day/hour-precise) -- deliberately
-        # generous over the measured data to fully cover each transition's
-        # partial-month edge (e.g. scheduled_net_de_to_at measured 28.6% in
-        # 2024-06 and 53.0% in 2025-07, both transition months, both fully
-        # inside the window below) rather than cut exactly at the observed
-        # fraction.
-        # Moved to data/entsoe_resolution_windows.py (2026-09-14) so
-        # data/_entsoe_cache.py's cache-hit heuristic can reference the exact
-        # same values without duplicating them or importing this module
-        # (which would be circular) -- see that module's own docstring.
-        known_low_resolution_windows=SCHEDULED_EXCHANGES_LOW_RESOLUTION_WINDOWS,
+        # Entirely CARRIED (6.9 spec section 2.5, Owner 2026-09-24): all 12
+        # neighbor columns, previously CHECKED because features/lags.py's
+        # _total_flow_lag summed every one of them (6.7.1a finding) -- spec
+        # 6.9 section 2.1 drops the cross-border-flow-lag track from every
+        # fallback-ladder row entirely ("Keine Zeile verlangt diese Spalten
+        # mehr"), so nothing reads this source any more. grid_based=False so
+        # the row-count coverage-gap check (column-agnostic) does not still
+        # block a sync on a now-fully-carried source -- same reasoning as
+        # "generation" above.
+        expected_columns=frozenset(),
+        carried_columns=frozenset(f"scheduled_net_de_to_{n.lower()}" for n in NEIGHBORS),
+        # grid_based=False disables the whole coverage/NaN block (see
+        # validate_source), including the carried-column NaN-fraction hint
+        # reporting -- the same trade-off already accepted for the two EC
+        # sources below (own comment: "duplicating that here would be
+        # redundant, not a gap"), not a new one. known_low_resolution_windows
+        # is therefore dropped here too: with grid_based=False it would never
+        # be consulted (dead configuration), unlike when this source was
+        # still partly CHECKED.
+        grid_based=False,
     ),
     "cross_border_flows": SourceExpectation(
-        # All 12 border columns (this source + scheduled_exchanges) are
-        # CHECKED -- see scheduled_exchanges' own comment for the code-
-        # search finding (features/lags.py::_total_flow_lag sums every
-        # matching column, all of them).
-        expected_columns=frozenset(f"physical_net_de_to_{n.lower()}" for n in NEIGHBORS),
-        # Same 0.001 backstop as scheduled_exchanges above -- A9's probe run
-        # (2026-09-10, 75-day window) separately found an isolated settled
-        # gap in physical_net_de_to_pl at 2026-09-02 03:00 UTC, the same
-        # small/permanent-gap category as generation's finding, independent
-        # of the resolution-transition finding below.
-        max_nan_fraction={f"physical_net_de_to_{n.lower()}": 0.001 for n in NEIGHBORS},
-        # physical cross-border flows are TSO actuals (realised, measured
-        # after the fact) -- unlike scheduled_exchanges, which are a
-        # day-ahead schedule. Every neighbor column gets the live-tail
-        # settling exclusion.
-        live_settling_columns=frozenset(f"physical_net_de_to_{n.lower()}" for n in NEIGHBORS),
-        # Same hourly-vs-quarter-hourly resolution-transition phenomenon as
-        # scheduled_exchanges, found in the same A9 real full-history
-        # rebuild (2026-09-10): physical_net_de_to_{fr,pl} were genuinely
-        # hourly for years (physical_net_de_to_dk_1 stayed quarter-hourly
-        # throughout, hence no entry here); physical_net_de_to_{nl,at,ch}
-        # additionally show one brief shared blip in 2021-08 (~2.2% that
-        # month) at the exact same month FR/PL's multi-year transition
-        # begins -- almost certainly the same network-wide 15-minute
-        # settlement rollout, just already complete for these three borders
-        # within that one month. Windows again generous to the calendar
-        # month, not fitted to the exact observed fraction.
-        # Moved to data/entsoe_resolution_windows.py (2026-09-14) -- see the
-        # scheduled_exchanges entry above for why.
-        known_low_resolution_windows=CROSS_BORDER_FLOWS_LOW_RESOLUTION_WINDOWS,
+        # Entirely CARRIED -- see scheduled_exchanges' own comment above for
+        # the reasoning (same fetch group, same dropped cross-border-flow-lag
+        # track, spec 6.9 section 2.1/2.5) and for why grid_based=False also
+        # means known_low_resolution_windows is dropped, not just moved.
+        expected_columns=frozenset(),
+        carried_columns=frozenset(f"physical_net_de_to_{n.lower()}" for n in NEIGHBORS),
+        grid_based=False,
     ),
     "ttf_gas": SourceExpectation(
         expected_columns=frozenset({"ttf_gas_eur_per_mwh"}), grid_based=False
     ),
     "eua_co2": SourceExpectation(
-        expected_columns=frozenset({"eua_co2_eur_per_t"}), grid_based=False
+        # CARRIED (6.9 spec section 2.5, Owner 2026-09-24): no fallback-ladder
+        # row reads EUA any more (spec section 2.1 -- rows 1/2 keep only TTF
+        # gas, row 3 is gas-free entirely). grid_based is already False here
+        # (commodities are non-grid, daily, trading-days-only), so no change
+        # needed there.
+        expected_columns=frozenset(),
+        carried_columns=frozenset({"eua_co2_eur_per_t"}),
+        grid_based=False,
     ),
     # Energy-Charts, a permanent second source (6.9 spec section 2.4/2.5):
     # "Ein EC-Fehler im Pflege-Job ist nur eine Warnung, der Lauf bleibt

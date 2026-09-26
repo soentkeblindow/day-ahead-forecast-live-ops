@@ -18,7 +18,7 @@ import logging
 import os
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
@@ -26,7 +26,12 @@ from typing import Any, Final
 import holidays
 import pandas as pd
 
-from energy_price_forecast.arena.candidates import full_live_set_candidate_table, select_candidate
+from energy_price_forecast.arena.candidates import (
+    Candidate,
+    best_accepted_rank,
+    may_submit,
+    three_row_ladder,
+)
 from energy_price_forecast.arena.catalog import ChallengeSpec, get_challenge
 from energy_price_forecast.arena.config import ARENA_CHALLENGE_ID, is_live_enabled
 from energy_price_forecast.arena.live_inputs import (
@@ -35,6 +40,11 @@ from energy_price_forecast.arena.live_inputs import (
     price_provenance_report,
     read_quarterhourly_prices,
     read_weather_runs,
+)
+from energy_price_forecast.arena.load_patch import (
+    LoadPatchReference,
+    build_patched_load,
+    choose_reference_day,
 )
 from energy_price_forecast.arena.payload import build_payload, validate_payload
 from energy_price_forecast.arena.preflight import (
@@ -45,6 +55,7 @@ from energy_price_forecast.arena.preflight import (
     check_holiday_calendar,
     check_payload_plausibility,
     check_renewables_label_edge_age,
+    check_target_row,
     check_training_window,
     check_weather_run,
 )
@@ -63,7 +74,14 @@ from energy_price_forecast.evaluation.renewables_walkforward import (
 )
 from energy_price_forecast.evaluation.walkforward import Fold, walk_forward_splits
 from energy_price_forecast.features.build import build_feature_set_for_day
-from energy_price_forecast.features.nwp_fundamentals import IncompleteReconstructionError
+from energy_price_forecast.features.calendar import build_calendar_features
+from energy_price_forecast.features.config import FeatureConfig
+from energy_price_forecast.features.fundamentals import build_commodity_features
+from energy_price_forecast.features.lags import build_price_lags
+from energy_price_forecast.features.nwp_fundamentals import (
+    IncompleteReconstructionError,
+    build_nwp_forecast_fundamentals,
+)
 from energy_price_forecast.market_time import gate_closure_for_index
 from energy_price_forecast.models.arena_baseline import persistence_forecast
 from energy_price_forecast.models.bridge import expand_to_quarterhour, fit_shape_profile
@@ -76,6 +94,7 @@ from energy_price_forecast.ops.protocol import (
 )
 from energy_price_forecast.ops.store_sources import code_sha, run_id_and_url
 from energy_price_forecast.ops.windows import LOCAL_TZ, local_day_bounds, next_delivery_day
+from scripts.measurement_a_candidate_intake import build_floor_for_day
 
 logger = logging.getLogger(__name__)
 
@@ -186,29 +205,24 @@ def run_renewables_step(
     return predictions, runtime_seconds
 
 
-def build_price_feature_matrix(
-    df: pd.DataFrame, renewables_predictions: pd.DataFrame, target_day: dt.date
-) -> tuple[pd.DataFrame, Fold, set[dt.date]]:
-    """Build the price-model feature matrix for target_day's rolling
-    PRICE_TRAIN_SPAN_DAYS-day training window plus target_day itself (spec
-    section 5.4) -- features.build.build_feature_set_for_day is the one
-    codepath backtest and live both call (Entscheidung 10), never a second
-    live-only builder.
+def _hourly_index_for_local_day(target_day: dt.date) -> pd.DatetimeIndex:
+    start, end = local_day_bounds(target_day)
+    return pd.date_range(start, end, freq="h", inclusive="left").tz_convert("UTC")
 
-    The single Fold for target_day (train_index/test_index/gate_closure) is
-    obtained from evaluation/walkforward.py::walk_forward_splits, the same
-    function evaluation/arena_walkforward.py::run_live_gate_backtest uses,
-    rather than re-deriving local-day/DST boundaries here.
 
-    Days where build_feature_set_for_day raises IncompleteReconstructionError
-    are excluded, not filled (spec 6.5.3 section 3.3's whole-day-out policy,
-    the same handling evaluation/arena_walkforward.py::_build_matrix_over_days
-    applies -- reimplemented here in three lines rather than importing that
-    module's private helper, since evaluation/ stays untouched and this loop
-    is too small to be worth reaching into another module's internals for).
+def target_day_fold(df: pd.DataFrame, target_day: dt.date) -> Fold:
+    """The single Fold for target_day (train_index/test_index/gate_closure),
+    obtained from evaluation/walkforward.py::walk_forward_splits (spec
+    section 5.4) -- purely calendar/DST-derived from ``df``'s own hourly
+    index, independent of which row's features get fit on it (spec 6.9
+    section 2.6: "Zeile 2 hat dasselbe Trainingsfenster wie Zeile 1"; row 3
+    shares the identical fold too, only its own required columns/builder
+    differ). Computed once per run and shared by every row, rather than
+    re-derived per candidate.
 
-    Raises ValueError if target_day itself has no complete rolling training
-    window yet, or if every day in the needed range was excluded.
+    Raises ValueError if target_day has no complete rolling training window
+    at all -- a failure every row shares alike, so a caller may treat it as
+    silence before ever reaching row-specific evaluation.
     """
     hourly_index = pd.DatetimeIndex(df.index)
     target_str = target_day.isoformat()
@@ -226,8 +240,40 @@ def build_price_feature_matrix(
             f"no evaluable fold for {target_day} -- incomplete {PRICE_TRAIN_SPAN_DAYS}-day "
             "training window or missing test-day data"
         )
-    fold = folds[0]
+    return folds[0]
 
+
+def build_price_feature_matrix(
+    df: pd.DataFrame,
+    renewables_predictions: pd.DataFrame,
+    target_day: dt.date,
+    fold: Fold,
+    *,
+    builder: Callable[[dt.date, pd.DataFrame, pd.DataFrame], pd.DataFrame] | None = None,
+) -> tuple[pd.DataFrame, set[dt.date]]:
+    """Build one row's feature matrix for target_day's rolling
+    PRICE_TRAIN_SPAN_DAYS-day training window plus target_day itself (spec
+    section 5.4). ``builder`` defaults to features.build.build_feature_set_
+    for_day -- the one codepath backtest and rows 1/2 both call (Entscheidung
+    10) -- resolved at call time (``None`` sentinel, not a bound default
+    argument) so a test patching the module-level name still takes effect
+    without passing ``builder=`` explicitly. Row 3 (spec 6.9 section 2.1, no
+    NWP dependency) passes an adapter around scripts.measurement_a_
+    candidate_intake.build_floor_for_day instead (same signature shape,
+    ``renewables_predictions`` ignored), reusing the exact function Schritt
+    10's Parity Check already proved is a byte-identical column subset --
+    never a second, hand-rewritten builder.
+
+    Days where ``builder`` raises IncompleteReconstructionError are
+    excluded, not filled (spec 6.5.3 section 3.3's whole-day-out policy) --
+    ``build_floor_for_day`` never raises this (no NWP dependency at all), so
+    row 3's own ``excluded`` set is effectively always empty in practice.
+
+    Raises ValueError if every day in the needed range was excluded (target_
+    day's own presence/absence in the returned matrix is the caller's job to
+    check via the returned ``excluded`` set, not this function's).
+    """
+    build = builder if builder is not None else build_feature_set_for_day
     first_train_day = fold.train_index.tz_convert(LOCAL_TZ).normalize().min()
     all_days_needed = pd.date_range(
         first_train_day, pd.Timestamp(target_day, tz=LOCAL_TZ), freq="D", tz=LOCAL_TZ
@@ -237,13 +283,13 @@ def build_price_feature_matrix(
     excluded: set[dt.date] = set()
     for day in all_days_needed:
         try:
-            frames.append(build_feature_set_for_day(day.date(), df, renewables_predictions))
+            frames.append(build(day.date(), df, renewables_predictions))
         except IncompleteReconstructionError:
             excluded.add(day.date())
     if not frames:
         raise ValueError(f"no day produced a usable feature row for {target_day}")
 
-    return pd.concat(frames).sort_index(), fold, excluded
+    return pd.concat(frames).sort_index(), excluded
 
 
 def fit_predict_expand(
@@ -505,6 +551,132 @@ class SubmissionOutcome:
     training_tolerance_used: bool | None = None
     training_missing_days: tuple[dt.date, ...] = ()
     known_weather_defect_days: tuple[dt.date, ...] = ()
+    # spec 6.9 section 5.7 (Protokoll v5) / Leitprinzip 3 ("jede Rückfall-Zeile ...
+    # sichtbar"): one entry per row actually evaluated, rank order, {"name", "rank", "ok",
+    # "reasons"} -- populated even on total silence, so a silent day still names every row's
+    # own reason (spec section 5.1 step 7: "Trägt keine: Schweigen mit allen Gründen").
+    candidates_evaluated: tuple[dict[str, Any], ...] = ()
+    candidate_rank: int | None = None
+    load_forecast_source: str | None = None
+    load_patch_reference_day: dt.date | None = None
+    load_patch_weeks_back: int | None = None
+    load_patch_skipped: tuple[tuple[dt.date, str], ...] = ()
+    # spec 6.9 section 2.3: set True only when the capacity anchor table itself has expired
+    # (a Pflegeversäumnis, not a data outage) -- run_daily_submission() reddens the run on this
+    # alone, even if a lower row still submitted successfully (spec: "Zeile 3 reicht ein, aber
+    # der Lauf ist rot").
+    capacity_anchor_expired: bool = False
+    # spec 6.9 section 2.9 (Downgrade-Schutz): set True when a row would have been selected but
+    # a better-or-equal rank was already accepted live for target_day earlier today -- the run
+    # stays green (spec: "endet der Lauf grün"), candidate_selected/payload are still populated
+    # (the payload is archived regardless), but no submit() call is made.
+    downgrade_blocked: bool = False
+    best_accepted_rank_before: int | None = None
+
+
+def determine_load_patch_reference(
+    target_day: dt.date, df: pd.DataFrame
+) -> LoadPatchReference | None:
+    """Spec 6.9 section 5.1 step 7c -- only reached for row 2
+    (core_gas_loadpatch). ``is_holiday``/``is_complete`` are injected per
+    arena.load_patch's own contract (spec section 5.5): the holiday source
+    is the identical nationwide-DE-only check features/calendar.py's
+    is_holiday feature and holiday_calendar_covers_target above both use
+    (spec section 2.2: "Die Feiertagsquelle ist dieselbe wie für die
+    Kalender-Features"); ``is_complete`` reads the raw, un-coalesced ENTSO-E
+    load_forecast_day_ahead column directly (spec section 2.2 point 2: "im
+    Speicher"), not any candidate's own built feature matrix.
+    """
+    return choose_reference_day(
+        target_day,
+        is_holiday=lambda day: day in holidays.country_holidays("DE", years=[day.year]),
+        is_complete=lambda day: bool(
+            df["load_forecast_day_ahead"].reindex(_hourly_index_for_local_day(day)).notna().all()
+        ),
+    )
+
+
+def build_row2_target_row(
+    df: pd.DataFrame,
+    renewables_predictions: pd.DataFrame,
+    target_day: dt.date,
+    reference_day: dt.date,
+) -> pd.DataFrame:
+    """Spec 6.9 section 5.1 step 8 (the Last-Patch): patches ONLY
+    target_day's own load_forecast_day_ahead cells via
+    arena.load_patch.build_patched_load (the package's one implementation,
+    spec section 3.2), then rebuilds target_day's row through the
+    unmodified, unchanged build_feature_set_for_day -- "gleiche Features,
+    gleiches Training" (spec section 2.1: row 2 is literally the same model
+    as row 1). The patch is applied to a local copy of ``df`` that is
+    discarded after this call returns -- no training row is ever touched
+    (spec section 2.2: "Der Patch schreibt nie in Trainingszeilen").
+    """
+    patched_load = build_patched_load(df["load_forecast_day_ahead"], reference_day, target_day)
+    patched_df = df.copy()
+    patched_df.loc[patched_load.index, "load_forecast_day_ahead"] = patched_load.to_numpy()
+    return build_feature_set_for_day(target_day, patched_df, renewables_predictions)
+
+
+def nwp_group_columns_for_day(
+    target_day: dt.date, df: pd.DataFrame, renewables_predictions: pd.DataFrame
+) -> tuple[frozenset[str], frozenset[str]]:
+    """The (load_forecast, nwp_residual) column-name split (spec section
+    2.1/5.2) for rows 1/2, read off build_nwp_forecast_fundamentals's own
+    six-feature output for target_day -- safe to call here since this is
+    only reached once row1_row2_matrix's own build already succeeded for
+    target_day (build_ladder's own docstring). A separate, named function
+    (not inlined into run_submission_for_day) purely so tests can mock this
+    one unit without needing a real renewables_predictions frame shaped
+    exactly as build_nwp_forecast_fundamentals expects.
+    """
+    target_index = _hourly_index_for_local_day(target_day)
+    fundamentals = build_nwp_forecast_fundamentals(df, renewables_predictions, target_index)
+    return frozenset({fundamentals[0].name}), frozenset(f.name for f in fundamentals[1:])
+
+
+def build_ladder(
+    target_day: dt.date,
+    df: pd.DataFrame,
+    *,
+    nwp_group_columns: tuple[frozenset[str], frozenset[str]] | None,
+    cfg: FeatureConfig | None = None,
+) -> tuple[Candidate, ...]:
+    """Assembles arena.candidates.three_row_ladder with target_day's own
+    real per-group column names -- never hand-enumerated (spec section
+    2.1). calendar/price_lags/gas never touch NWP/renewables data at all
+    (safe to derive regardless of NWP availability, the same independence
+    row 3 itself relies on); ``nwp_group_columns`` (load_forecast,
+    nwp_residual) is None when NWP is unavailable for target_day -- rows
+    1/2 are always gated on ``requires_nwp`` before their (then empty,
+    meaningless) required_columns() is ever consulted, so this is harmless.
+    """
+    cfg = cfg or FeatureConfig()
+    target_index = _hourly_index_for_local_day(target_day)
+    calendar_columns = frozenset(f.name for f in build_calendar_features(target_index, cfg))
+    price_lag_columns = frozenset(f.name for f in build_price_lags(df, target_index, cfg))
+    gas_columns = frozenset(f.name for f in build_commodity_features(df, target_index, cfg)[:1])
+    load_forecast_columns, nwp_residual_columns = nwp_group_columns or (frozenset(), frozenset())
+    return three_row_ladder(
+        calendar_columns=calendar_columns,
+        nwp_residual_columns=nwp_residual_columns,
+        load_forecast_columns=load_forecast_columns,
+        price_lag_columns=price_lag_columns,
+        gas_columns=gas_columns,
+    )
+
+
+def _base_builder(day: dt.date, df: pd.DataFrame, _renewables: pd.DataFrame) -> pd.DataFrame:
+    """Row 3's own builder adapter for build_price_feature_matrix's
+    ``builder`` parameter (spec section 2.1: gas-free, no NWP dependency at
+    all) -- reuses scripts.measurement_a_candidate_intake.build_floor_for_day
+    unchanged (Schritt 10's Parity Check already proved it is a byte-
+    identical column subset of build_feature_set_for_day), never a second,
+    hand-rewritten builder. The ``_renewables`` argument only exists to
+    match build_feature_set_for_day's own call shape -- build_floor_for_day
+    takes no renewables data at all.
+    """
+    return build_floor_for_day(day, df, FeatureConfig(), commodities="none")
 
 
 def run_submission_for_day(
@@ -517,40 +689,31 @@ def run_submission_for_day(
     live: bool = False,
     now: Callable[[], pd.Timestamp] = _utcnow,
     weather_root: Path = CACHE_ROOT,
+    submitted_records: Iterable[dict[str, object]] = (),
 ) -> SubmissionOutcome:
-    """The prediction pipeline for one target day (spec section 5.1, steps
-    4-10; spec 6.7.3 section 5.4): Check A, renewables walk-forward, feature
-    build, Check B plus the training-extent guard, candidate selection,
-    price fit/predict/expand, payload build/validate/plausibility, a second
-    gate-closure check, and submit() -- ``live`` is threaded straight
-    through to it (arena/submit.py's own ``if not live: return`` is what
-    actually keeps a dry run from sending, not a guard here).
+    """The prediction pipeline for one target day (spec 6.9 section 5.1) --
+    Check A, the three-row fallback ladder (rank order: core_gas ->
+    core_gas_loadpatch -> base), price fit/predict/expand, payload build/
+    validate/plausibility, a second gate-closure check, downgrade
+    protection, and submit() -- ``live`` is threaded straight through to it
+    (arena/submit.py's own ``if not live: return`` is what actually keeps a
+    dry run from sending, not a guard here).
 
     A failure at any check point (including the second gate-closure check)
     returns immediately with ``skip_reason`` set and ``candidate_selected``
     left as it was found -- a silent day is an expected operating state
     (spec section 2.7), never an exception from this function for an
-    expected failure mode. An *unexpected* exception (a genuine bug, a
-    raised IncompleteReconstructionError escaping past the per-day catch in
-    build_price_feature_matrix, an LGBMForecaster failure) is deliberately
-    NOT caught here -- it propagates to the caller, which is where
-    "unerwartete Ausnahme" (spec section 2.7's second red condition,
-    distinct from silence) belongs.
+    expected failure mode. An *unexpected* exception (a genuine bug, an
+    LGBMForecaster failure) is deliberately NOT caught here -- it
+    propagates to the caller, which is where "unerwartete Ausnahme" (spec
+    section 2.7's second red condition, distinct from silence) belongs.
 
-    ``as_of`` (the run's own wall-clock time) is used only for the
-    non-blocking commodity-staleness measurement (spec section 2.3) --
-    computed once, right after Check A, and carried in every returned
-    SubmissionOutcome (including early skips), since it is diagnostic
-    information about ``df``'s own freshness, independent of how far the
-    run otherwise got. ``now`` is a second, later wall-clock reading, used
-    only for the pre-POST gate-closure re-check (spec section 2.4) -- a
-    real fit/predict pass takes real minutes, so re-using ``as_of`` there
-    would never catch a run that crossed the deadline while computing.
-    Injectable so tests never depend on real time.
-
-    ``weather_root`` defaults to the real local cache, matching every
-    existing caller's behaviour unchanged -- see check_a_nwp's own
-    docstring for why scripts/outage_drill.py (spec 6.9) needs to override it.
+    ``as_of``/``now``/``weather_root`` are unchanged from before this step
+    -- see the prior revision's own docstring for their reasoning.
+    ``submitted_records`` is the already-read protocol log (spec section
+    2.9's downgrade protection, arena.candidates.best_accepted_rank) -- read
+    once by the caller (run_daily_submission), not by this function, so
+    tests can pass a synthetic list without touching a real log file.
     """
     check_global = check_a_global(target_day)
     if not check_global.ok:
@@ -569,97 +732,223 @@ def run_submission_for_day(
             "capacity anchor table expires in %.1f day(s) (CAPACITY_ANCHOR_WARN_DAYS)",
             nwp.anchor.days_until_expiry,
         )
-    if not nwp.ok:
-        # Schritt 8 still has only the one row, and it needs the NWP reconstruction
-        # unconditionally -- unavailability here is still silence, same as before this
-        # step. Only once a gasfrei row exists (spec 6.9 section 2.1, Schritt 11) does
-        # this stop being the end of the run.
-        return SubmissionOutcome(
-            candidate_selected=None,
-            skip_reason="Check A: " + "; ".join(nwp.reasons),
-            commodity_staleness_warnings=commodity_staleness_warnings,
-            nwp_available=False,
-            nwp_unavailable_reason="; ".join(nwp.reasons),
-            capacity_anchor_days_left=nwp.anchor.days_until_expiry,
-        )
+    # spec section 2.3: an expired anchor is its own, separately-visible red condition
+    # (checked later against whichever row is finally selected, if any), distinct from an
+    # ordinary weather-run failure -- both still make rows 1/2 unusable the same way.
+    anchor_expired = not nwp.ok and any("capacity anchor table not valid" in r for r in nwp.reasons)
 
-    # spec 6.9 section 2.7: a cheap guard before the walk-forward itself, mirroring
-    # check_weather_run/check_capacity_anchor's own "gate before the expensive work" shape.
-    label_result, rnw_label_edge_age_days = check_a_renewables_labels(df, target_day)
-    if not label_result.ok:
-        return SubmissionOutcome(
-            candidate_selected=None,
-            skip_reason="Check A: " + "; ".join(label_result.reasons),
-            commodity_staleness_warnings=commodity_staleness_warnings,
-            nwp_available=True,
-            capacity_anchor_days_left=nwp.anchor.days_until_expiry,
-            rnw_label_edge_age_days=rnw_label_edge_age_days,
-        )
-
-    renewables_predictions, renewables_runtime_seconds = run_renewables_step(
-        df, weather, target_day
-    )
-    matrix, fold, excluded = build_price_feature_matrix(df, renewables_predictions, target_day)
-
-    # Checked against the TRAINING portion only (target_day's own row is excluded here) --
-    # must_reach is the training window's own last day, target_day - 1, not target_day itself.
-    # Using the full matrix (with target_day's row always present) would make this check
-    # unable to ever see a frozen training window, exactly the failure mode it exists to catch
-    # (spec section 2.4).
-    training_matrix = matrix.loc[matrix.index.isin(fold.train_index)]
-    last_train_day = fold.train_index.tz_convert(LOCAL_TZ).normalize().max().date()
-    window_result, window_report = check_training_window(
-        training_matrix,
-        df["day_ahead_price"],
-        frozenset(matrix.columns),
-        must_reach=last_train_day,
-        window_days=PRICE_TRAIN_SPAN_DAYS,
-    )
-    # spec 6.9 section 5.7: these protocol_version 4 fields are this step's own job to fill in
-    # (docs/sprint6_step6_9_log.md step 3's schema-only scaffolding) -- training_tolerance_used
-    # is a coarse "was the window perfectly complete" flag, distinct from
-    # TrainingWindowReport.tolerance_used (the (min_training_days, max_edge_age_days) constants
-    # actually applied, which never vary at runtime and so add nothing new to log per run).
-    training_window_fields: dict[str, Any] = {
-        "nwp_available": True,
+    common_fields: dict[str, Any] = {
+        "commodity_staleness_warnings": commodity_staleness_warnings,
+        "nwp_available": nwp.ok,
         "capacity_anchor_days_left": nwp.anchor.days_until_expiry,
-        "rnw_label_edge_age_days": rnw_label_edge_age_days,
-        "n_training_days": window_report.n_training_days,
-        "age_of_last_complete_day": window_report.age_of_last_complete_day,
-        "training_tolerance_used": bool(window_report.missing_days),
-        "training_missing_days": window_report.missing_days,
-        "known_weather_defect_days": window_report.known_weather_defect_days,
     }
-    if not window_result.ok:
+    if not nwp.ok:
+        common_fields["nwp_unavailable_reason"] = "; ".join(nwp.reasons)
+
+    # spec 6.9 section 5.1 step 6 ("Feature-Matrix bauen"): the fold (train_index/test_index)
+    # is shared by every row, including row 3 -- computed here, after Check A, not before it
+    # (spec's own step order), so a Check A failure never needs df to have a usable rolling
+    # window at all.
+    try:
+        fold = target_day_fold(df, target_day)
+    except ValueError as exc:
         return SubmissionOutcome(
             candidate_selected=None,
-            skip_reason="training window: " + "; ".join(window_result.reasons),
-            renewables_runtime_seconds=renewables_runtime_seconds,
-            excluded_training_days=frozenset(excluded),
-            commodity_staleness_warnings=commodity_staleness_warnings,
-            **training_window_fields,
+            skip_reason=str(exc),
+            **common_fields,
         )
 
-    # Check B / candidate selection look only at target_day's own row(s) -- required by
-    # check_target_row's own contract (NaN-checks the frame it's given, not a specific day
-    # within it), confirmed against tests/test_candidates.py's fixtures, which pass single-row
-    # frames. Passing the full training-plus-target matrix here would wrongly fail on any NaN
-    # anywhere in 90 days of training history, not target_day's own freshness.
-    candidates = full_live_set_candidate_table(frozenset(matrix.columns))
-    selection = select_candidate(candidates, matrix.loc[fold.test_index], target_day)
-    if selection.candidate is None:
+    nwp_usable = nwp.ok
+    row1_row2_matrix: pd.DataFrame | None = None
+    renewables_predictions: pd.DataFrame | None = None
+    renewables_runtime_seconds: float | None = None
+    excluded_training_days: frozenset[dt.date] = frozenset()
+    nwp_group_columns: tuple[frozenset[str], frozenset[str]] | None = None
+    nwp_unusable_reason = "; ".join(nwp.reasons) if not nwp.ok else None
+
+    if nwp_usable:
+        # spec 6.9 section 2.7: a cheap guard before the walk-forward itself.
+        label_result, rnw_label_edge_age_days = check_a_renewables_labels(df, target_day)
+        common_fields["rnw_label_edge_age_days"] = rnw_label_edge_age_days
+        if not label_result.ok:
+            nwp_usable = False
+            nwp_unusable_reason = "; ".join(label_result.reasons)
+        else:
+            renewables_predictions, renewables_runtime_seconds = run_renewables_step(
+                df, weather, target_day
+            )
+            try:
+                row1_row2_matrix, excluded = build_price_feature_matrix(
+                    df, renewables_predictions, target_day, fold
+                )
+            except ValueError as exc:
+                nwp_usable = False
+                nwp_unusable_reason = str(exc)
+            else:
+                excluded_training_days = frozenset(excluded)
+                if target_day in excluded:
+                    nwp_usable = False
+                    nwp_unusable_reason = f"NWP reconstruction incomplete for {target_day} itself"
+                else:
+                    nwp_group_columns = nwp_group_columns_for_day(
+                        target_day, df, renewables_predictions
+                    )
+
+    ladder = build_ladder(target_day, df, nwp_group_columns=nwp_group_columns)
+    last_train_day = fold.train_index.tz_convert(LOCAL_TZ).normalize().max().date()
+
+    candidates_evaluated: list[dict[str, Any]] = []
+    selected: Candidate | None = None
+    selected_matrix: pd.DataFrame | None = None
+    load_patch_reference: LoadPatchReference | None = None
+    training_report = None
+
+    for candidate in ladder:
+        if candidate.requires_nwp and not nwp_usable:
+            candidates_evaluated.append(
+                {
+                    "name": candidate.name,
+                    "rank": candidate.rank,
+                    "ok": False,
+                    "reasons": (f"NWP unavailable: {nwp_unusable_reason}",),
+                }
+            )
+            continue
+
+        reference: LoadPatchReference | None = None
+        if candidate.load_source == "similar_day":
+            reference = determine_load_patch_reference(target_day, df)
+            if reference is None:
+                candidates_evaluated.append(
+                    {
+                        "name": candidate.name,
+                        "rank": candidate.rank,
+                        "ok": False,
+                        "reasons": ("no usable Similar-Day-Patch reference day found",),
+                    }
+                )
+                continue
+            assert row1_row2_matrix is not None and renewables_predictions is not None
+            row2_target_row = build_row2_target_row(
+                df, renewables_predictions, target_day, reference.reference_day
+            )
+            row_matrix = row1_row2_matrix.copy()
+            row_matrix.loc[fold.test_index, row2_target_row.columns] = row2_target_row.reindex(
+                fold.test_index
+            )
+        elif candidate.rank == 3:
+            try:
+                row_matrix, base_excluded = build_price_feature_matrix(
+                    df, pd.DataFrame(), target_day, fold, builder=_base_builder
+                )
+            except ValueError as exc:
+                candidates_evaluated.append(
+                    {
+                        "name": candidate.name,
+                        "rank": candidate.rank,
+                        "ok": False,
+                        "reasons": (str(exc),),
+                    }
+                )
+                continue
+            if target_day in base_excluded:
+                candidates_evaluated.append(
+                    {
+                        "name": candidate.name,
+                        "rank": candidate.rank,
+                        "ok": False,
+                        "reasons": (f"row 3's own build excluded {target_day}",),
+                    }
+                )
+                continue
+        else:
+            assert row1_row2_matrix is not None
+            row_matrix = row1_row2_matrix
+
+        required = candidate.required_columns()
+        row_matrix = row_matrix[sorted(required)]
+        training_matrix = row_matrix.loc[row_matrix.index.isin(fold.train_index)]
+        window_result, window_report = check_training_window(
+            training_matrix,
+            df["day_ahead_price"],
+            required,
+            must_reach=last_train_day,
+            window_days=PRICE_TRAIN_SPAN_DAYS,
+        )
+        if not window_result.ok:
+            candidates_evaluated.append(
+                {
+                    "name": candidate.name,
+                    "rank": candidate.rank,
+                    "ok": False,
+                    "reasons": window_result.reasons,
+                }
+            )
+            continue
+
+        target_check = check_target_row(row_matrix.loc[fold.test_index], target_day, required)
+        if not target_check.ok:
+            candidates_evaluated.append(
+                {
+                    "name": candidate.name,
+                    "rank": candidate.rank,
+                    "ok": False,
+                    "reasons": target_check.reasons,
+                    "missing_features": target_check.missing_features,
+                }
+            )
+            continue
+
+        selected = candidate
+        selected_matrix = row_matrix
+        training_report = window_report
+        load_patch_reference = reference
+        candidates_evaluated.append(
+            {"name": candidate.name, "rank": candidate.rank, "ok": True, "reasons": ()}
+        )
+        break
+
+    training_window_fields: dict[str, Any] = {}
+    if training_report is not None:
+        training_window_fields = {
+            "n_training_days": training_report.n_training_days,
+            "age_of_last_complete_day": training_report.age_of_last_complete_day,
+            "training_tolerance_used": bool(training_report.missing_days),
+            "training_missing_days": training_report.missing_days,
+            "known_weather_defect_days": training_report.known_weather_defect_days,
+        }
+    load_patch_fields: dict[str, Any] = {}
+    if load_patch_reference is not None:
+        load_patch_fields = {
+            "load_patch_reference_day": load_patch_reference.reference_day,
+            "load_patch_weeks_back": load_patch_reference.weeks_back,
+            "load_patch_skipped": load_patch_reference.skipped,
+        }
+
+    if selected is None or selected_matrix is None:
+        # spec section 2.5: every offending column named individually, across every row
+        # tried (deduplicated, first-seen order) -- not just the last one, since a silent
+        # day may be silent for three different reasons at once.
+        missing_features: list[str] = []
+        for e in candidates_evaluated:
+            for column in e.get("missing_features", ()):
+                if column not in missing_features:
+                    missing_features.append(column)
         return SubmissionOutcome(
             candidate_selected=None,
-            skip_reason="Check B: " + "; ".join(selection.result.reasons),
-            missing_features=selection.result.missing_features,
+            skip_reason="Check B: "
+            + "; ".join(f"{e['name']}: {'; '.join(e['reasons'])}" for e in candidates_evaluated),
+            missing_features=tuple(missing_features),
             renewables_runtime_seconds=renewables_runtime_seconds,
-            excluded_training_days=frozenset(excluded),
-            commodity_staleness_warnings=commodity_staleness_warnings,
+            excluded_training_days=excluded_training_days,
+            candidates_evaluated=tuple(candidates_evaluated),
+            capacity_anchor_expired=anchor_expired,
+            **common_fields,
             **training_window_fields,
         )
 
     quarterhourly_forecast, n_training_rows, n_training_labels = fit_predict_expand(
-        df, matrix, fold, prices_qh
+        df, selected_matrix, fold, prices_qh
     )
     payload, challenge = build_arena_payload(quarterhourly_forecast, target_day)
 
@@ -670,14 +959,19 @@ def run_submission_for_day(
     )
     if not plausibility.ok:
         return SubmissionOutcome(
-            candidate_selected=selection.candidate.name,
+            candidate_selected=selected.name,
+            candidate_rank=selected.rank,
+            load_forecast_source=selected.load_source,
             skip_reason="payload plausibility: " + "; ".join(plausibility.reasons),
             renewables_runtime_seconds=renewables_runtime_seconds,
-            excluded_training_days=frozenset(excluded),
-            commodity_staleness_warnings=commodity_staleness_warnings,
+            excluded_training_days=excluded_training_days,
+            candidates_evaluated=tuple(candidates_evaluated),
             n_training_rows=n_training_rows,
             n_training_labels=n_training_labels,
+            capacity_anchor_expired=anchor_expired,
+            **common_fields,
             **training_window_fields,
+            **load_patch_fields,
         )
 
     # spec 6.7.3 section 2.4: re-check the gate closure immediately before the POST -- a
@@ -686,30 +980,64 @@ def run_submission_for_day(
     # section 5.4 step 11: the payload archive runs regardless of whether anything sent).
     if is_past_gate_closure(target_day, now()):
         return SubmissionOutcome(
-            candidate_selected=selection.candidate.name,
+            candidate_selected=selected.name,
+            candidate_rank=selected.rank,
+            load_forecast_source=selected.load_source,
             skip_reason="gate closure passed before POST",
             payload=payload,
             renewables_runtime_seconds=renewables_runtime_seconds,
-            excluded_training_days=frozenset(excluded),
-            commodity_staleness_warnings=commodity_staleness_warnings,
+            excluded_training_days=excluded_training_days,
+            candidates_evaluated=tuple(candidates_evaluated),
             n_training_rows=n_training_rows,
             n_training_labels=n_training_labels,
+            capacity_anchor_expired=anchor_expired,
+            **common_fields,
             **training_window_fields,
+            **load_patch_fields,
+        )
+
+    # spec 6.9 section 2.9 (Downgrade-Schutz): a later slot must not overwrite an
+    # already-accepted, better-or-equal-rank live submission for target_day.
+    best_rank = best_accepted_rank(submitted_records, target_day, ladder)
+    if not may_submit(selected.rank, best_rank):
+        return SubmissionOutcome(
+            candidate_selected=selected.name,
+            candidate_rank=selected.rank,
+            load_forecast_source=selected.load_source,
+            skip_reason=f"KEPT -- rank {best_rank} already accepted, this run: rank {selected.rank}",
+            payload=payload,
+            renewables_runtime_seconds=renewables_runtime_seconds,
+            excluded_training_days=excluded_training_days,
+            candidates_evaluated=tuple(candidates_evaluated),
+            n_training_rows=n_training_rows,
+            n_training_labels=n_training_labels,
+            capacity_anchor_expired=anchor_expired,
+            downgrade_blocked=True,
+            best_accepted_rank_before=best_rank,
+            **common_fields,
+            **training_window_fields,
+            **load_patch_fields,
         )
 
     submission_result = submit(challenge, payload, live=live)
 
     return SubmissionOutcome(
-        candidate_selected=selection.candidate.name,
+        candidate_selected=selected.name,
+        candidate_rank=selected.rank,
+        load_forecast_source=selected.load_source,
         skip_reason=None,
         payload=payload,
         submission_result=submission_result,
         renewables_runtime_seconds=renewables_runtime_seconds,
-        excluded_training_days=frozenset(excluded),
-        commodity_staleness_warnings=commodity_staleness_warnings,
+        excluded_training_days=excluded_training_days,
+        candidates_evaluated=tuple(candidates_evaluated),
         n_training_rows=n_training_rows,
         n_training_labels=n_training_labels,
+        capacity_anchor_expired=anchor_expired,
+        best_accepted_rank_before=best_rank,
+        **common_fields,
         **training_window_fields,
+        **load_patch_fields,
     )
 
 
@@ -809,6 +1137,18 @@ def _submission_fields(
     )
 
 
+def _jsonable_candidate_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    """One SubmissionOutcome.candidates_evaluated entry, JSON-line-safe
+    (spec section 5.7): ``reasons``/``missing_features`` are tuples inside
+    run_submission_for_day (matching arena.preflight.PreflightResult's own
+    convention) but must be lists for json.dumps."""
+    out = dict(entry)
+    out["reasons"] = list(out.get("reasons", ()))
+    if "missing_features" in out:
+        out["missing_features"] = list(out["missing_features"])
+    return out
+
+
 def build_submission_record(
     outcome: SubmissionOutcome,
     manifest: store.Manifest,
@@ -900,6 +1240,18 @@ def build_submission_record(
         training_tolerance_used=outcome.training_tolerance_used,
         training_missing_days=[d.isoformat() for d in outcome.training_missing_days],
         known_weather_defect_days=[d.isoformat() for d in outcome.known_weather_defect_days],
+        candidate_rank=outcome.candidate_rank,
+        candidates_evaluated=[_jsonable_candidate_entry(e) for e in outcome.candidates_evaluated],
+        load_forecast_source=outcome.load_forecast_source,
+        downgrade_blocked=outcome.downgrade_blocked,
+        best_accepted_rank_before=outcome.best_accepted_rank_before,
+        load_patch_reference_day=(
+            outcome.load_patch_reference_day.isoformat()
+            if outcome.load_patch_reference_day is not None
+            else None
+        ),
+        load_patch_weeks_back=outcome.load_patch_weeks_back,
+        load_patch_skipped=[[d.isoformat(), reason] for d, reason in outcome.load_patch_skipped],
     )
 
 
@@ -966,6 +1318,9 @@ def run_daily_submission(
     )
     weather = read_weather_runs([d.date() for d in local_days])
     prices_qh = read_quarterhourly_prices()
+    # spec 6.9 section 2.9 (Downgrade-Schutz): read once here, not inside
+    # run_submission_for_day itself, so tests can pass a synthetic list.
+    submitted_records = read_submission_records(SUBMISSIONS_LOG)
 
     # Restarbeit Teil C.4: an unexpected exception here (spec section 2.7's
     # second red condition, distinct from silence) is deliberately NOT
@@ -977,7 +1332,15 @@ def run_daily_submission(
     # re-raises unchanged -- exit code, traceback, and CI redness are
     # exactly as before this addition.
     try:
-        outcome = run_submission_for_day(df, weather, prices_qh, target_day, as_of=as_of, live=live)
+        outcome = run_submission_for_day(
+            df,
+            weather,
+            prices_qh,
+            target_day,
+            as_of=as_of,
+            live=live,
+            submitted_records=submitted_records,
+        )
     except Exception as exc:  # noqa: BLE001 -- deliberately broad, re-raised unchanged below
         print(f"EXCEPTION — {type(exc).__name__}: {exc}")
         raise
@@ -1015,8 +1378,19 @@ def run_daily_submission(
             "training row(s) have no real day_ahead_price label"
         )
 
+    # spec 6.9 section 2.9 (Downgrade-Schutz): a later, worse-or-would-be-equal-but-blocked
+    # rank never reddens the run -- an earlier, better-or-equal rank is already accepted and
+    # archived for target_day (spec: "endet der Lauf grün").
+    if outcome.downgrade_blocked:
+        print(f"KEPT — {outcome.skip_reason}")
+        return 0
+
     if outcome.skip_reason is not None:
         print(f"SILENT — {outcome.skip_reason}")
+        # spec 6.9 section 2.3: an expired capacity anchor table is a Pflegeversäumnis, not
+        # an ordinary data outage -- it reddens the run even on a day with no complete rows.
+        if outcome.capacity_anchor_expired:
+            return 1
         # spec 6.7.3 section 2.4: the last slot reads the protocol (never a lock) --
         # a day with an already-accepted submission from an earlier run stays green
         # even if this, the final, run itself stayed silent.
@@ -1028,9 +1402,21 @@ def run_daily_submission(
 
     response_exit = _print_response_summary(outcome, target_day)
     if response_exit is not None:
+        # spec 6.9 section 2.3: "Zeile 3 reicht ein, aber der Lauf ist rot" -- an expired
+        # anchor table reddens even an otherwise-successful submission (never downgrades an
+        # already-red response_exit, e.g. a rejected live POST).
+        if outcome.capacity_anchor_expired and response_exit == 0:
+            print("FALLBACK — capacity anchor table expired")
+            return 1
         return response_exit
 
-    print(f"submitted (dry-run): candidate={outcome.candidate_selected}, target_day={target_day}")
+    print(
+        f"submitted (dry-run): candidate={outcome.candidate_selected}"
+        f"{_candidate_summary_suffix(outcome)}, target_day={target_day}"
+    )
+    if outcome.capacity_anchor_expired:
+        print("FALLBACK — capacity anchor table expired")
+        return 1
     return 0
 
 
@@ -1057,10 +1443,35 @@ def _print_response_summary(outcome: SubmissionOutcome, target_day: dt.date) -> 
 
     n_values = len(outcome.payload["values"]) if outcome.payload is not None else None
     print(
-        f"SUBMITTED — target {target_day}, {n_values} values, "
+        f"SUBMITTED — target {target_day}, {outcome.candidate_selected}"
+        f"{_candidate_summary_suffix(outcome)}, {n_values} values, "
         f"status {result.status}, id {result.submission_id}"
     )
     return 0
+
+
+def _candidate_summary_suffix(outcome: SubmissionOutcome) -> str:
+    """Spec 6.9 section 5.7's SUBMITTED example: ``core_gas_loadpatch (rank
+    2, FALLBACK: load_forecast missing, reference 2026-10-01)`` -- names why
+    every higher-ranked row failed and, for row 2, which reference day the
+    patch used. Rank 1 (no fallback happened) gets no FALLBACK clause.
+    Returns "" for a smoke outcome (candidate_rank is always None there).
+    """
+    if outcome.candidate_rank is None:
+        return ""
+    if outcome.candidate_rank == 1:
+        return f" (rank {outcome.candidate_rank})"
+    prior_reasons = "; ".join(
+        f"{e['name']}: {'; '.join(e['reasons'])}"
+        for e in outcome.candidates_evaluated
+        if not e["ok"] and e["rank"] < outcome.candidate_rank
+    )
+    reference = (
+        f", reference {outcome.load_patch_reference_day}"
+        if outcome.load_patch_reference_day is not None
+        else ""
+    )
+    return f" (rank {outcome.candidate_rank}, FALLBACK: {prior_reasons}{reference})"
 
 
 def smoke_target_day(as_of: pd.Timestamp) -> dt.date:

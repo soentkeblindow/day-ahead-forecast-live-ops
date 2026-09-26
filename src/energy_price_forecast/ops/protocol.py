@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
 
-PROTOCOL_VERSION: Final[int] = 4
+PROTOCOL_VERSION: Final[int] = 5
 
 # Fixed so every appended line writes its keys in the same order (spec
 # section 2.8: "sonst sind die Git-Diffs verrauscht"). New fields are
@@ -69,13 +69,11 @@ _KEY_ORDER: Final[tuple[str, ...]] = (
     "confirmed_via_query",
     "smoke_baseline_source_day",
     # protocol_version 4 (spec 6.9, section 5.7) -- appended, same rule.
-    # Step 3 (docs/sprint6_step6_9_log.md) only adds the schema; every field
-    # here is None/empty until the step that actually computes it lands
-    # (candidate_rank/candidates_evaluated/downgrade_blocked/
-    # best_accepted_rank_before in step 10, nwp_available/training_* in
-    # step 8, target_day_fills in step 11, load_forecast_source/
-    # price_provenance/price_source_conflicts in step 7,
-    # rnw_label_edge_age_days in step 8, capacity_anchor_days_left in step 8).
+    # Step 3 (docs/sprint6_step6_9_log.md) only added the schema; each field was None/empty
+    # until the step that actually computes it landed (candidate_rank/candidates_evaluated/
+    # downgrade_blocked/best_accepted_rank_before/load_forecast_source in step 11,
+    # nwp_available/training_*/rnw_label_edge_age_days/capacity_anchor_days_left in step 8,
+    # price_provenance/price_source_conflicts in step 7, target_day_fills in step 12).
     "candidate_rank",
     "candidates_evaluated",
     "nwp_available",
@@ -93,6 +91,10 @@ _KEY_ORDER: Final[tuple[str, ...]] = (
     "downgrade_blocked",
     "best_accepted_rank_before",
     "capacity_anchor_days_left",
+    # protocol_version 5 (spec 6.9 section 5.7, Schritt 11) -- appended, same rule.
+    "load_patch_reference_day",
+    "load_patch_weeks_back",
+    "load_patch_skipped",
 )
 
 
@@ -159,10 +161,15 @@ class SubmissionRecord:
     step 3) -- every one of them is still its default here, filled in by
     later 6.9 steps once the corresponding logic exists:
 
-    - ``candidate_rank``: the selected fallback-ladder row's rank (1-3).
-    - ``candidates_evaluated``: one entry per row tried, each
-      ``{"name": ..., "rank": ..., "outcome": "selected"/"failed"/
-      "not_reached", "reason": ...}``.
+    - ``candidate_rank``: the selected fallback-ladder row's rank (1-3),
+      ``None`` on total silence.
+    - ``candidates_evaluated`` (shape settled in step 11, not the shape
+      originally sketched here): one entry per row actually reached, in
+      rank order, each ``{"name": ..., "rank": ..., "ok": bool,
+      "reasons": [...]}`` (and ``"missing_features": [...]`` when Check B
+      itself is what failed) -- a row skipped outright because an earlier
+      row already succeeded is simply absent from the list, not recorded
+      as "not_reached".
     - ``nwp_available``/``nwp_unavailable_reason``: Check A's split NWP
       verdict (spec section 2.3) -- whether weather/capacity allowed a
       renewables walk-forward at all this run, independent of which row
@@ -173,8 +180,12 @@ class SubmissionRecord:
     - ``price_source_conflicts``: count of cells where both ENTSO-E and
       Energy-Charts had a value and they disagreed (spec section 5.3) --
       purely informative, never gates, never warns.
-    - ``load_forecast_source``: ``"entsoe"``/``"energy_charts"``/``None``,
-      whichever fed the selected row's load-forecast fundamentals.
+    - ``load_forecast_source``: ``"entsoe"``/``"similar_day"``/``None``
+      (revised in step 11 -- Fassung 2 of the spec replaced the originally
+      envisioned EC-load candidate with the Similar-Day-Patch, spec section
+      1/2.4), whichever fed the selected row's own load forecast
+      (``arena.candidates.Candidate.load_source``). ``None`` for row 3
+      (``base``), which reads no load forecast at all.
     - ``n_training_days``/``age_of_last_complete_day``/
       ``training_tolerance_used``/``training_missing_days``: the measured-
       tolerance training-window report (spec section 2.6) that replaces
@@ -195,6 +206,18 @@ class SubmissionRecord:
       rank was (spec section 2.9).
     - ``capacity_anchor_days_left``: days until the capacity anchor table's
       own validity boundary, at this run's ``as_of`` (spec section 2.3).
+
+    protocol_version 5 fields (spec 6.9 section 5.7, Schritt 11), additive:
+
+    - ``load_patch_reference_day``/``load_patch_weeks_back``: the Similar-
+      Day-Patch's chosen reference day (spec section 2.2) and how many
+      escalation steps it took to find it (0 = the first candidate of the
+      applicable weekday rule) -- both ``None`` unless row 2
+      (``core_gas_loadpatch``) was actually selected.
+    - ``load_patch_skipped``: every reference-day candidate the patch tried
+      and rejected before settling on ``load_patch_reference_day``, each
+      ``[date_iso, "holiday"|"incomplete"]`` -- empty if the first candidate
+      was usable, or if row 2 was never selected.
     """
 
     run_timestamp_utc: str
@@ -240,6 +263,9 @@ class SubmissionRecord:
     downgrade_blocked: bool | None = None
     best_accepted_rank_before: int | None = None
     capacity_anchor_days_left: float | None = None
+    load_patch_reference_day: str | None = None
+    load_patch_weeks_back: int | None = None
+    load_patch_skipped: list[list[str]] = field(default_factory=list)
     protocol_version: int = PROTOCOL_VERSION
 
     def to_dict(self) -> dict[str, Any]:
