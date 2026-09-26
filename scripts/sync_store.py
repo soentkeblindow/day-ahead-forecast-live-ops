@@ -57,7 +57,11 @@ from energy_price_forecast.ops.store_sources import (
     code_sha,
     run_id_and_url,
 )
-from energy_price_forecast.ops.windows import next_delivery_day
+from energy_price_forecast.ops.windows import (
+    expected_timestamp_count,
+    local_day_bounds,
+    next_delivery_day,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -354,6 +358,39 @@ def _sync_commodity_source(
     )
 
 
+# Source name and column name happen to be identical for this one EC source
+# (store_sources.py's own ENERGY_CHARTS_SOURCES tuple) -- named separately
+# here anyway so a future rename of one doesn't silently rename the other.
+_EC_LOAD_SOURCE_NAME: Final = "load_forecast_day_ahead_ec"
+_EC_LOAD_RESOLUTION_MINUTES: Final = 15
+
+
+def _ec_load_complete_for_target_day(target_day: dt.date) -> bool:
+    """Is load_forecast_day_ahead_ec fully present (no NaN, no missing
+    quarter-hour) for every local quarter-hour of target_day, as of this
+    run's just-written store state (spec 6.9 section 2.4's conditional
+    requirement).
+
+    Read from disk after the EC sync loop rather than threaded through
+    _sync_energy_charts_source's own return value, since that function
+    stays generic across day_ahead_price_ec and this source. A per-run raw
+    fact, same design as the rest of this log -- "when did it first become
+    complete for delivery day D" is then a simple post-hoc scan of the CSV,
+    not something computed live here (Schritt-9 Nachlesen finding: the
+    existing log could not answer this per-target-day question at all).
+    """
+    path = ENERGY_CHARTS_DIR / f"{_EC_LOAD_SOURCE_NAME}.parquet"
+    if not path.exists():
+        return False
+    df = pd.read_parquet(path)
+    if _EC_LOAD_SOURCE_NAME not in df.columns:
+        return False
+    start, end = local_day_bounds(target_day)
+    window = df.loc[(df.index >= start) & (df.index < end), _EC_LOAD_SOURCE_NAME]
+    expected = expected_timestamp_count(start, end, resolution_minutes=_EC_LOAD_RESOLUTION_MINUTES)
+    return expected > 0 and int(window.notna().sum()) == expected
+
+
 def _sync_energy_charts_source(
     name: str,
     fetch: RowFetchFn,
@@ -563,6 +600,9 @@ def _write_log_row(
     log: RunLog,
     store_bytes: int | None,
     exit_status: str,
+    *,
+    ec_load_target_day: dt.date,
+    ec_load_complete_for_target_day: bool,
 ) -> None:
     row: dict[str, object] = {
         "run_timestamp_utc": as_of.isoformat(),
@@ -571,6 +611,8 @@ def _write_log_row(
         "store_bytes": store_bytes if store_bytes is not None else "",
         "warnings": " | ".join(log.warnings),
         "exit_status": exit_status,
+        "ec_load_target_day": ec_load_target_day.isoformat(),
+        "ec_load_complete_for_target_day": ec_load_complete_for_target_day,
     }
     for name, source_row in sorted(log.sources.items()):
         row[f"{name}_fetched"] = source_row.fetched
@@ -670,6 +712,9 @@ def run_sync(
         entry = _sync_energy_charts_source(name, fetch, column, manifest, as_of, log)
         if entry is not None:
             new_sources[name] = entry
+
+    ec_load_target_day = next_delivery_day(as_of)
+    ec_load_complete_for_target_day = _ec_load_complete_for_target_day(ec_load_target_day)
 
     if not only or "weather_single_runs" in only:
         entry = _sync_weather(manifest, as_of, log)
@@ -784,7 +829,16 @@ def run_sync(
     if log.warnings:
         logger.warning("Maintenance run warnings: %s", log.warnings)
 
-    _write_log_row(as_of, run_id, sha, log, store_bytes, exit_status)
+    _write_log_row(
+        as_of,
+        run_id,
+        sha,
+        log,
+        store_bytes,
+        exit_status,
+        ec_load_target_day=ec_load_target_day,
+        ec_load_complete_for_target_day=ec_load_complete_for_target_day,
+    )
     print(f"Store sync complete: {exit_status}, warnings={log.warnings}")
 
     # A partial-source failure is a documented, expected finding (spec

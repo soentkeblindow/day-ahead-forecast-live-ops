@@ -190,3 +190,67 @@ def test_sync_energy_charts_source_merge_conflict_is_a_warning_not_a_raise(
     # The on-disk file must be untouched -- the conflict was never written.
     on_disk = pd.read_parquet(tmp_path / "day_ahead_price_ec.parquet")
     assert on_disk["x"].tolist() == [1.0, 2.0]
+
+
+# ---------------------------------------------------------------------------
+# scripts/sync_store.py::_ec_load_complete_for_target_day (Schritt 13, spec
+# section 2.4's conditional log requirement)
+# ---------------------------------------------------------------------------
+
+
+def _write_ec_load(tmp_path: Path, index: pd.DatetimeIndex, values: list[float]) -> None:
+    pd.DataFrame({"load_forecast_day_ahead_ec": values}, index=index).to_parquet(
+        tmp_path / "load_forecast_day_ahead_ec.parquet"
+    )
+
+
+def test_ec_load_complete_for_target_day_true_for_a_full_quarter_hourly_day(
+    tmp_path: Path,
+) -> None:
+    index = pd.date_range("2026-09-01T00:00:00", periods=96, freq="15min", tz="Europe/Berlin")
+    _write_ec_load(tmp_path, index, [1.0] * 96)
+
+    with patch.object(sync_store, "ENERGY_CHARTS_DIR", tmp_path):
+        assert sync_store._ec_load_complete_for_target_day(dt.date(2026, 9, 1)) is True
+
+
+def test_ec_load_complete_for_target_day_false_on_a_single_nan_gap(tmp_path: Path) -> None:
+    index = pd.date_range("2026-09-01T00:00:00", periods=96, freq="15min", tz="Europe/Berlin")
+    values = [1.0] * 96
+    values[10] = float("nan")
+    _write_ec_load(tmp_path, index, values)
+
+    with patch.object(sync_store, "ENERGY_CHARTS_DIR", tmp_path):
+        assert sync_store._ec_load_complete_for_target_day(dt.date(2026, 9, 1)) is False
+
+
+def test_ec_load_complete_for_target_day_false_on_missing_rows_not_just_nan(tmp_path: Path) -> None:
+    """A gap that is entirely absent (never fetched), not merely NaN, must
+    also count as incomplete -- notna().sum() against the sliced window
+    catches both, since a missing row is simply not in the window at all."""
+    index = pd.date_range("2026-09-01T00:00:00", periods=96, freq="15min", tz="Europe/Berlin")
+    index = index.delete(50)
+    _write_ec_load(tmp_path, index, [1.0] * 95)
+
+    with patch.object(sync_store, "ENERGY_CHARTS_DIR", tmp_path):
+        assert sync_store._ec_load_complete_for_target_day(dt.date(2026, 9, 1)) is False
+
+
+def test_ec_load_complete_for_target_day_false_when_the_file_does_not_exist_yet(
+    tmp_path: Path,
+) -> None:
+    with patch.object(sync_store, "ENERGY_CHARTS_DIR", tmp_path):
+        assert sync_store._ec_load_complete_for_target_day(dt.date(2026, 9, 1)) is False
+
+
+def test_ec_load_complete_for_target_day_handles_a_dst_short_day(tmp_path: Path) -> None:
+    """2026-03-29 is a spring-forward day in Europe/Berlin -- 92 quarter-
+    hours, not 96 (Restarbeiten Teil C.1's own DST value, spec-consistent
+    for this quarter-hourly resolution)."""
+    start, end = sync_store.local_day_bounds(dt.date(2026, 3, 29))
+    index = pd.date_range(start, end, freq="15min", inclusive="left")
+    assert len(index) == 92
+    _write_ec_load(tmp_path, index, [1.0] * 92)
+
+    with patch.object(sync_store, "ENERGY_CHARTS_DIR", tmp_path):
+        assert sync_store._ec_load_complete_for_target_day(dt.date(2026, 3, 29)) is True

@@ -11,6 +11,7 @@ test_sync_store_weather.py.
 
 from __future__ import annotations
 
+import datetime as dt
 from pathlib import Path
 
 import pandas as pd
@@ -56,7 +57,16 @@ def test_write_log_row_migrates_header_when_the_column_set_grows(
     # A real run today writes a row with the new hints column -- through
     # the real, unmodified _write_log_row.
     log = _row("day_ahead_price", with_hints=True)
-    sync_store._write_log_row(pd.Timestamp("2026-09-11", tz="UTC"), "2", "def", log, 200, "ok")
+    sync_store._write_log_row(
+        pd.Timestamp("2026-09-11", tz="UTC"),
+        "2",
+        "def",
+        log,
+        200,
+        "ok",
+        ec_load_target_day=dt.date(2026, 9, 12),
+        ec_load_complete_for_target_day=False,
+    )
 
     # Must be readable without error, both rows present, old value
     # preserved, new hint captured.
@@ -80,6 +90,8 @@ def test_write_log_row_appends_normally_when_the_column_set_is_unchanged(
         _row("day_ahead_price", with_hints=False),
         100,
         "ok",
+        ec_load_target_day=dt.date(2026, 9, 2),
+        ec_load_complete_for_target_day=False,
     )
     sync_store._write_log_row(
         pd.Timestamp("2026-09-02", tz="UTC"),
@@ -88,6 +100,8 @@ def test_write_log_row_appends_normally_when_the_column_set_is_unchanged(
         _row("day_ahead_price", with_hints=False),
         100,
         "ok",
+        ec_load_target_day=dt.date(2026, 9, 3),
+        ec_load_complete_for_target_day=True,
     )
 
     restored = pd.read_csv(log_path)

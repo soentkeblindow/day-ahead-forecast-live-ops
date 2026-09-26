@@ -63,23 +63,27 @@ const POLL_INTERVAL_MINUTES = 5;
 // see docs/sprint6_step6_7_3.md section 2.2 for the full worst-case-timing
 // derivation): audit.yml's slots are gone entirely (workflow_dispatch-only
 // from here on, manual diagnosis only -- the workflow file itself already
-// dropped its schedule: trigger back in 6.7.1); weather_availability_probe.yml
-// keeps a pre-gate-closure morning slot (09:30) and its post-18:00
-// confirmation slot (18:30).
+// dropped its schedule: trigger back in 6.7.1). weather_availability_probe.yml
+// originally kept a pre-gate-closure morning slot (09:30) and a post-18:00
+// confirmation slot (18:30) -- both since replaced by maintenance/submission
+// passes of their own (see the 2026-09-24 and 2026-09-26 comments below);
+// as of 2026-09-26, weather_availability_probe.yml has no scheduled slot
+// left in SLOTS at all (workflow_dispatch-only, same as audit.yml).
 //
-// Section 2.2's "never in the 10:00-12:00 window" rule for the probe was
-// explicitly relaxed by the owner on 2026-09-21: the three slots it removed
-// (originally 10:30/11:30) were exactly what made the Energy-Charts
-// knowledge-time probe's ~28min-before-gate-closure margin for `load`
-// measurable at all (docs/data_sources_for_live_model_use.md section 3.3) --
-// losing them meant that finding could never be refined or re-confirmed.
-// Three slots restored at 10:35/11:10/11:35, each five minutes ahead of the
-// submit.yml slot it precedes, to capture the availability state
-// immediately before each submission attempt. Still deliberately not in the
-// maintain-store concurrency group (see submit.yml's own comment) -- a
-// probe-only workflow reading an unrelated third-party API has nothing to
-// coordinate with maintenance/submission over, the original "never take
-// priority" framing was caution, not a real resource conflict.
+// The 2026-09-21/-22 in-window probe slots (10:35/10:50/11:10/11:35) that
+// used to sit here were removed again 2026-09-26 (spec 6.9 section 2.10,
+// Schritt 13): the Energy-Charts `load` knowledge-time question they
+// existed to narrow is now answered for free by the maintenance job itself
+// -- the EC load source is fetched on every one of the four maintain_store.yml
+// passes below regardless (spec section 2.4), and scripts/sync_store.py now
+// records, every run, whether load_forecast_day_ahead_ec is already
+// complete for the next delivery day (logs/store_sync.csv's
+// ec_load_target_day/ec_load_complete_for_target_day columns). A dedicated
+// probe inside the 10:00-12:00 window is no longer the only way to observe
+// this, so 6.7.3's original "never a probe in that window" rule (caution
+// about an unrelated third-party call competing for the window, not a real
+// resource conflict) applies again without exception. The 18:30 evening
+// confirmation slot, outside that window, is unaffected and stays.
 //
 // Fourth maintenance/submission pass added 2026-09-24 (owner instruction,
 // same day as the incident that motivated it): the 2026-09-25 delivery day's
@@ -98,55 +102,56 @@ const POLL_INTERVAL_MINUTES = 5;
 //
 // The 09:30 morning weather_availability_probe.yml slot was removed the same
 // day (owner instruction) to make room for this without adding a slot --
-// the 18:30 evening probe remains the only pre-existing coverage away from
-// the 10:00-12:00 window; the 10:35/10:50/11:10/11:35 probes inside that
-// window are unaffected. Losing 09:30 means a broken/missing weather run for
-// the day no longer gets an early-morning signal, only the four probes
-// clustered right before gate closure and the 18:30 confirmation -- an
-// accepted reduction in early-warning lead time, not a beneficial side
-// effect.
+// the 18:30 evening probe was, at the time, the only remaining coverage
+// away from the 10:00-12:00 window (the in-window probes mentioned above
+// were themselves removed later, 2026-09-26). Losing 09:30 meant a
+// broken/missing weather run for the day no longer got an early-morning
+// signal, only the 18:30 confirmation -- an accepted reduction in
+// early-warning lead time, not a beneficial side effect. The 18:30 probe
+// itself was in turn replaced by a maintain_store.yml pass 2026-09-26 (see
+// the comment above the 18:30 entry in SLOTS) -- weather-run early-warning
+// coverage is now gone entirely in favour of the earlier 09:00/09:30 pair
+// and a same-evening store refresh, an explicit owner trade-off, not an
+// oversight.
 const SLOTS: Slot[] = [
+  // Fifth, earlier maintenance/submission pass added 2026-09-26 (owner
+  // instruction, same day as the in-window probe removal above): an early
+  // 09:00/09:30 pair ahead of the existing 10:10 pass, for the case where
+  // the day's data (ENTSO-E load, EC load, weather run) is already complete
+  // well before the main window -- the earlier ladder rows (core_gas) can
+  // then submit that much sooner instead of waiting for 10:40 regardless.
+  // Not the last slot of the day (is_last_slot_of_day stays on 11:55) --
+  // this only ever adds an earlier opportunity, never removes a later one.
+  { localTime: "09:00", workflow: "maintain_store.yml" },
+  {
+    localTime: "09:30",
+    workflow: "submit.yml",
+    inputs: { nominal_slot: "09:30", is_last_slot_of_day: "false" },
+  },
   // Maintenance/submission window (spec 6.7.3 section 2.2, extended to four
-  // passes 2026-09-24 per the comment above): Pflege 10:10 -> Sonde 10:35 ->
-  // Einreichung 10:40 -> Pflege 10:55 (a second chance for the load forecast
-  // and the weather run) -> Sonde 11:10 -> Einreichung 11:15 -> Pflege 11:25
-  // (a third chance) -> Sonde 11:35 -> Einreichung 11:40 (no longer the last
-  // slot) -> Pflege 11:45 (a fourth chance) -> Einreichung 11:55 (the day's
-  // actual last submission attempt now, only ~5 minutes clear of the 12:00
-  // gate closure even in the worst case). submit.yml's own nominal_slot/
-  // is_last_slot_of_day inputs replace its former wall-clock derivation --
-  // this worker already knows which slot it meant to fire.
+  // passes 2026-09-24 per the comment above; in-window probes removed
+  // 2026-09-26, see the comment above SLOTS): Pflege 10:10 -> Einreichung
+  // 10:40 -> Pflege 10:55 (a second chance for the load forecast and the
+  // weather run) -> Einreichung 11:15 -> Pflege 11:25 (a third chance) ->
+  // Einreichung 11:40 (no longer the last slot) -> Pflege 11:45 (a fourth
+  // chance) -> Einreichung 11:55 (the day's actual last submission attempt
+  // now, only ~5 minutes clear of the 12:00 gate closure even in the worst
+  // case). submit.yml's own nominal_slot/is_last_slot_of_day inputs replace
+  // its former wall-clock derivation -- this worker already knows which
+  // slot it meant to fire.
   { localTime: "10:10", workflow: "maintain_store.yml" },
-  { localTime: "10:35", workflow: "weather_availability_probe.yml" },
   {
     localTime: "10:40",
     workflow: "submit.yml",
     inputs: { nominal_slot: "10:40", is_last_slot_of_day: "false" },
   },
-  // Extra probe slot added 2026-09-22, in place of the former 08:30 slot
-  // (owner instruction): bisects the 10:35-11:10 window in which the
-  // Energy-Charts `load` day-ahead forecast was observed to become
-  // available on 2026-09-22 (10:35 still 404, 11:10 already available) --
-  // narrows that ~35min uncertainty band instead of re-confirming the
-  // already well-established "never available before ~10:30" baseline the
-  // old 08:30 slot mostly produced by now (see
-  // docs/data_sources_for_live_model_use.md section 3.3). The weather-run
-  // early-warning role 08:30 also served was accepted as redundant with the
-  // (since 2026-09-24 removed) 09:30 slot at the time -- section 2.3's
-  // offset bug is fixed and the 10:10 maintenance pass has reliably gotten
-  // the fresh run every time measured, so no early-morning weather-run probe
-  // remains at all after 09:30's own removal (see the 2026-09-24 comment
-  // above SLOTS).
-  { localTime: "10:50", workflow: "weather_availability_probe.yml" },
   { localTime: "10:55", workflow: "maintain_store.yml" },
-  { localTime: "11:10", workflow: "weather_availability_probe.yml" },
   {
     localTime: "11:15",
     workflow: "submit.yml",
     inputs: { nominal_slot: "11:15", is_last_slot_of_day: "false" },
   },
   { localTime: "11:25", workflow: "maintain_store.yml" },
-  { localTime: "11:35", workflow: "weather_availability_probe.yml" },
   {
     localTime: "11:40",
     workflow: "submit.yml",
@@ -158,7 +163,14 @@ const SLOTS: Slot[] = [
     workflow: "submit.yml",
     inputs: { nominal_slot: "11:55", is_last_slot_of_day: "true" },
   },
-  { localTime: "18:30", workflow: "weather_availability_probe.yml" },
+  // The 18:30 weather_availability_probe.yml confirmation slot was replaced
+  // with a maintain_store.yml pass 2026-09-26 (owner instruction, same
+  // change as the 09:00/09:30 addition above) -- an evening maintenance
+  // pass keeps the store current for the next day's early 09:00 pass
+  // instead of only confirming weather-run availability. This is also the
+  // point at which the header-migrating maintenance run for Schritt 13's
+  // new logs/store_sync.csv columns is expected to actually land live.
+  { localTime: "18:30", workflow: "maintain_store.yml" },
 ];
 
 function localHHMM(utcMillis: number): string {
