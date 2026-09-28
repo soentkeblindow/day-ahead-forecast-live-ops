@@ -122,12 +122,12 @@ def plan_target_day_fill(
         )
 
     fills: list[GroupFill] = []
-    for name, action, columns, hours in pending:
+    for name, action, fill_columns, hours in pending:
         if action == "forward_fill":
             hours = pd.DatetimeIndex([h for h in hours if h not in partial_hours])
             if len(hours) == 0:
                 continue
-        fills.append(GroupFill(group=name, action=action, columns=columns, hours=tuple(hours)))
+        fills.append(GroupFill(group=name, action=action, columns=fill_columns, hours=tuple(hours)))
     return tuple(fills)
 
 
