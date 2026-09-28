@@ -55,11 +55,16 @@ from energy_price_forecast.arena.preflight import (
     check_holiday_calendar,
     check_payload_plausibility,
     check_renewables_label_edge_age,
-    check_target_row,
     check_training_window,
     check_weather_run,
 )
 from energy_price_forecast.arena.submit import SubmissionResult, submit
+from energy_price_forecast.arena.target_day_fill import (
+    GroupFill,
+    apply_forward_fill,
+    apply_partial_fill,
+    plan_target_day_fill,
+)
 from energy_price_forecast.config import PROJECT_ROOT
 from energy_price_forecast.data._weather_cache import CACHE_ROOT, cache_path, read_cached_run
 from energy_price_forecast.data.capacity import (
@@ -567,6 +572,10 @@ class SubmissionOutcome:
     load_patch_reference_day: dt.date | None = None
     load_patch_weeks_back: int | None = None
     load_patch_skipped: tuple[tuple[dt.date, str], ...] = ()
+    # spec 6.9 section 2.8/5.7 (Schritt 12): one entry per feature group actually
+    # forward-filled or partial-filled for the selected row's own target-day gap, empty
+    # when target_day had no gaps at all -- ops.protocol.SubmissionRecord's own shape.
+    target_day_fills: tuple[dict[str, Any], ...] = ()
     # spec 6.9 section 2.3: set True only when the capacity anchor table itself has expired
     # (a Pflegeversäumnis, not a data outage) -- run_daily_submission() reddens the run on this
     # alone, even if a lower row still submitted successfully (spec: "Zeile 3 reicht ein, aber
@@ -806,6 +815,7 @@ def run_submission_for_day(
     candidates_evaluated: list[dict[str, Any]] = []
     selected: Candidate | None = None
     selected_matrix: pd.DataFrame | None = None
+    selected_fills: tuple[GroupFill, ...] = ()
     load_patch_reference: LoadPatchReference | None = None
     training_report = None
 
@@ -892,21 +902,23 @@ def run_submission_for_day(
             )
             continue
 
-        target_check = check_target_row(row_matrix.loc[fold.test_index], target_day, required)
-        if not target_check.ok:
+        fill_plan = plan_target_day_fill(row_matrix.loc[fold.test_index], candidate)
+        if isinstance(fill_plan, PreflightResult):
             candidates_evaluated.append(
                 {
                     "name": candidate.name,
                     "rank": candidate.rank,
                     "ok": False,
-                    "reasons": target_check.reasons,
-                    "missing_features": target_check.missing_features,
+                    "reasons": fill_plan.reasons,
+                    "missing_features": fill_plan.missing_features,
                 }
             )
             continue
+        row_matrix = apply_forward_fill(row_matrix, fill_plan)
 
         selected = candidate
         selected_matrix = row_matrix
+        selected_fills = fill_plan
         training_report = window_report
         load_patch_reference = reference
         candidates_evaluated.append(
@@ -930,6 +942,15 @@ def run_submission_for_day(
             "load_patch_weeks_back": load_patch_reference.weeks_back,
             "load_patch_skipped": load_patch_reference.skipped,
         }
+    target_day_fills = tuple(
+        {
+            "group": fill.group,
+            "n_hours": len(fill.hours),
+            "hours": [h.isoformat() for h in fill.hours],
+            "action": fill.action,
+        }
+        for fill in selected_fills
+    )
 
     if selected is None or selected_matrix is None:
         # spec section 2.5: every offending column named individually, across every row
@@ -956,6 +977,13 @@ def run_submission_for_day(
     quarterhourly_forecast, n_training_rows, n_training_labels = fit_predict_expand(
         df, selected_matrix, fold, prices_qh
     )
+    if any(fill.action == "partial_fill" for fill in selected_fills):
+        persistence = persistence_forecast(
+            prices_qh["day_ahead_price"], pd.Timestamp(target_day, tz=LOCAL_TZ)
+        )
+        quarterhourly_forecast = apply_partial_fill(
+            quarterhourly_forecast, persistence, selected_fills
+        )
     payload, challenge = build_arena_payload(quarterhourly_forecast, target_day)
 
     plausibility = check_payload_plausibility(
@@ -975,6 +1003,7 @@ def run_submission_for_day(
             n_training_rows=n_training_rows,
             n_training_labels=n_training_labels,
             capacity_anchor_expired=anchor_expired,
+            target_day_fills=target_day_fills,
             **common_fields,
             **training_window_fields,
             **load_patch_fields,
@@ -997,6 +1026,7 @@ def run_submission_for_day(
             n_training_rows=n_training_rows,
             n_training_labels=n_training_labels,
             capacity_anchor_expired=anchor_expired,
+            target_day_fills=target_day_fills,
             **common_fields,
             **training_window_fields,
             **load_patch_fields,
@@ -1020,6 +1050,7 @@ def run_submission_for_day(
             capacity_anchor_expired=anchor_expired,
             downgrade_blocked=True,
             best_accepted_rank_before=best_rank,
+            target_day_fills=target_day_fills,
             **common_fields,
             **training_window_fields,
             **load_patch_fields,
@@ -1041,6 +1072,7 @@ def run_submission_for_day(
         n_training_labels=n_training_labels,
         capacity_anchor_expired=anchor_expired,
         best_accepted_rank_before=best_rank,
+        target_day_fills=target_day_fills,
         **common_fields,
         **training_window_fields,
         **load_patch_fields,
@@ -1258,6 +1290,7 @@ def build_submission_record(
         ),
         load_patch_weeks_back=outcome.load_patch_weeks_back,
         load_patch_skipped=[[d.isoformat(), reason] for d, reason in outcome.load_patch_skipped],
+        target_day_fills=list(outcome.target_day_fills),
     )
 
 

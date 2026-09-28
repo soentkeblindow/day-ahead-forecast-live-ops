@@ -214,6 +214,16 @@ def test_none_scenario_registered() -> None:
     assert "none" in SCENARIOS
 
 
+def test_load_gap_scenarios_registered() -> None:
+    """spec 6.9 section 10, Schritt 12's own As-of-Lauf requirement -- the
+    two partial-load-gap drills, same registration-level check as the other
+    scenarios (the real injection mechanics are proven by an As-of-Lauf
+    against real data, not a unit test, same as _scenario_load_missing
+    itself)."""
+    assert "load_gap_3h" in SCENARIOS
+    assert "load_gap_4h" in SCENARIOS
+
+
 def test_unknown_scenario_raises_before_touching_the_network() -> None:
     """The unknown-scenario check must happen before store.load_store() is
     ever called -- otherwise a typo'd --scenario would still cost a real

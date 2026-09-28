@@ -149,6 +149,53 @@ def _scenario_load_missing(copied: CopiedStore, target_day: dt.date) -> None:
     df.to_parquet(load_cache_path)
 
 
+def _scenario_load_gap(copied: CopiedStore, target_day: dt.date, hours: int) -> None:
+    """Shared implementation for the two partial-load-gap drills below: NaNs
+    the trailing ``hours`` local hours of target_day's own
+    ``load_forecast_day_ahead`` (spec section 2.8: "gemessen sind nur
+    zusammenhängende Randlücken am Tagesende") -- a partial, not whole-day,
+    gap, unlike ``_scenario_load_missing``.
+    """
+    load_source = next(s for s in copied.entsoe_sources if s.name == "load")
+    load_cache_path = (
+        load_source.cache_dir / f"DE_LU_{target_day.year:04d}-{target_day.month:02d}.parquet"
+    )
+    df = pd.read_parquet(load_cache_path)
+    index = pd.DatetimeIndex(df.index)
+    if index.tz is None:
+        index = index.tz_localize("UTC")
+        df.index = index
+    start, end = local_day_bounds(target_day)
+    local_hours = pd.date_range(start, end, freq="h", inclusive="left")
+    gap_start = local_hours[-hours].tz_convert("UTC")
+    mask = (index >= gap_start) & (index < end.tz_convert("UTC"))
+    df.loc[mask, "load_forecast_day_ahead"] = float("nan")
+    df.to_parquet(load_cache_path)
+
+
+def _scenario_load_gap_3h(copied: CopiedStore, target_day: dt.date) -> None:
+    """Spec section 10, Schritt 12's own As-of-Lauf requirement (spec section
+    6.3 table: "3-Stunden-Lücke ENTSO-E-Last -> Fortschreiben, Zeile 1"): a
+    3-hour trailing gap is within the ``load_forecast`` group's
+    ``FFILL_MAX_HOURS`` (3), so ``arena.target_day_fill`` forward-fills it
+    and row 1 (core_gas) stays selected -- unlike ``_scenario_load_missing``'s
+    whole-day gap, which always routes to row 2.
+    """
+    _scenario_load_gap(copied, target_day, 3)
+
+
+def _scenario_load_gap_4h(copied: CopiedStore, target_day: dt.date) -> None:
+    """Spec section 10, Schritt 12's own As-of-Lauf requirement (spec section
+    6.3 table: "4-Stunden-Lücke ENTSO-E-Last -> Zeile 1 scheitert, Zeile 2"):
+    one hour more than ``_scenario_load_gap_3h``'s own gap, past
+    ``FFILL_MAX_HOURS``, so the ``load_forecast`` group fails row 1 and row 2
+    (core_gas_loadpatch) takes over via the Similar-Day-Patch -- the same
+    row-2 outcome as ``_scenario_load_missing``, reached via a partial rather
+    than whole-day gap.
+    """
+    _scenario_load_gap(copied, target_day, 4)
+
+
 def _scenario_weather_missing(copied: CopiedStore, target_day: dt.date) -> None:
     """Spec section 6.3's "Wetterlauf für D entfernt" drill (pulled forward
     to this step for the same reason _scenario_load_missing was, see its
@@ -169,6 +216,8 @@ def _scenario_weather_missing(copied: CopiedStore, target_day: dt.date) -> None:
 SCENARIOS: Final[dict[str, ScenarioFn]] = {
     "none": _scenario_none,
     "load_missing": _scenario_load_missing,
+    "load_gap_3h": _scenario_load_gap_3h,
+    "load_gap_4h": _scenario_load_gap_4h,
     "weather_missing": _scenario_weather_missing,
 }
 

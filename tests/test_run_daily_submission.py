@@ -517,7 +517,9 @@ def _fake_fold(target_day: dt.date, train_days: int = PRICE_TRAIN_SPAN_DAYS) -> 
     )
 
 
-def _one_row_ladder(required: frozenset[str] = frozenset({"feat_a"})) -> tuple[Candidate, ...]:
+def _one_row_ladder(
+    required: frozenset[str] = frozenset({"feat_a"}), policy: GapPolicy = GapPolicy.STRICT
+) -> tuple[Candidate, ...]:
     """A single-row, rank-1, NWP-dependent ladder standing in for the real
     three_row_ladder() (spec 6.9 section 5.2) -- used by tests that mock
     scripts.run_daily_submission.build_ladder to isolate run_submission_for_
@@ -525,12 +527,14 @@ def _one_row_ladder(required: frozenset[str] = frozenset({"feat_a"})) -> tuple[C
     (build_calendar_features/build_price_lags/build_commodity_features),
     which needs a much more complete ``df`` than these tests otherwise
     build. arena/candidates.py's own test suite (tests/test_candidates.py)
-    covers the real three_row_ladder()'s own shape."""
+    covers the real three_row_ladder()'s own shape. ``policy`` defaults to
+    STRICT (every existing caller's own assumption); Schritt 12's own
+    target-day-fill tests below pass a fill-capable policy instead."""
     return (
         Candidate(
             name="core_gas",
             rank=1,
-            groups=(FeatureGroup("all", required, GapPolicy.STRICT),),
+            groups=(FeatureGroup("all", required, policy),),
             requires_nwp=True,
             load_source="entsoe",
             measured_as="test",
@@ -939,6 +943,117 @@ def test_run_submission_for_day_happy_path_submits_dry_run() -> None:
     assert outcome.training_tolerance_used is False
     assert outcome.training_missing_days == ()
     assert outcome.known_weather_defect_days == ()
+
+
+def test_run_submission_for_day_forward_fills_a_small_target_day_gap() -> None:
+    """spec 6.9 section 2.8/5.6 (Schritt 12): a 3-hour trailing gap in a
+    FILL_ONLY-policy group must not fail the row -- it is forward-filled,
+    the row is still selected, and the fill is reported in
+    ``target_day_fills``."""
+    fold = _fake_fold(_TARGET_DAY)
+    matrix_index = fold.train_index.union(fold.test_index)
+    matrix = pd.DataFrame({"feat_a": 1.0}, index=matrix_index)
+    matrix.loc[fold.test_index[-3:], "feat_a"] = float("nan")
+    df = pd.DataFrame({"day_ahead_price": 50.0}, index=matrix_index)
+    forecast = _quarterhourly_series(_TARGET_DAY)
+    payload = {
+        "challenge_id": "2",
+        "target_start": pd.Timestamp(_TARGET_DAY, tz="Europe/Berlin").isoformat(),
+        "values": [50.0 + i * 0.01 for i in range(96)],
+    }
+    fake_submission_result = SubmissionResult(sent=False, challenge_id="2")
+
+    with (
+        patch("scripts.run_daily_submission.check_a_global", return_value=PreflightResult(ok=True)),
+        patch("scripts.run_daily_submission.check_a_nwp", return_value=_OK_NWP),
+        patch("scripts.run_daily_submission.check_a_renewables_labels", return_value=_OK_LABEL),
+        patch(
+            "scripts.run_daily_submission.run_renewables_step",
+            return_value=(pd.DataFrame(), 1.5),
+        ),
+        patch("scripts.run_daily_submission.target_day_fold", return_value=fold),
+        patch(
+            "scripts.run_daily_submission.nwp_group_columns_for_day",
+            return_value=(frozenset(), frozenset()),
+        ),
+        patch(
+            "scripts.run_daily_submission.build_ladder",
+            return_value=_one_row_ladder(
+                required=frozenset(matrix.columns), policy=GapPolicy.FILL_ONLY
+            ),
+        ),
+        patch(
+            "scripts.run_daily_submission.build_price_feature_matrix",
+            return_value=(matrix, set()),
+        ),
+        patch(
+            "scripts.run_daily_submission.fit_predict_expand", return_value=(forecast, 2160, 2160)
+        ),
+        patch(
+            "scripts.run_daily_submission.build_arena_payload", return_value=(payload, CHALLENGE)
+        ),
+        patch("scripts.run_daily_submission.submit", return_value=fake_submission_result),
+    ):
+        outcome = run_submission_for_day(
+            df,
+            pd.DataFrame(),
+            pd.DataFrame(),
+            _TARGET_DAY,
+            as_of=_AS_OF,
+            now=lambda: _BEFORE_GATE_CLOSURE,
+        )
+
+    assert outcome.candidate_selected == "core_gas"
+    assert outcome.skip_reason is None
+    assert len(outcome.target_day_fills) == 1
+    fill = outcome.target_day_fills[0]
+    assert fill["group"] == "all"
+    assert fill["action"] == "forward_fill"
+    assert fill["n_hours"] == 3
+
+
+def test_run_submission_for_day_check_b_fails_past_the_fill_threshold() -> None:
+    """spec 6.9 section 2.8: a gap past the group's own fill ceiling still
+    fails the row (Check B), same as before Schritt 12 -- FILL_ONLY's own
+    MAX_GAP_HOURS ceiling here, rather than STRICT's zero tolerance."""
+    fold = _fake_fold(_TARGET_DAY)
+    matrix_index = fold.train_index.union(fold.test_index)
+    matrix = pd.DataFrame({"feat_a": 1.0}, index=matrix_index)
+    matrix.loc[fold.test_index, "feat_a"] = float("nan")  # the whole day, well past MAX_GAP_HOURS
+    df = pd.DataFrame({"day_ahead_price": 50.0}, index=matrix_index)
+
+    with (
+        patch("scripts.run_daily_submission.check_a_global", return_value=PreflightResult(ok=True)),
+        patch("scripts.run_daily_submission.check_a_nwp", return_value=_OK_NWP),
+        patch("scripts.run_daily_submission.check_a_renewables_labels", return_value=_OK_LABEL),
+        patch(
+            "scripts.run_daily_submission.run_renewables_step",
+            return_value=(pd.DataFrame(), 1.5),
+        ),
+        patch("scripts.run_daily_submission.target_day_fold", return_value=fold),
+        patch(
+            "scripts.run_daily_submission.nwp_group_columns_for_day",
+            return_value=(frozenset(), frozenset()),
+        ),
+        patch(
+            "scripts.run_daily_submission.build_ladder",
+            return_value=_one_row_ladder(
+                required=frozenset(matrix.columns), policy=GapPolicy.FILL_ONLY
+            ),
+        ),
+        patch(
+            "scripts.run_daily_submission.build_price_feature_matrix",
+            return_value=(matrix, set()),
+        ),
+    ):
+        outcome = run_submission_for_day(
+            df, pd.DataFrame(), pd.DataFrame(), _TARGET_DAY, as_of=_AS_OF
+        )
+
+    assert outcome.candidate_selected is None
+    assert outcome.skip_reason is not None
+    assert "Check B" in outcome.skip_reason
+    assert outcome.target_day_fills == ()
 
 
 def test_run_submission_for_day_carries_commodity_staleness_warnings_through() -> None:
