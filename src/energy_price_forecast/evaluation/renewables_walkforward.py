@@ -145,6 +145,7 @@ def run_renewables_backtest(
     source: CapacitySource = CapacitySource.PUBLIC_REGISTRY,
     method: CapacityExtrapolation = CapacityExtrapolation.LAST_INCREMENT,
     keep_rows_for: dt.date | None = None,
+    require_baseline: bool = True,
 ) -> pd.DataFrame:
     """Run the rolling (or expanding) walk-forward for all three targets.
 
@@ -169,6 +170,19 @@ def run_renewables_backtest(
     label still yields a prediction, just no actual/error columns to match
     it against. For a day that already has a real label, passing it here
     changes nothing (bit-identical to omitting the argument).
+
+    ``require_baseline`` (spec 6.9 section 2.13): a fold's D-1 persistence
+    baseline is only needed to score that fold in a *backtest* -- the
+    prediction itself only needs weather features. Default ``True`` keeps
+    the historical behaviour exactly as measured (6.5.2/6.6/6.8): a fold
+    whose D-1 label is missing (or falls on a DST changeover with no D-1
+    local 02:00) is skipped entirely, including the prediction. Set to
+    ``False`` only from the live path (``run_renewables_step``): a fold
+    with an undefined baseline still fits/predicts, it simply isn't
+    baseline-scorable. This is what makes a real ENTSO-E outage stop
+    silently discarding a prediction that weather data alone could still
+    produce (the real 2026-09-28 outage-drill finding, docs bug entry
+    closed by this switch, not a patch on top of it).
 
     Returns one tidy DataFrame indexed by (run_init_utc, valid_time_utc)
     with columns {target}_cf_pred, {target}_cf_actual, {target}_mw_pred,
@@ -283,17 +297,18 @@ def run_renewables_backtest(
                 )
                 continue
 
-            try:
-                persistence_baseline_cf(target_labels_flat[target], fold.test_index)
-            except (pytz.exceptions.InvalidTimeError, ValueError) as exc:
-                skip_counts[target.value] += 1
-                logger.info(
-                    "%s / %s: skipped, persistence baseline undefined (%s)",
-                    fold.delivery_day.date(),
-                    target.value,
-                    exc,
-                )
-                continue
+            if require_baseline:
+                try:
+                    persistence_baseline_cf(target_labels_flat[target], fold.test_index)
+                except (pytz.exceptions.InvalidTimeError, ValueError) as exc:
+                    skip_counts[target.value] += 1
+                    logger.info(
+                        "%s / %s: skipped, persistence baseline undefined (%s)",
+                        fold.delivery_day.date(),
+                        target.value,
+                        exc,
+                    )
+                    continue
 
             if fits_since_refit[target] >= refit_every:
                 train_mask = (vt >= train_lo) & (vt <= train_hi)

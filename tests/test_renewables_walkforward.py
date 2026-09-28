@@ -287,3 +287,108 @@ def test_dst_day_is_skipped_and_logged_not_aborting_the_run(
 
     assert not result.empty  # the run completed rather than aborting
     assert any("baseline undefined" in message for message in caplog.messages)
+
+
+# ---------------------------------------------------------------------------
+# require_baseline (spec 6.9 section 2.13): decouple the live prediction
+# from the backtest-only persistence baseline
+# ---------------------------------------------------------------------------
+
+
+def test_require_baseline_default_skips_the_day_after_a_missing_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Backtest standard (require_baseline omitted, i.e. True): unchanged
+    from the pre-6.9.15 behaviour -- a day whose own label exists but whose
+    D-1 label is entirely missing still has no defined persistence
+    baseline, so the fold is skipped, prediction included. This is exactly
+    the 2026-09-28 outage-drill finding (entsoe_cutoff_d1/_d3): without the
+    switch, row 2 of the fallback ladder is unreachable during a real
+    ENTSO-E outage even though it needs no ENTSO-E label to predict."""
+    _patch_capacity_anchors(monkeypatch)
+    days = _consecutive_days("2025-06-01", 15)
+    weather = _weather_for_days(days)
+    target_hourly = _target_hourly_for_days(days)
+
+    gap_day = days[-2]
+    gap_hours = _target_hours_for_day(gap_day)
+    target_hourly.loc[target_hourly.index.isin(gap_hours), :] = float("nan")
+
+    result = run_renewables_backtest(
+        target_hourly, weather, window="rolling", train_span_days=6, refit_every=1
+    )
+
+    result_local_days = (
+        pd.DatetimeIndex(result.index.get_level_values("valid_time_utc"))
+        .tz_convert("Europe/Berlin")
+        .date
+    )
+    last_day = days[-1]
+    assert last_day not in result_local_days
+
+
+def test_require_baseline_false_still_predicts_the_day_after_a_missing_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Live path (require_baseline=False): the same missing-D-1-label
+    situation as above must no longer discard the prediction -- only the
+    baseline gate is skipped, weather-driven features are untouched."""
+    _patch_capacity_anchors(monkeypatch)
+    days = _consecutive_days("2025-06-01", 15)
+    weather = _weather_for_days(days)
+    target_hourly = _target_hourly_for_days(days)
+
+    gap_day = days[-2]
+    gap_hours = _target_hours_for_day(gap_day)
+    target_hourly.loc[target_hourly.index.isin(gap_hours), :] = float("nan")
+
+    last_day = days[-1]
+    last_hours = _target_hours_for_day(last_day)
+
+    result = run_renewables_backtest(
+        target_hourly,
+        weather,
+        window="rolling",
+        train_span_days=6,
+        refit_every=1,
+        require_baseline=False,
+    )
+
+    result_local_days = (
+        pd.DatetimeIndex(result.index.get_level_values("valid_time_utc"))
+        .tz_convert("Europe/Berlin")
+        .date
+    )
+    assert last_day in result_local_days
+
+    last_rows = result[result_local_days == last_day]
+    assert len(last_rows) == len(last_hours)
+    for target in ("wind_onshore", "wind_offshore", "solar"):
+        assert last_rows[f"{target}_cf_pred"].notna().all()
+        # last_day's own label was never touched -- only gap_day's (D-1)
+        # was, so the actual is still real, not fabricated.
+        assert last_rows[f"{target}_cf_actual"].notna().all()
+
+
+def test_require_baseline_true_is_the_implicit_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Omitting the parameter must be bit-identical to require_baseline=True
+    -- the acceptance criterion (spec 6.9 section 8) that the backtest
+    standard stays untouched by this switch."""
+    _patch_capacity_anchors(monkeypatch)
+    days = _consecutive_days("2025-06-01", 15)
+    weather = _weather_for_days(days)
+    target_hourly = _target_hourly_for_days(days)
+
+    omitted = run_renewables_backtest(
+        target_hourly, weather, window="rolling", train_span_days=6, refit_every=1
+    )
+    explicit = run_renewables_backtest(
+        target_hourly,
+        weather,
+        window="rolling",
+        train_span_days=6,
+        refit_every=1,
+        require_baseline=True,
+    )
+
+    pd.testing.assert_frame_equal(omitted, explicit)

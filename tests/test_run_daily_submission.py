@@ -171,6 +171,9 @@ def test_run_renewables_step_slices_to_the_window_and_measures_runtime() -> None
     assert call_kwargs["train_span_days"] == RENEWABLES_TRAIN_SPAN_DAYS
     assert call_kwargs["refit_every"] == 1
     assert call_kwargs["objective"] == "l2"
+    # spec 6.9 section 2.13: the live path must decouple the prediction
+    # from the backtest-only persistence baseline.
+    assert call_kwargs["require_baseline"] is False
 
     target_hourly_arg, weather_arg = mock_backtest.call_args.args
     assert list(target_hourly_arg.columns) == [

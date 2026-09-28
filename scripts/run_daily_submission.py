@@ -194,6 +194,12 @@ def run_renewables_step(
     Returns the raw run_renewables_backtest output (unsliced to target_day
     -- the caller's feature-build step needs the whole windowed frame, not
     just the target day) and the measured wall-clock seconds.
+
+    ``require_baseline=False`` (spec 6.9 section 2.13): the live path never
+    scores a backtest baseline, so a fold whose D-1 label is missing (a
+    real ENTSO-E outage) must not discard the prediction itself -- only
+    the backtest caller (``scripts/train_renewables.py`` and friends) needs
+    the default ``True`` behaviour, and does not go through this function.
     """
     start, end = renewables_window(target_day)
     target_hourly = df.loc[start:end, list(TARGET_COLUMNS.values())]
@@ -211,6 +217,7 @@ def run_renewables_step(
         source=CapacitySource.PUBLIC_REGISTRY,
         method=CapacityExtrapolation.LAST_INCREMENT,
         keep_rows_for=target_day,
+        require_baseline=False,
     )
     runtime_seconds = time.monotonic() - t0
     return predictions, runtime_seconds
