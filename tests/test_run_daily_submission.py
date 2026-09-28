@@ -474,6 +474,36 @@ def test_check_a_nwp_weather_root_override_actually_reads_from_it(tmp_path: Path
         assert result_populated.ok
 
 
+def test_check_a_nwp_anchor_valid_until_override_bypasses_the_real_table(tmp_path: Path) -> None:
+    """spec 6.9 section 6.3, Schritt 14 (the `anchor_expired` drill): unlike
+    `weather_root`, the anchor table has no store-copy equivalent to corrupt
+    (it's a committed repo file, not part of the downloaded store) -- an
+    explicit `anchor_valid_until` is the only way to drive it. Patches
+    `anchor_table_valid_until` to a value that would PASS, to prove the
+    override -- not the real table -- is what actually decided the FAIL
+    outcome here."""
+    run_init = run_init_for_target_day(_TARGET_DAY)
+    weather_root = tmp_path / "cache"
+    write_cached_run(
+        _synthetic_weather_frame(run_init),
+        cache_path(run_init, DEFAULT_WEATHER_MODEL, root=weather_root),
+    )
+
+    with patch(
+        "scripts.run_daily_submission.anchor_table_valid_until",
+        return_value=pd.Timestamp("2099-01-01", tz="UTC"),
+    ) as mock_real_table:
+        result = check_a_nwp(
+            _TARGET_DAY,
+            weather_root=weather_root,
+            anchor_valid_until=pd.Timestamp("2020-01-01", tz="UTC"),
+        )
+
+    assert not result.ok
+    assert any("anchor table" in r for r in result.reasons)
+    mock_real_table.assert_not_called()
+
+
 def test_check_a_nwp_reports_an_expiry_warning_without_blocking() -> None:
     """spec 6.9 section 2.3: an anchor table within CAPACITY_ANCHOR_WARN_DAYS
     of expiry must still report ok=True (a warning, not a block) -- the

@@ -152,6 +152,25 @@ def test_price_lags_7h_gap_fails() -> None:
     assert plan.ok is False
 
 
+def test_three_scattered_hours_are_counted_the_same_as_a_contiguous_gap() -> None:
+    """Spec section 6.3: "3 verstreute Einzelstunden -> funktional geprüft".
+    plan_target_day_fill counts gap hours via a plain column-wise isna() mask
+    with no contiguity assumption -- this proves it, rather than trusting
+    that from the (exclusively trailing-gap) tests above alone.
+    """
+    candidate = _one_group_candidate("price_lags", _PRICE_LAGS, GapPolicy.FILL_ONLY)
+    rows = _complete_rows(_PRICE_LAGS)
+    scattered = rows.index[[2, 10, 20]]
+    rows.loc[scattered, list(_PRICE_LAGS)] = float("nan")
+
+    plan = plan_target_day_fill(rows, candidate)
+
+    assert isinstance(plan, tuple)
+    assert len(plan) == 1
+    assert plan[0].action == "forward_fill"
+    assert set(plan[0].hours) == set(scattered)
+
+
 # ---------------------------------------------------------------------------
 # plan_target_day_fill -- calendar / gas (STRICT)
 # ---------------------------------------------------------------------------

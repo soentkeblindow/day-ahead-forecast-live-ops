@@ -74,7 +74,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("outage_drill")
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass
 class CopiedStore:
     """The store copy's own source bindings -- same shape as
     ops.store_sources.ENTSOE_SOURCES/COMMODITIES_DIR/data._weather_cache.CACHE_ROOT,
@@ -82,13 +82,21 @@ class CopiedStore:
     reader in arena.live_inputs already accepts these as explicit keyword
     overrides (the established wiring-probe pattern, e.g.
     scripts/backtest_arena.py's own path overrides) -- no monkeypatching of
-    module-level constants anywhere."""
+    module-level constants anywhere.
+
+    ``anchor_valid_until`` (Schritt 14, not frozen any more so a scenario can
+    set it): the capacity anchor table has no store-copy file to corrupt --
+    it's a committed repo file, not part of the downloaded store -- so
+    ``_scenario_anchor_expired`` is the one scenario that signals its fault
+    through this field instead of mutating a file under ``workdir``.
+    """
 
     workdir: Path
     entsoe_sources: tuple[EntsoeSource, ...]
     commodities_dir: Path
     weather_root: Path
     energy_charts_dir: Path
+    anchor_valid_until: pd.Timestamp | None = None
 
 
 def _copy_sources_for_workdir(workdir: Path) -> CopiedStore:
@@ -213,12 +221,224 @@ def _scenario_weather_missing(copied: CopiedStore, target_day: dt.date) -> None:
     path.unlink()
 
 
+def _year_months_between(start: pd.Timestamp, end: pd.Timestamp) -> list[tuple[int, int]]:
+    """Every (year, month) touched by [start, end], inclusive -- cache files
+    are monthly-partitioned, so a gap/cutoff window crossing a month
+    boundary needs every file in range, not just the one ``start`` falls
+    into."""
+    months: list[tuple[int, int]] = []
+    cur = pd.Timestamp(year=start.year, month=start.month, day=1, tz="UTC")
+    end_marker = pd.Timestamp(year=end.year, month=end.month, day=1, tz="UTC")
+    while cur <= end_marker:
+        months.append((cur.year, cur.month))
+        cur = cur + pd.DateOffset(months=1)
+    return months
+
+
+def _blank_rows(df: pd.DataFrame, mask: pd.Series | Any, column: str | None) -> pd.DataFrame:
+    """NaNs either one named column or every column (``column=None``, an
+    entire-source cutoff) for the rows ``mask`` selects -- shared by every
+    scenario below that mutates a cached parquet file in place."""
+    index = pd.DatetimeIndex(df.index)
+    if index.tz is None:
+        index = index.tz_localize("UTC")
+        df = df.copy()
+        df.index = index
+    if column is None:
+        df.loc[mask, :] = float("nan")
+    else:
+        df.loc[mask, column] = float("nan")
+    return df
+
+
+def _blank_monthly_files(
+    cache_dir: Path, start: pd.Timestamp, end: pd.Timestamp, *, column: str | None = None
+) -> None:
+    """Blanks every monthly-partitioned cache file under ``cache_dir``
+    (globbed by its trailing ``_YYYY-MM.parquet`` suffix -- works for both
+    the single-file-per-month sources and the per-neighbor multi-file
+    sources like cross_border_flows/scheduled_exchanges, which never share a
+    file naming assumption with this function) for rows in ``[start, end)``.
+    """
+    for year, month in _year_months_between(start, end):
+        for path in sorted(cache_dir.glob(f"*_{year:04d}-{month:02d}.parquet")):
+            df = pd.read_parquet(path)
+            index = pd.DatetimeIndex(df.index)
+            if index.tz is None:
+                index = index.tz_localize("UTC")
+                df.index = index
+            mask = (index >= start) & (index < end)
+            if not mask.any():
+                continue
+            df = _blank_rows(df, mask, column)
+            df.to_parquet(path)
+
+
+def _blank_single_file(
+    path: Path, start: pd.Timestamp, end: pd.Timestamp, *, column: str | None = None
+) -> None:
+    """Same as ``_blank_monthly_files`` for a source stored as one file
+    covering its whole history (the two commodities, the two Energy-Charts
+    sources) rather than monthly partitions."""
+    df = pd.read_parquet(path)
+    index = pd.DatetimeIndex(df.index)
+    if index.tz is None:
+        index = index.tz_localize("UTC")
+        df.index = index
+    mask = (index >= start) & (index < end)
+    if not mask.any():
+        return
+    df = _blank_rows(df, mask, column)
+    df.to_parquet(path)
+
+
+def _scenario_entsoe_cutoff(
+    copied: CopiedStore, target_day: dt.date, days_before_target: int
+) -> None:
+    """Shared implementation for the three "ENTSO-E ab D-N abgeschnitten"
+    drills (spec section 6.3): blanks every column of five of the six
+    ENTSO-E sources from ``target_day - days_before_target`` onward, through
+    a couple of days past target_day (a real outage doesn't self-heal inside
+    this drill's own observation window) -- simulates a total ENTSO-E outage
+    starting at that point, except the price itself.
+
+    ``day_ahead_price`` is deliberately excluded (owner decision, this
+    session): a real ENTSO-E outage still leaves the price recoverable via
+    Energy-Charts' own independent feed (coalesce_price, spec section 5.3),
+    so cutting it here would conflate two different failure modes. Cutting
+    it would also mask this drill's own point -- the spec table expects row
+    2 for a D-1 cutoff, which needs the *renewables* reconstruction to keep
+    working even though its own ENTSO-E training labels (``generation``/
+    ``wind_solar``) are gone; a first version of this scenario cut all six
+    sources including the price and landed on row 3 instead, for a reason
+    unrelated to what this drill is supposed to exercise.
+    """
+    cutoff = pd.Timestamp(target_day, tz=LOCAL_TZ).tz_convert("UTC") - pd.Timedelta(
+        days=days_before_target
+    )
+    end = pd.Timestamp(target_day, tz=LOCAL_TZ).tz_convert("UTC") + pd.Timedelta(days=2)
+    for source in copied.entsoe_sources:
+        if source.name == "day_ahead_price":
+            continue
+        _blank_monthly_files(source.cache_dir, cutoff, end, column=None)
+
+
+def _scenario_entsoe_cutoff_d1(copied: CopiedStore, target_day: dt.date) -> None:
+    """Spec section 6.3: "ENTSO-E (alle Quellen) ab D-1 abgeschnitten ->
+    Preise aus EC, Zeile 2 mit Referenz eine Woche zurück, Trainingsalter 1".
+    """
+    _scenario_entsoe_cutoff(copied, target_day, 1)
+
+
+def _scenario_entsoe_cutoff_d3(copied: CopiedStore, target_day: dt.date) -> None:
+    """Spec section 6.3: "ENTSO-E ab D-3 abgeschnitten -> Zeile 2,
+    Renewables-Fit läuft (rnw_label_edge_age_days = 3)"."""
+    _scenario_entsoe_cutoff(copied, target_day, 3)
+
+
+def _scenario_entsoe_cutoff_d9(copied: CopiedStore, target_day: dt.date) -> None:
+    """Spec section 6.3: "ENTSO-E ab D-9 abgeschnitten -> Grenzen
+    überschritten, Zeile 3" -- 9 days exceeds both MAX_TRAINING_EDGE_AGE_DAYS
+    (7) and MAX_RNW_LABEL_EDGE_AGE_DAYS (7)."""
+    _scenario_entsoe_cutoff(copied, target_day, 9)
+
+
+def _scenario_ttf_dead_15d(copied: CopiedStore, target_day: dt.date) -> None:
+    """Spec section 6.3: "TTF 15 Tage tot -> Zeilen 1 und 2 scheitern, Zeile
+    3" -- 15 days exceeds COMMODITY_FFILL_LIMIT (14, spec section 6.9 §2.11),
+    so the gas STRICT group in rows 1/2 stays NaN for target_day; row 3
+    (gas-free per Fassung 2) is unaffected.
+    """
+    cutoff = pd.Timestamp(target_day, tz=LOCAL_TZ).tz_convert("UTC") - pd.Timedelta(days=15)
+    end = pd.Timestamp(target_day, tz=LOCAL_TZ).tz_convert("UTC") + pd.Timedelta(days=2)
+    _blank_single_file(copied.commodities_dir / "ttf_gas.parquet", cutoff, end, column=None)
+
+
+def _scenario_price_gap(copied: CopiedStore, target_day: dt.date, hours: int | None) -> None:
+    """Shared implementation for the two "Preis-Lücke in beiden Quellen"
+    drills: gaps the trailing ``hours`` local hours of D-1 (``hours=None`` ->
+    the whole day) in BOTH the ENTSO-E ``day_ahead_price`` cache and the EC
+    ``day_ahead_price_ec`` cache. Both sources must be gapped at the
+    identical hours -- coalesce_price only falls back to EC when ENTSO-E is
+    missing, so gapping only one source would leave the merged series (what
+    price_lags actually reads) fully covered.
+    """
+    d_minus_1 = target_day - dt.timedelta(days=1)
+    start, end = local_day_bounds(d_minus_1)
+    if hours is None:
+        gap_start = start.tz_convert("UTC")
+    else:
+        local_hours = pd.date_range(start, end, freq="h", inclusive="left")
+        gap_start = local_hours[-hours].tz_convert("UTC")
+    gap_end = end.tz_convert("UTC")
+
+    entsoe_price = next(s for s in copied.entsoe_sources if s.name == "day_ahead_price")
+    _blank_monthly_files(entsoe_price.cache_dir, gap_start, gap_end, column="day_ahead_price")
+    _blank_single_file(
+        copied.energy_charts_dir / "day_ahead_price_ec.parquet",
+        gap_start,
+        gap_end,
+        column="day_ahead_price_ec",
+    )
+
+
+def _scenario_price_lags_gap_5h(copied: CopiedStore, target_day: dt.date) -> None:
+    """Spec section 6.3: "5-Stunden-Lücke Preis-Lags (beide Quellen) ->
+    Fortschreiben, Zeile 1" -- 5h is within price_lags' own FILL_ONLY
+    ceiling (MAX_GAP_HOURS=6), so the group forward-fills and row 1 stays
+    selected.
+    """
+    _scenario_price_gap(copied, target_day, 5)
+
+
+def _scenario_price_d1_removed_both(copied: CopiedStore, target_day: dt.date) -> None:
+    """Spec section 6.3: "Preis D-1 in beiden Quellen entfernt -> alle
+    Zeilen scheitern, Schweigen" -- the whole of D-1 (23/24/25 local hours)
+    exceeds price_lags' MAX_GAP_HOURS=6 in every row, including row 3 (which
+    also carries a price_lags group).
+    """
+    _scenario_price_gap(copied, target_day, None)
+
+
+def _scenario_source_frozen_8d(copied: CopiedStore, target_day: dt.date) -> None:
+    """Spec section 6.3: "Quelle eingefroren, letzter vollständiger Tag 8
+    Tage alt -> Altersgrenze greift" -- target_day_fold's own training
+    window ends at target_day - 1 (must_reach), so blanking "load" from
+    target_day - 8 onward leaves target_day - 9 as its last complete day,
+    exactly MAX_TRAINING_EDGE_AGE_DAYS (7) + 1 days behind must_reach.
+    """
+    cutoff = pd.Timestamp(target_day, tz=LOCAL_TZ).tz_convert("UTC") - pd.Timedelta(days=8)
+    end = pd.Timestamp(target_day, tz=LOCAL_TZ).tz_convert("UTC") + pd.Timedelta(days=2)
+    load_source = next(s for s in copied.entsoe_sources if s.name == "load")
+    _blank_monthly_files(load_source.cache_dir, cutoff, end, column=None)
+
+
+def _scenario_anchor_expired(copied: CopiedStore, target_day: dt.date) -> None:
+    """Spec section 6.3: "Ankertabelle abgelaufen -> Zeile 3, Lauf rot" --
+    the anchor table is a committed repo file, not part of the downloaded
+    store, so there is no file under the copy to corrupt (see CopiedStore's
+    own docstring). Signals the fault through ``copied.anchor_valid_until``
+    instead, which run_outage_drill forwards to
+    run_submission_for_day(..., anchor_valid_until=...).
+    """
+    run_init = run_init_for_target_day(target_day)
+    copied.anchor_valid_until = run_init - pd.Timedelta(days=1)
+
+
 SCENARIOS: Final[dict[str, ScenarioFn]] = {
     "none": _scenario_none,
     "load_missing": _scenario_load_missing,
     "load_gap_3h": _scenario_load_gap_3h,
     "load_gap_4h": _scenario_load_gap_4h,
     "weather_missing": _scenario_weather_missing,
+    "entsoe_cutoff_d1": _scenario_entsoe_cutoff_d1,
+    "entsoe_cutoff_d3": _scenario_entsoe_cutoff_d3,
+    "entsoe_cutoff_d9": _scenario_entsoe_cutoff_d9,
+    "ttf_dead_15d": _scenario_ttf_dead_15d,
+    "price_lags_gap_5h": _scenario_price_lags_gap_5h,
+    "price_d1_removed_both": _scenario_price_d1_removed_both,
+    "source_frozen_8d": _scenario_source_frozen_8d,
+    "anchor_expired": _scenario_anchor_expired,
 }
 
 
@@ -367,6 +587,7 @@ def run_outage_drill(
             live=False,
             now=lambda: as_of,
             weather_root=copied.weather_root,
+            anchor_valid_until=copied.anchor_valid_until,
         )
         runtime_seconds = time.monotonic() - t0
         price_provenance, price_source_conflicts = price_provenance_report(

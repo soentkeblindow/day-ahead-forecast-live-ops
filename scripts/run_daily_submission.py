@@ -456,7 +456,12 @@ class NwpAvailability:
     anchor: CapacityAnchorReport
 
 
-def check_a_nwp(target_day: dt.date, *, weather_root: Path = CACHE_ROOT) -> NwpAvailability:
+def check_a_nwp(
+    target_day: dt.date,
+    *,
+    weather_root: Path = CACHE_ROOT,
+    anchor_valid_until: pd.Timestamp | None = None,
+) -> NwpAvailability:
     """Assemble Check A's NWP-dependent inputs and run them (spec section
     5.2) -- the cheap gate before any fit happens (spec section 2.1).
 
@@ -475,10 +480,19 @@ def check_a_nwp(target_day: dt.date, *, weather_root: Path = CACHE_ROOT) -> NwpA
     read_weather_runs/read_quarterhourly_prices, so an early outage-drill
     run silently checked this machine's own (stale) local weather cache
     instead of the store copy it had just downloaded.
+
+    ``anchor_valid_until`` (spec 6.9 section 6.3, Schritt 14): ``None``
+    (every existing caller) computes the real boundary exactly as before --
+    the anchor CSV itself is a committed repo file, not part of the
+    downloaded store, so it has no store-copy equivalent for
+    scripts/outage_drill.py to corrupt the way every other drill scenario
+    does. An explicit override lets the ``anchor_expired`` drill scenario
+    force an already-past boundary instead.
     """
     run_init = run_init_for_target_day(target_day)
     weather_run = read_cached_run(cache_path(run_init, DEFAULT_WEATHER_MODEL, root=weather_root))
-    anchor_valid_until = anchor_table_valid_until(CapacitySource.PUBLIC_REGISTRY)
+    if anchor_valid_until is None:
+        anchor_valid_until = anchor_table_valid_until(CapacitySource.PUBLIC_REGISTRY)
 
     weather_result = check_weather_run(weather_run)
     anchor_result, anchor_report = check_capacity_anchor(target_day, anchor_valid_until)
@@ -704,6 +718,7 @@ def run_submission_for_day(
     live: bool = False,
     now: Callable[[], pd.Timestamp] = _utcnow,
     weather_root: Path = CACHE_ROOT,
+    anchor_valid_until: pd.Timestamp | None = None,
     submitted_records: Iterable[dict[str, object]] = (),
 ) -> SubmissionOutcome:
     """The prediction pipeline for one target day (spec 6.9 section 5.1) --
@@ -725,6 +740,10 @@ def run_submission_for_day(
 
     ``as_of``/``now``/``weather_root`` are unchanged from before this step
     -- see the prior revision's own docstring for their reasoning.
+    ``anchor_valid_until`` (Schritt 14): ``None`` for every real caller,
+    forwarded straight to ``check_a_nwp`` -- see that function's own
+    docstring for why the anchor table needs this instead of a
+    ``weather_root``-style directory override.
     ``submitted_records`` is the already-read protocol log (spec section
     2.9's downgrade protection, arena.candidates.best_accepted_rank) -- read
     once by the caller (run_daily_submission), not by this function, so
@@ -738,7 +757,7 @@ def run_submission_for_day(
 
     commodity_staleness_warnings = check_commodity_staleness(df, as_of)
 
-    nwp = check_a_nwp(target_day, weather_root=weather_root)
+    nwp = check_a_nwp(target_day, weather_root=weather_root, anchor_valid_until=anchor_valid_until)
     # spec 6.9 section 2.3: the anchor's own approaching-expiry warning is logged
     # independently of whether Check A as a whole passes -- a Pflegeversäumnis must stay
     # visible well before it can ever block anything.

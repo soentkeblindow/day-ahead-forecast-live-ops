@@ -24,8 +24,11 @@ from energy_price_forecast.ops.store_sources import (
 from scripts.outage_drill import (
     SCENARIOS,
     CopiedStore,
+    _blank_monthly_files,
+    _blank_single_file,
     _compare_against_archived_payload,
     _copy_sources_for_workdir,
+    _year_months_between,
     resolve_as_of,
     run_outage_drill,
 )
@@ -119,6 +122,97 @@ def test_copy_sources_returns_a_copiedstore(tmp_path: Path) -> None:
     assert isinstance(copied, CopiedStore)
     for source in copied.entsoe_sources:
         assert source.cache_dir.is_relative_to(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# _year_months_between / _blank_monthly_files / _blank_single_file
+# (Schritt 14's new file-mutation helpers, shared by every new scenario)
+# ---------------------------------------------------------------------------
+
+
+def test_year_months_between_within_one_month() -> None:
+    start = pd.Timestamp("2026-09-10", tz="UTC")
+    end = pd.Timestamp("2026-09-20", tz="UTC")
+    assert _year_months_between(start, end) == [(2026, 9)]
+
+
+def test_year_months_between_crosses_a_month_boundary() -> None:
+    start = pd.Timestamp("2026-09-25", tz="UTC")
+    end = pd.Timestamp("2026-10-05", tz="UTC")
+    assert _year_months_between(start, end) == [(2026, 9), (2026, 10)]
+
+
+def test_year_months_between_crosses_a_year_boundary() -> None:
+    start = pd.Timestamp("2026-12-20", tz="UTC")
+    end = pd.Timestamp("2027-01-10", tz="UTC")
+    assert _year_months_between(start, end) == [(2026, 12), (2027, 1)]
+
+
+def _write_month_file(cache_dir: Path, year: int, month: int, columns: dict[str, float]) -> Path:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    index = pd.date_range(f"{year:04d}-{month:02d}-01", periods=24 * 28, freq="h", tz="UTC")
+    df = pd.DataFrame({name: [value] * len(index) for name, value in columns.items()}, index=index)
+    path = cache_dir / f"DE_LU_{year:04d}-{month:02d}.parquet"
+    df.to_parquet(path)
+    return path
+
+
+def test_blank_monthly_files_nans_only_the_named_column_in_range(tmp_path: Path) -> None:
+    path = _write_month_file(tmp_path, 2026, 9, {"load_forecast_day_ahead": 100.0, "other": 1.0})
+    start = pd.Timestamp("2026-09-10T00:00", tz="UTC")
+    end = pd.Timestamp("2026-09-12T00:00", tz="UTC")
+
+    _blank_monthly_files(tmp_path, start, end, column="load_forecast_day_ahead")
+
+    df = pd.read_parquet(path)
+    in_range = (df.index >= start) & (df.index < end)
+    assert df.loc[in_range, "load_forecast_day_ahead"].isna().all()
+    assert df.loc[in_range, "other"].notna().all()
+    assert df.loc[~in_range, "load_forecast_day_ahead"].notna().all()
+
+
+def test_blank_monthly_files_whole_row_when_column_is_none(tmp_path: Path) -> None:
+    path = _write_month_file(tmp_path, 2026, 9, {"a": 1.0, "b": 2.0})
+    start = pd.Timestamp("2026-09-15T00:00", tz="UTC")
+    end = pd.Timestamp("2026-09-16T00:00", tz="UTC")
+
+    _blank_monthly_files(tmp_path, start, end, column=None)
+
+    df = pd.read_parquet(path)
+    in_range = (df.index >= start) & (df.index < end)
+    assert df.loc[in_range, ["a", "b"]].isna().all().all()
+    assert df.loc[~in_range, ["a", "b"]].notna().all().all()
+
+
+def test_blank_monthly_files_spans_two_month_files(tmp_path: Path) -> None:
+    sep_path = _write_month_file(tmp_path, 2026, 9, {"a": 1.0})
+    oct_path = _write_month_file(tmp_path, 2026, 10, {"a": 1.0})
+    start = pd.Timestamp("2026-09-29T00:00", tz="UTC")
+    end = pd.Timestamp("2026-10-02T00:00", tz="UTC")
+
+    _blank_monthly_files(tmp_path, start, end, column="a")
+
+    sep_df, oct_df = pd.read_parquet(sep_path), pd.read_parquet(oct_path)
+    assert sep_df.loc[sep_df.index >= start, "a"].isna().all()
+    assert sep_df.loc[sep_df.index < start, "a"].notna().all()
+    assert oct_df.loc[oct_df.index < end, "a"].isna().all()
+    assert oct_df.loc[oct_df.index >= end, "a"].notna().all()
+
+
+def test_blank_single_file_nans_only_the_named_column_in_range(tmp_path: Path) -> None:
+    index = pd.date_range("2026-01-01", periods=200, freq="h", tz="UTC")
+    df = pd.DataFrame({"day_ahead_price_ec": 50.0, "other": 1.0}, index=index)
+    path = tmp_path / "day_ahead_price_ec.parquet"
+    df.to_parquet(path)
+    start, end = index[10], index[15]
+
+    _blank_single_file(path, start, end, column="day_ahead_price_ec")
+
+    out = pd.read_parquet(path)
+    in_range = (out.index >= start) & (out.index < end)
+    assert out.loc[in_range, "day_ahead_price_ec"].isna().all()
+    assert out.loc[in_range, "other"].notna().all()
+    assert out.loc[~in_range, "day_ahead_price_ec"].notna().all()
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +316,23 @@ def test_load_gap_scenarios_registered() -> None:
     itself)."""
     assert "load_gap_3h" in SCENARIOS
     assert "load_gap_4h" in SCENARIOS
+
+
+def test_schritt_14_scenarios_registered() -> None:
+    """spec 6.9 section 6.3, Schritt 14's own acceptance suite -- registration-
+    level check only, same discipline as the other scenarios above (the real
+    injection mechanics are proven by a real As-of-Lauf, not a unit test)."""
+    for name in (
+        "entsoe_cutoff_d1",
+        "entsoe_cutoff_d3",
+        "entsoe_cutoff_d9",
+        "ttf_dead_15d",
+        "price_lags_gap_5h",
+        "price_d1_removed_both",
+        "source_frozen_8d",
+        "anchor_expired",
+    ):
+        assert name in SCENARIOS
 
 
 def test_unknown_scenario_raises_before_touching_the_network() -> None:
