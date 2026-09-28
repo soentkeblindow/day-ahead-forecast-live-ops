@@ -94,7 +94,13 @@ from energy_price_forecast.ops.protocol import (
 )
 from energy_price_forecast.ops.store_sources import code_sha, run_id_and_url
 from energy_price_forecast.ops.windows import LOCAL_TZ, local_day_bounds, next_delivery_day
-from scripts.measurement_a_candidate_intake import build_floor_for_day
+
+# `python scripts/run_daily_submission.py` (the invocation submit.yml uses) puts
+# scripts/ itself on sys.path, not the repo root, so `scripts` isn't importable
+# as a package from here without this -- same fix as freeze_golden_fixture.py.
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+from scripts.measurement_a_candidate_intake import build_floor_for_day  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
