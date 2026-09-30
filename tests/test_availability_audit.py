@@ -283,6 +283,31 @@ def test_client_error_produces_an_error_row_without_raising() -> None:
     assert "RuntimeError" in row["error"]
 
 
+def test_client_error_redacts_an_entsoe_security_token() -> None:
+    """Regression test for a real incident (publication spec, Sicherheits-
+    prüfung section 3.1): entsoe-py's HTTPError embeds ENTSOE_API_KEY in the
+    request URL, and this row's own [:200] truncation used to just cut the
+    token short rather than remove it -- a real key ended up committed into
+    logs/availability.csv across several commits (git history was not
+    rewritten; the key was rotated instead, spec section 2.3)."""
+    spec = audit.SeriesSpec("day_ahead_price", Availability.DA_FIXED, "day_ahead_price")
+    target_date = dt.date(2026, 8, 20)
+    run_ts_utc = pd.Timestamp("2026-08-19T09:00:00+00:00")
+    run_ts_local = run_ts_utc.tz_convert(audit.LOCAL_TZ)
+    error = RuntimeError(
+        "404 Client Error: Not Found for url: https://web-api.tp.entsoe.eu/api"
+        "?documentType=A11&securityToken=4359c395-caf3-44aa-ad56-5cd216700952"
+    )
+
+    row = audit._availability_row(
+        None, error, spec, "critical", target_date, run_ts_utc, run_ts_local
+    )
+
+    assert row["error"] is not None
+    assert "4359c395" not in row["error"]
+    assert "securityToken=***REDACTED***" in row["error"]
+
+
 def test_run_availability_audit_does_not_raise_when_a_fetch_group_errors() -> None:
     def _boom(start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
         raise RuntimeError("ENTSO-E is down")

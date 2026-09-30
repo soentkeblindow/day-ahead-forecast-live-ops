@@ -39,6 +39,7 @@ from energy_price_forecast.data.entsoe_client import (
     fetch_wind_solar_forecast,
 )
 from energy_price_forecast.features.availability import _RAW_AVAILABILITY, Availability
+from energy_price_forecast.ops.store_sources import redact_secrets
 from energy_price_forecast.ops.windows import (
     expected_timestamp_count,
     local_day_bounds,
@@ -333,7 +334,11 @@ def _availability_row(
 
     if error is not None:
         row["status"] = "error"
-        row["error"] = f"{type(error).__name__}: {error}"[:200]
+        # redact_secrets: entsoe-py embeds ENTSOE_API_KEY in the request URL
+        # (publication spec, Sicherheitsprüfung section 3.1) -- a transient
+        # HTTPError's own str() would otherwise carry it into this committed
+        # CSV column, truncation or not.
+        row["error"] = redact_secrets(f"{type(error).__name__}: {error}")[:200]
         return row
 
     assert df is not None
@@ -389,7 +394,11 @@ def _commodity_row(
 
     if error is not None:
         row["status"] = "error"
-        row["error"] = f"{type(error).__name__}: {error}"[:200]
+        # redact_secrets: entsoe-py embeds ENTSOE_API_KEY in the request URL
+        # (publication spec, Sicherheitsprüfung section 3.1) -- a transient
+        # HTTPError's own str() would otherwise carry it into this committed
+        # CSV column, truncation or not.
+        row["error"] = redact_secrets(f"{type(error).__name__}: {error}")[:200]
         return row
 
     assert df is not None

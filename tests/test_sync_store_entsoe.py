@@ -64,6 +64,41 @@ def test_sync_entsoe_source_fetches_full_history_not_just_the_gap(tmp_path: Path
     assert not log.any_failure
 
 
+def test_sync_entsoe_source_redacts_a_security_token_on_fetch_failure(tmp_path: Path) -> None:
+    """Regression test for a real incident (publication spec, Sicherheits-
+    prüfung section 3.1): an entsoe-py HTTPError's own str() embeds
+    ENTSOE_API_KEY in the request URL -- this source's own error handling
+    must not let that reach log.get(name).validation, since that field is
+    written straight into the committed logs/store_sync.csv."""
+
+    def fake_fetch(
+        start: pd.Timestamp, end: pd.Timestamp, *, use_cache: bool = True
+    ) -> pd.DataFrame:
+        raise RuntimeError(
+            "404 Client Error: Not Found for url: https://web-api.tp.entsoe.eu/api"
+            "?documentType=A11&securityToken=4359c395-caf3-44aa-ad56-5cd216700952"
+        )
+
+    source = sync_store.EntsoeSource(name="day_ahead_price", fetch=fake_fetch, cache_dir=tmp_path)
+    manifest = store.Manifest(
+        store_format_version=store.STORE_FORMAT_VERSION,
+        created_at_utc="2020-01-10T00:00:00+00:00",
+        run_id="1",
+        run_url="",
+        code_sha="abc",
+        sources={},
+    )
+    log = sync_store.RunLog()
+    as_of = pd.Timestamp("2020-01-10T00:00:00+00:00", tz="UTC")
+
+    entry = sync_store._sync_entsoe_source(source, manifest, as_of, log)
+
+    assert entry is None
+    validation = log.get("day_ahead_price").validation
+    assert "4359c395" not in validation
+    assert "securityToken=***REDACTED***" in validation
+
+
 def test_heal_refetch_with_use_cache_false_actually_persists_to_disk(tmp_path: Path) -> None:
     """Regression for 6.7.1's own section 2.1 finding, closed by 6.7.1a
     (spec section 5.4): before this fix, a heal refetch had no way to ask

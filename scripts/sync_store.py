@@ -55,6 +55,7 @@ from energy_price_forecast.ops.store_sources import (
     EntsoeSource,
     RowFetchFn,
     code_sha,
+    redact_secrets,
     run_id_and_url,
 )
 from energy_price_forecast.ops.windows import (
@@ -252,8 +253,13 @@ def _sync_entsoe_source(
         frame = source.fetch(fetch_start, period_end)
         row.fetched = True
     except Exception as exc:  # noqa: BLE001 -- an unreachable source is a green outcome (spec 2.7)
-        logger.warning("Source %r unreachable this run: %s", source.name, exc)
-        row.validation = f"unreachable: {exc}"
+        # redact_secrets: entsoe-py embeds ENTSOE_API_KEY in the request URL
+        # (publication spec, Sicherheitsprüfung section 3.1) -- exc's own
+        # str() would otherwise carry it into this log line and this row's
+        # committed CSV column.
+        safe_exc = redact_secrets(str(exc))
+        logger.warning("Source %r unreachable this run: %s", source.name, safe_exc)
+        row.validation = f"unreachable: {safe_exc}"
         return previous
 
     expectation = store.EXPECTATION_TABLE[source.name]

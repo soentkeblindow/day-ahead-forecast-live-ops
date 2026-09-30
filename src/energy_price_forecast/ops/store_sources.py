@@ -13,6 +13,7 @@ scripts import from here instead, so the binding is defined exactly once.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -39,6 +40,26 @@ from energy_price_forecast.data.entsoe_client import (
 from energy_price_forecast.ops.windows import LOCAL_TZ
 
 RowFetchFn = Callable[[pd.Timestamp, pd.Timestamp], pd.DataFrame]
+
+# entsoe-py's underlying HTTP client embeds ENTSOE_API_KEY directly in the
+# request URL as a securityToken query parameter -- a transient HTTPError's
+# own str() therefore contains it verbatim (requests.HTTPError includes the
+# full request URL). Found leaked into a committed audit log this way
+# (publication spec, Sicherheitsprüfung section 3.1: a real token, truncated
+# but reconstructable across several commits, in logs/availability.csv) --
+# the truncation that produced the leak was incidental, not the cause; any
+# fixed-length slice of an unredacted URL leaks a prefix. Applied wherever an
+# exception from an ENTSO-E fetch is turned into a string that gets
+# logged/persisted, not only at the point the leak was first found.
+_SECURITY_TOKEN_RE: Final = re.compile(r"(securityToken=)[^&\s]+")
+
+
+def redact_secrets(text: str) -> str:
+    """Replace any ENTSO-E securityToken query-parameter value in text with
+    a fixed placeholder. Safe to call unconditionally (a no-op if no token
+    is present), so callers don't need to reason about which specific
+    exception could contain one."""
+    return _SECURITY_TOKEN_RE.sub(r"\1***REDACTED***", text)
 
 
 class EntsoeFetchFn(Protocol):
