@@ -42,6 +42,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import os
 import tarfile
 import tempfile
 from collections.abc import Callable, Iterable
@@ -50,6 +51,7 @@ from pathlib import Path
 from typing import Any, Final, Literal, cast
 
 import pandas as pd
+from cryptography.fernet import Fernet, InvalidToken
 
 from energy_price_forecast.data.entsoe_client import NEIGHBORS
 from energy_price_forecast.data.weather_grid import (
@@ -256,12 +258,89 @@ def unpack_store(tar_path: Path, workdir: Path) -> Manifest:
 
 
 # ---------------------------------------------------------------------------
+# Encryption (publication spec, section 2.1) -- the store contains
+# third-party market data (TTF via Yahoo Finance) that may not be
+# redistributed, so the packed archive is encrypted before it ever leaves
+# this process and decrypted right after it arrives, nowhere else. Fernet
+# (``cryptography``) is symmetric, authenticated encryption: a wrong key or
+# a damaged file fails loudly (InvalidToken) rather than silently handing
+# back garbage. Code and every other data source in this repo are public;
+# only the packed archive as a whole is not.
+# ---------------------------------------------------------------------------
+
+STORE_ENCRYPTION_KEY_ENV_VAR: Final[str] = "STORE_ENCRYPTION_KEY"
+
+# A Fernet token is urlsafe-base64 of a fixed-format binary blob starting
+# with a version byte 0x80 -- base64-encoding that single byte always
+# produces the literal ASCII prefix "gAAAAA". This is what lets the
+# transitional read path below tell an already-encrypted archive apart from
+# a legacy plaintext one without a separate marker file or format flag: no
+# plaintext tar (magic bytes "ustar" at offset 257) can ever start this way.
+_FERNET_PREFIX: Final[bytes] = b"gAAAAA"
+
+
+class StoreEncryptionError(StoreError):
+    """STORE_ENCRYPTION_KEY is missing/invalid, or an archive could not be
+    decrypted with it."""
+
+
+def _fernet() -> Fernet:
+    key = os.environ.get(STORE_ENCRYPTION_KEY_ENV_VAR)
+    if not key:
+        raise StoreEncryptionError(
+            f"{STORE_ENCRYPTION_KEY_ENV_VAR} is not set -- the store cannot be read or "
+            "written without it (README 'Data store and scheduling' section). If the key "
+            "itself is lost, scripts/rebuild_store.py can rebuild the store from source "
+            "instead of decrypting an existing archive."
+        )
+    try:
+        return Fernet(key.encode("ascii"))
+    except (ValueError, TypeError) as exc:
+        raise StoreEncryptionError(
+            f"{STORE_ENCRYPTION_KEY_ENV_VAR} is set but is not a valid Fernet key."
+        ) from exc
+
+
+def _encrypt_store_archive(path: Path) -> None:
+    """Encrypt path's bytes in place with Fernet. The only call site is
+    publish_store, directly before upload_asset -- this is what makes
+    "the store never uploads plaintext" true: _fernet() raises before
+    upload_asset is ever reached if the key is missing or invalid."""
+    plaintext = path.read_bytes()
+    token = _fernet().encrypt(plaintext)
+    path.write_bytes(token)
+
+
+def _decrypt_store_archive(path: Path) -> Literal["encrypted", "plaintext"]:
+    """Decrypt path's bytes in place if they look like a Fernet token; leave
+    a legacy plaintext archive untouched. This is the transitional read path
+    (publication spec section 2.1): as long as an already-published
+    plaintext asset can still be the newest one, load_store must keep being
+    able to read it. Removed once the observation phase (section 8 step 8)
+    is over and every remaining asset is encrypted. Returns which format was
+    read, so the caller can log it."""
+    raw = path.read_bytes()
+    if not raw.startswith(_FERNET_PREFIX):
+        return "plaintext"
+    try:
+        plaintext = _fernet().decrypt(raw)
+    except InvalidToken as exc:
+        raise StoreEncryptionError(
+            f"Could not decrypt {path.name!r} with {STORE_ENCRYPTION_KEY_ENV_VAR} -- wrong "
+            "or corrupted key, or the file is damaged."
+        ) from exc
+    path.write_bytes(plaintext)
+    return "encrypted"
+
+
+# ---------------------------------------------------------------------------
 # Kernfunktionen (spec section 5.3)
 # ---------------------------------------------------------------------------
 
 
 def load_store(workdir: Path) -> StoreState:
-    """Download the newest store asset and unpack it into workdir.
+    """Download the newest store asset, decrypt it, and unpack it into
+    workdir.
 
     Raises StoreError if no asset exists -- an empty store is not a valid
     operating state, it is a signal to run scripts/rebuild_store.py.
@@ -276,16 +355,18 @@ def load_store(workdir: Path) -> StoreState:
     with tempfile.TemporaryDirectory() as tmp:
         tar_path = Path(tmp) / newest.name
         release_assets.download_asset(newest, tar_path)
+        store_format = _decrypt_store_archive(tar_path)
+        logger.info("Store archive %s read as %s", newest.name, store_format)
         manifest = unpack_store(tar_path, workdir)
     return StoreState(workdir=workdir, manifest=manifest)
 
 
 def publish_store(workdir: Path, manifest: Manifest) -> AssetRef:
-    """Pack, upload as a new timestamped asset, then prune to the newest
-    STORE_KEEP_VERSIONS. Never overwrites an existing asset (spec section
-    2.5) -- the timestamp in manifest.created_at_utc is also the asset's
-    file name, so two publishes in the same second would collide; callers
-    are expected to call this at most once per run.
+    """Pack, encrypt, upload as a new timestamped asset, then prune to the
+    newest STORE_KEEP_VERSIONS. Never overwrites an existing asset (spec
+    section 2.5) -- the timestamp in manifest.created_at_utc is also the
+    asset's file name, so two publishes in the same second would collide;
+    callers are expected to call this at most once per run.
     """
     release = release_assets.ensure_release(STORE_RELEASE_TAG)
     ts = pd.Timestamp(manifest.created_at_utc).strftime("%Y%m%dT%H%M%SZ")
@@ -293,6 +374,7 @@ def publish_store(workdir: Path, manifest: Manifest) -> AssetRef:
     with tempfile.TemporaryDirectory() as tmp:
         tar_path = Path(tmp) / tar_name
         pack_store(workdir, manifest, tar_path)
+        _encrypt_store_archive(tar_path)
         asset = release_assets.upload_asset(release, tar_path)
     release_assets.prune_assets(release, STORE_KEEP_VERSIONS)
     return asset

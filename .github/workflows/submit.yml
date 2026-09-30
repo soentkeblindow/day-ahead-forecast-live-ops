@@ -84,6 +84,10 @@ jobs:
           ARENA_API_KEY: ${{ secrets.ARENA_API_KEY }}
           ARENA_API_BASE_URL: ${{ vars.ARENA_API_BASE_URL }}
           ARENA_LIVE: ${{ vars.ARENA_LIVE }}
+          # Decrypts the store this job reads (publication spec section 2.1)
+          # -- this job never publishes, only load_store, but that still
+          # needs the key.
+          STORE_ENCRYPTION_KEY: ${{ secrets.STORE_ENCRYPTION_KEY }}
           MODE: ${{ inputs.mode }}
           NOMINAL_SLOT: ${{ inputs.nominal_slot }}
           IS_LAST_SLOT_OF_DAY: ${{ inputs.is_last_slot_of_day }}

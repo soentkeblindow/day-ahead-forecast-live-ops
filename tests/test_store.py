@@ -16,11 +16,17 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import pytest
+from cryptography.fernet import Fernet
 
 from energy_price_forecast.config import PROJECT_ROOT
 from energy_price_forecast.data.weather_grid import GRID_POINTS, HOURLY_VARIABLES
 from energy_price_forecast.ops import release_assets as ra
 from energy_price_forecast.ops import store
+
+# A throwaway key generated fresh per test run -- never the real
+# STORE_ENCRYPTION_KEY, so these tests need no secret and can run in CI
+# exactly as before (publication spec section 9: "Synthetisch, ohne Netz").
+_TEST_KEY: str = Fernet.generate_key().decode()
 
 
 def _write(path: Path, content: bytes = b"x") -> None:
@@ -300,6 +306,7 @@ def test_publish_store_uploads_then_prunes_to_keep_versions(
 
     monkeypatch.setattr(store.release_assets, "upload_asset", fake_upload)
     monkeypatch.setattr(store.release_assets, "prune_assets", fake_prune)
+    monkeypatch.setenv(store.STORE_ENCRYPTION_KEY_ENV_VAR, _TEST_KEY)
 
     manifest = _sample_manifest(created_at_utc="2026-09-08T10:10:00+00:00")
     asset = store.publish_store(root, manifest)
@@ -308,6 +315,157 @@ def test_publish_store_uploads_then_prunes_to_keep_versions(
     assert pruned["keep"] == store.STORE_KEEP_VERSIONS
     assert pruned["release"] == release
     assert asset.name == "store-20260908T101000Z.tar"
+
+
+# ---------------------------------------------------------------------------
+# Encryption (publication spec, section 2.1/9)
+# ---------------------------------------------------------------------------
+
+
+def test_encrypt_then_decrypt_archive_round_trips_byte_identical(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv(store.STORE_ENCRYPTION_KEY_ENV_VAR, _TEST_KEY)
+    path = tmp_path / "store.tar"
+    original = b"not-actually-a-tar-but-bytes-are-bytes" * 100
+    path.write_bytes(original)
+
+    store._encrypt_store_archive(path)
+    assert path.read_bytes().startswith(store._FERNET_PREFIX)  # actually encrypted, not a no-op
+
+    store_format = store._decrypt_store_archive(path)
+
+    assert store_format == "encrypted"
+    assert path.read_bytes() == original
+
+
+def test_decrypt_with_wrong_key_raises_a_clear_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv(store.STORE_ENCRYPTION_KEY_ENV_VAR, _TEST_KEY)
+    path = tmp_path / "store.tar"
+    path.write_bytes(b"some store bytes")
+    store._encrypt_store_archive(path)
+
+    monkeypatch.setenv(store.STORE_ENCRYPTION_KEY_ENV_VAR, Fernet.generate_key().decode())
+
+    with pytest.raises(store.StoreEncryptionError, match="wrong or corrupted"):
+        store._decrypt_store_archive(path)
+
+
+def test_decrypt_a_corrupted_file_raises_a_clear_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv(store.STORE_ENCRYPTION_KEY_ENV_VAR, _TEST_KEY)
+    path = tmp_path / "store.tar"
+    path.write_bytes(b"some store bytes" * 10)
+    store._encrypt_store_archive(path)
+
+    corrupted = bytearray(path.read_bytes())
+    corrupted[-5] ^= 0xFF  # flip one byte inside the token, well past the fixed prefix
+    path.write_bytes(bytes(corrupted))
+
+    with pytest.raises(store.StoreEncryptionError, match="wrong or corrupted"):
+        store._decrypt_store_archive(path)
+
+
+def test_missing_key_raises_a_clear_error_naming_the_env_var(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv(store.STORE_ENCRYPTION_KEY_ENV_VAR, raising=False)
+    path = tmp_path / "store.tar"
+    path.write_bytes(b"gAAAAA-shaped bytes that would need a key to decrypt")
+
+    with pytest.raises(store.StoreEncryptionError, match=store.STORE_ENCRYPTION_KEY_ENV_VAR):
+        store._decrypt_store_archive(path)
+
+
+def test_transitional_read_path_distinguishes_plaintext_from_encrypted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv(store.STORE_ENCRYPTION_KEY_ENV_VAR, _TEST_KEY)
+
+    plaintext_path = tmp_path / "plain.tar"
+    plaintext_path.write_bytes(b"a legacy plaintext archive, e.g. tar magic bytes")
+    assert store._decrypt_store_archive(plaintext_path) == "plaintext"
+    assert plaintext_path.read_bytes() == b"a legacy plaintext archive, e.g. tar magic bytes"
+
+    encrypted_path = tmp_path / "enc.tar"
+    encrypted_path.write_bytes(b"a fresh archive")
+    store._encrypt_store_archive(encrypted_path)
+    assert store._decrypt_store_archive(encrypted_path) == "encrypted"
+    assert encrypted_path.read_bytes() == b"a fresh archive"
+
+
+def test_publish_store_never_uploads_without_a_valid_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The upload path must abort before upload_asset is ever called if the
+    key is missing -- this is what makes 'the store never uploads plaintext'
+    true, not just documented (publication spec section 9, 'Upload schreibt
+    nie Klartext')."""
+    root = tmp_path / "repo"
+    _write(root / "data" / "raw" / "entsoe" / "day_ahead_prices" / "2026-08.parquet")
+    monkeypatch.delenv(store.STORE_ENCRYPTION_KEY_ENV_VAR, raising=False)
+
+    release = ra.ReleaseRef(release_id=1, tag=store.STORE_RELEASE_TAG)
+    monkeypatch.setattr(store.release_assets, "ensure_release", lambda tag: release)
+
+    upload_called = False
+
+    def fake_upload(rel: ra.ReleaseRef, path: Path) -> ra.AssetRef:
+        nonlocal upload_called
+        upload_called = True
+        return ra.AssetRef(9, path.name, rel.release_id, True, path.stat().st_size)
+
+    monkeypatch.setattr(store.release_assets, "upload_asset", fake_upload)
+    monkeypatch.setattr(store.release_assets, "prune_assets", lambda rel, keep: ())
+
+    manifest = _sample_manifest(created_at_utc="2026-09-08T10:10:00+00:00")
+    with pytest.raises(store.StoreEncryptionError, match=store.STORE_ENCRYPTION_KEY_ENV_VAR):
+        store.publish_store(root, manifest)
+
+    assert upload_called is False
+
+
+def test_load_store_decrypts_a_real_encrypted_asset(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """publish_store then load_store, round-tripped through real Fernet
+    encryption end to end (not just the two private helpers in isolation)."""
+    monkeypatch.setenv(store.STORE_ENCRYPTION_KEY_ENV_VAR, _TEST_KEY)
+    root = tmp_path / "source_repo"
+    _write(root / "data" / "raw" / "entsoe" / "day_ahead_prices" / "2026-08.parquet", b"payload")
+
+    release = ra.ReleaseRef(release_id=1, tag=store.STORE_RELEASE_TAG)
+    monkeypatch.setattr(store.release_assets, "ensure_release", lambda tag: release)
+
+    published: dict[str, bytes] = {}
+
+    def fake_upload(rel: ra.ReleaseRef, path: Path) -> ra.AssetRef:
+        published["bytes"] = path.read_bytes()
+        return ra.AssetRef(9, path.name, rel.release_id, True, path.stat().st_size)
+
+    monkeypatch.setattr(store.release_assets, "upload_asset", fake_upload)
+    monkeypatch.setattr(store.release_assets, "prune_assets", lambda rel, keep: ())
+
+    manifest = _sample_manifest(created_at_utc="2026-09-08T10:10:00+00:00")
+    store.publish_store(root, manifest)
+    assert published["bytes"].startswith(store._FERNET_PREFIX)  # confirms it left encrypted
+
+    newest = ra.AssetRef(1, "store-20260908T101000Z.tar", 1, True, len(published["bytes"]))
+    monkeypatch.setattr(store.release_assets, "list_assets", lambda rel: (newest,))
+
+    def fake_download(asset: ra.AssetRef, target: Path) -> None:
+        target.write_bytes(published["bytes"])
+
+    monkeypatch.setattr(store.release_assets, "download_asset", fake_download)
+
+    workdir = tmp_path / "workdir"
+    state = store.load_store(workdir)
+
+    assert state.manifest == manifest
+    assert (workdir / "data" / "raw" / "entsoe" / "day_ahead_prices" / "2026-08.parquet").exists()
 
 
 # ---------------------------------------------------------------------------

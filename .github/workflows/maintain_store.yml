@@ -46,11 +46,16 @@ jobs:
 
       # ENTSOE_API_KEY for the six ENTSO-E fetch groups; GITHUB_TOKEN
       # (built-in, permissions: contents: write above) for release assets
-      # and the log commit below -- no new secret (spec section 3.4).
+      # and the log commit below. STORE_ENCRYPTION_KEY (publication spec
+      # section 2.1) decrypts the downloaded store and encrypts the one this
+      # run publishes -- this is the only workflow besides submit.yml that
+      # reads or writes the store, so it is the only other place this secret
+      # is bound.
       - name: Sync the data store
         env:
           ENTSOE_API_KEY: ${{ secrets.ENTSOE_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STORE_ENCRYPTION_KEY: ${{ secrets.STORE_ENCRYPTION_KEY }}
         run: uv run python scripts/sync_store.py
 
       # Same push discipline as audit.yml/weather_availability_probe.yml

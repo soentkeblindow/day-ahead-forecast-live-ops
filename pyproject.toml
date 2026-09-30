@@ -8,6 +8,7 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "cryptography>=46.0.7",
     "entsoe-py>=0.8.0",
     "holidays>=0.95",
     "lightgbm==4.6.0",
