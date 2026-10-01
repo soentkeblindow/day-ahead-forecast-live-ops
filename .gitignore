@@ -242,9 +242,14 @@ mlartifacts/
 .vscode/
 .idea/
 claude.md
+CLAUDE.md
 
 # Throwaway exploration scripts (see docs/sprint6_step6_5_0_spike.md)
 scratch/
+
+# One-off operational repair scripts, kept locally only (see
+# documentation/removed_modules.md)
+scripts_local/
 
 # OS
 .DS_Store

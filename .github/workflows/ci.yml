@@ -6,7 +6,10 @@ on:
   pull_request:
     branches: [main]
 
-# Neuere Pushes auf denselben Branch stornieren ältere Runs
+permissions:
+  contents: read
+
+# Newer pushes to the same branch cancel older in-flight runs
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
