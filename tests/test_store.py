@@ -1670,6 +1670,131 @@ def test_carried_columns_scan_negative_control_catches_a_misclassified_column() 
 
 
 # ---------------------------------------------------------------------------
+# relevant_only_eligible -- a second, independent source-scan regression
+# test (2026-10-01 maintenance-timeout fix, docs/bugs_in_live_system.md
+# entry 6: scripts/sync_store.py's --mode relevant-only skips a fixed set of
+# sources during the gate-closure-adjacent window). Deliberately NOT reusing
+# _find_consumer_hits/_CONSUMER_DIRS above unchanged: that scan answers "is
+# this read by features/models/evaluation" (the DQ-gate question this
+# source's carried_columns status already answers); this one answers a
+# different question, "is it read anywhere in the live submission path" --
+# which also needs arena/ and run_daily_submission.py itself. day_ahead_
+# price_ec/load_forecast_day_ahead_ec are the proof this distinction is
+# real and not pedantic: fully carried_columns, genuinely read via
+# arena/live_inputs.py::coalesce_price as the ENTSO-E-outage fallback, but
+# invisible to the narrower features/models/evaluation scan above. The same
+# wider scan is what caught eua_co2_eur_per_t being read by
+# arena/preflight.py::check_commodity_staleness's default columns while
+# building this -- that is why EXPECTATION_TABLE["eua_co2"] is NOT marked
+# relevant_only_eligible despite being fully carried (see its own comment).
+# ---------------------------------------------------------------------------
+
+_RELEVANT_ONLY_CONSUMER_DIRS: tuple[str, ...] = ("features", "models", "evaluation", "arena")
+
+
+def _relevant_only_consumer_source_files() -> list[Path]:
+    src_root = PROJECT_ROOT / "src" / "energy_price_forecast"
+    files = [
+        p
+        for d in _RELEVANT_ONLY_CONSUMER_DIRS
+        for p in (src_root / d).rglob("*.py")
+        if p.name not in _NOT_A_CONSUMER
+    ]
+    # The live daily orchestrator itself, not just the package code it
+    # calls into -- a column could in principle be referenced directly here
+    # without going through arena/ at all.
+    files.append(PROJECT_ROOT / "scripts" / "run_daily_submission.py")
+    return files
+
+
+def _find_relevant_only_consumer_hits(columns: frozenset[str]) -> dict[str, list[str]]:
+    files = _relevant_only_consumer_source_files()
+    texts = {p: p.read_text(encoding="utf-8") for p in files}
+    hits: dict[str, list[str]] = {}
+    for column in columns:
+        pattern = re.compile(rf"\b{re.escape(column)}\b")
+        matches = [str(p) for p, text in texts.items() if pattern.search(text)]
+        if matches:
+            hits[column] = matches
+    return hits
+
+
+def _relevant_only_eligible_carried_columns() -> frozenset[str]:
+    return frozenset(
+        col
+        for expectation in store.EXPECTATION_TABLE.values()
+        if expectation.relevant_only_eligible
+        for col in expectation.carried_columns
+    )
+
+
+def test_relevant_only_eligible_sources_are_fully_carried_and_unread() -> None:
+    """Every source scripts/sync_store.py's --mode relevant-only may skip
+    must satisfy both halves of SourceExpectation.relevant_only_eligible's
+    own docstring claim: no checked columns at all, and no hit anywhere in
+    the live submission path (features/models/evaluation/arena plus
+    run_daily_submission.py itself) for any of its carried columns --
+    EXCEPT the already-accepted spec 6.9 section 2.5 "computed but
+    unrequired" exemption (gen_wind_onshore/_offshore/_solar, same set
+    _unrequired_feature_columns() already names above), checked separately
+    and more narrowly by the next test."""
+    eligible = {
+        name: expectation
+        for name, expectation in store.EXPECTATION_TABLE.items()
+        if expectation.relevant_only_eligible
+    }
+    assert len(eligible) > 0  # sanity: the mechanism has at least one real user
+
+    for name, expectation in eligible.items():
+        assert expectation.expected_columns == frozenset(), (
+            f"{name!r} has checked column(s) {expectation.expected_columns} but is marked "
+            "relevant_only_eligible=True -- a checked column can never be skip-eligible"
+        )
+
+    strictly_unread = _relevant_only_eligible_carried_columns() - _unrequired_feature_columns()
+    hits = _find_relevant_only_consumer_hits(strictly_unread)
+    assert hits == {}, (
+        f"relevant_only_eligible column(s) actually read somewhere in the live submission "
+        f"path -- must not be skip-eligible: {hits}"
+    )
+
+
+def test_relevant_only_eligible_unrequired_feature_columns_are_read_only_where_expected() -> None:
+    """The weaker claim for whichever relevant_only_eligible columns also
+    fall under spec 6.9 section 2.5's _unrequired_feature_columns()
+    exemption (currently gen_wind_onshore/_offshore/_solar, carried by the
+    "generation" source): still read (confirmed, not just assumed), but
+    only inside the same already-accepted files
+    test_unrequired_feature_columns_are_read_only_where_expected checks
+    above -- a hit anywhere else would mean a live candidate now requires
+    one of them, which would also disqualify it from relevant_only_eligible."""
+    columns = _relevant_only_eligible_carried_columns() & _unrequired_feature_columns()
+    assert len(columns) > 0  # sanity: this exemption really is in play here
+
+    hits = _find_relevant_only_consumer_hits(columns)
+    stray = {
+        col: [f for f in files if Path(f).name not in _ALLOWED_UNREQUIRED_FEATURE_FILES]
+        for col, files in hits.items()
+    }
+    stray = {col: files for col, files in stray.items() if files}
+    assert stray == {}, (
+        f"relevant_only_eligible column(s) read outside the already-accepted computed-but-"
+        f"unrequired files -- a live candidate may now require them: {stray}"
+    )
+
+
+def test_relevant_only_eligible_scan_negative_control_catches_an_ec_source() -> None:
+    """Proves the scan's wider scope (vs. the features/models/evaluation-only
+    one above) is actually doing something: day_ahead_price_ec is fully
+    carried (same shape as a real relevant_only_eligible source) but IS
+    read, via arena/live_inputs.py::coalesce_price -- invisible to the
+    narrower scan, which is exactly why relevant_only_eligible needed its
+    own check instead of reusing carried_columns directly."""
+    hits = _find_relevant_only_consumer_hits(frozenset({"day_ahead_price_ec"}))
+    assert "day_ahead_price_ec" in hits
+
+
+# ---------------------------------------------------------------------------
 # Every real source that gets its own manifest entry must have a
 # _SOURCE_GLOBS entry too -- a real bug found live (spec 6.9 Schritt 6,
 # 2026-09-24): the two new Energy-Charts sources got EXPECTATION_TABLE

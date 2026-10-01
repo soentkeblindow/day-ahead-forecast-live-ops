@@ -199,7 +199,14 @@ def test_sync_budget_exhausted_in_heal_loop_still_publishes_weather(
     # finally trips.
     clock = _StepClock(free_calls=1 + len(names))
 
-    exit_code = sync_store.run_sync(only=None, dry_run=False, clock=clock)
+    # mode="relevant-only" (2026-10-01): _StepClock trips at
+    # SYNC_SOFT_BUDGET_SECONDS+1, which is the budget that mode applies
+    # (unchanged from before --mode existed, see SYNC_SOFT_BUDGET_SECONDS'
+    # own comment). Default mode="all" now uses the larger
+    # SYNC_SOFT_BUDGET_SECONDS_ALL instead, which this fake clock would
+    # never cross -- this test is about the generic budget-guard mechanism,
+    # not about which mode-specific value it's testing against.
+    exit_code = sync_store.run_sync(only=None, dry_run=False, mode="relevant-only", clock=clock)
 
     assert exit_code == 1  # partial_failure must redden the run
     assert calls == ["main:day_ahead_price", "main:load"]  # both main-loop fetches ran
@@ -240,7 +247,9 @@ def test_sync_budget_exhausted_in_main_loop_keeps_previous_entries(
     # from the very first main-loop source onward already trips.
     clock = _StepClock(free_calls=1)
 
-    exit_code = sync_store.run_sync(only=None, dry_run=False, clock=clock)
+    # mode="relevant-only": see the identical note in
+    # test_sync_budget_exhausted_in_heal_loop_still_publishes_weather above.
+    exit_code = sync_store.run_sync(only=None, dry_run=False, mode="relevant-only", clock=clock)
 
     assert exit_code == 1
     assert calls == []  # no fetch was ever attempted

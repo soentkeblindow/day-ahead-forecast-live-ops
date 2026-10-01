@@ -594,6 +594,26 @@ class SourceExpectation:
     known_low_resolution_windows: dict[str, tuple[str, str]] = field(default_factory=dict)
     live_settling_columns: frozenset[str] = field(default_factory=frozenset)
     carried_columns: frozenset[str] = field(default_factory=frozenset)
+    # relevant_only_eligible (2026-10-01 maintenance-timeout fix): True only
+    # for a source scripts/sync_store.py's --mode relevant-only may skip
+    # entirely during the gate-closure-adjacent window. Deliberately a
+    # SEPARATE field from expected_columns/carried_columns above, not a
+    # third value folded into that split: carried_columns answers "does any
+    # feature/model/evaluation code read this column" (pinned by the
+    # source-scan test below); this field answers a different question,
+    # "is it operationally safe to skip fetching this source for a few
+    # hours" -- and the two answers do NOT always agree. day_ahead_price_ec/
+    # load_forecast_day_ahead_ec are fully carried but never eligible here
+    # (actively read via arena/live_inputs.py::coalesce_price as the
+    # ENTSO-E-outage fallback). eua_co2 is fully carried and has no
+    # feature/model dependency either, but is also NOT eligible: real-code
+    # search found arena/preflight.py::check_commodity_staleness reads it
+    # by default, called unconditionally from run_daily_submission.py --
+    # skipping its fetch here would make that staleness signal partly
+    # self-inflicted instead of reflecting genuine upstream lag. Default
+    # False is the safe choice -- a source must be explicitly proven
+    # skip-eligible, not assumed so from carried_columns alone.
+    relevant_only_eligible: bool = False
 
 
 # Six ENTSO-E fetch groups (data/entsoe_client.py's own _FETCH_FUNCTIONS/
@@ -664,6 +684,16 @@ EXPECTATION_TABLE: Final[dict[str, SourceExpectation]] = {
             }
         ),
         grid_based=False,
+        # relevant_only_eligible (2026-10-01): confirmed by a real code
+        # search of src/ and scripts/ that no gen_* column is read outside
+        # entsoe_client.py (the fetch itself), features/availability.py
+        # (bookkeeping, already excluded from the consumer scan below),
+        # ops/availability_audit.py (a separate, non-live DQ audit), and the
+        # already-accepted "computed but unrequired" features/lags.py /
+        # evaluation/regimes.py hits for the three wind/solar columns (see
+        # _unrequired_feature_columns below) -- none of that is the live
+        # submission path (run_daily_submission.py / arena/).
+        relevant_only_eligible=True,
     ),
     "scheduled_exchanges": SourceExpectation(
         # Entirely CARRIED (6.9 spec section 2.5, Owner 2026-09-24): all 12
@@ -686,6 +716,13 @@ EXPECTATION_TABLE: Final[dict[str, SourceExpectation]] = {
         # be consulted (dead configuration), unlike when this source was
         # still partly CHECKED.
         grid_based=False,
+        # relevant_only_eligible (2026-10-01): one of the two sources behind
+        # the near-miss maintain_store.yml timeout documented in
+        # docs/bugs_in_live_system.md entry 6 -- a real code search found no
+        # scheduled_net_de_to_* column read anywhere outside
+        # entsoe_client.py/availability.py/availability_audit.py (same
+        # reasoning as "generation" above).
+        relevant_only_eligible=True,
     ),
     "cross_border_flows": SourceExpectation(
         # Entirely CARRIED -- see scheduled_exchanges' own comment above for
@@ -695,6 +732,14 @@ EXPECTATION_TABLE: Final[dict[str, SourceExpectation]] = {
         expected_columns=frozenset(),
         carried_columns=frozenset(f"physical_net_de_to_{n.lower()}" for n in NEIGHBORS),
         grid_based=False,
+        # relevant_only_eligible (2026-10-01): the OTHER, bigger source
+        # behind the near-miss documented in docs/bugs_in_live_system.md
+        # entry 6 -- the live API cache-miss cascade for the current
+        # month's physical_net_de_to_* columns (6 neighbours) dominated the
+        # 1085s worst-observed "Sync the data store" step. Same "read by
+        # nothing outside fetch/bookkeeping/audit code" finding as
+        # scheduled_exchanges above.
+        relevant_only_eligible=True,
     ),
     "ttf_gas": SourceExpectation(
         expected_columns=frozenset({"ttf_gas_eur_per_mwh"}), grid_based=False
@@ -708,6 +753,20 @@ EXPECTATION_TABLE: Final[dict[str, SourceExpectation]] = {
         expected_columns=frozenset(),
         carried_columns=frozenset({"eua_co2_eur_per_t"}),
         grid_based=False,
+        # NOT relevant_only_eligible, deliberately (2026-10-01): fully
+        # carried for the feature/model split above, but a real code search
+        # found arena/preflight.py::check_commodity_staleness reads
+        # eua_co2_eur_per_t by default, called unconditionally from
+        # run_daily_submission.py -- skipping this source's fetch in
+        # relevant-only mode would make that staleness signal partly
+        # self-inflicted (stale because we chose not to fetch, not because
+        # of genuine upstream lag) rather than a clean measurement, which is
+        # exactly the thing 6.7.2's deferred acceptance criterion is
+        # waiting to observe for real. In practice this costs nothing:
+        # _sync_commodity_source's own once-per-UTC-day cadence gate (spec
+        # section 2.8) already limits this source to one real fetch a day
+        # regardless, so an explicit relevant-only skip would rarely even
+        # have been a no-op API call it saved.
     ),
     # Energy-Charts, a permanent second source (6.9 spec section 2.4/2.5):
     # "Ein EC-Fehler im Pflege-Job ist nur eine Warnung, der Lauf bleibt

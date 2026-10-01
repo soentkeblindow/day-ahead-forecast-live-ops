@@ -113,6 +113,17 @@ const POLL_INTERVAL_MINUTES = 5;
 // coverage is now gone entirely in favour of the earlier 09:00/09:30 pair
 // and a same-evening store refresh, an explicit owner trade-off, not an
 // oversight.
+// sync_mode inputs on the maintain_store.yml slots below (docs/
+// bugs_in_live_system.md entry 6, 2026-10-01): a real near-miss on that
+// job's hard timeout (1085s against a then-20-minute limit) root-caused to
+// a live API cache-miss cascade for cross_border_flows -- a source fully
+// carried and read by no live code. The four passes inside the
+// gate-closure-adjacent window (10:10/10:55/11:25/11:45) now get
+// sync_mode: "relevant-only", which skips that source entirely; the two
+// passes outside the window (09:00, 18:30) keep sync_mode: "all", so the
+// store still gets a fully current refresh twice a day, just shifted away
+// from the hours that matter for submission timing. Pending owner approval
+// of this table before the next `wrangler deploy` (2026-10-01).
 const SLOTS: Slot[] = [
   // Fifth, earlier maintenance/submission pass added 2026-09-26 (owner
   // instruction, same day as the in-window probe removal above): an early
@@ -122,7 +133,7 @@ const SLOTS: Slot[] = [
   // then submit that much sooner instead of waiting for 10:40 regardless.
   // Not the last slot of the day (is_last_slot_of_day stays on 11:55) --
   // this only ever adds an earlier opportunity, never removes a later one.
-  { localTime: "09:00", workflow: "maintain_store.yml" },
+  { localTime: "09:00", workflow: "maintain_store.yml", inputs: { sync_mode: "all" } },
   {
     localTime: "09:30",
     workflow: "submit.yml",
@@ -139,25 +150,25 @@ const SLOTS: Slot[] = [
   // case). submit.yml's own nominal_slot/is_last_slot_of_day inputs replace
   // its former wall-clock derivation -- this worker already knows which
   // slot it meant to fire.
-  { localTime: "10:10", workflow: "maintain_store.yml" },
+  { localTime: "10:10", workflow: "maintain_store.yml", inputs: { sync_mode: "relevant-only" } },
   {
     localTime: "10:40",
     workflow: "submit.yml",
     inputs: { nominal_slot: "10:40", is_last_slot_of_day: "false" },
   },
-  { localTime: "10:55", workflow: "maintain_store.yml" },
+  { localTime: "10:55", workflow: "maintain_store.yml", inputs: { sync_mode: "relevant-only" } },
   {
     localTime: "11:15",
     workflow: "submit.yml",
     inputs: { nominal_slot: "11:15", is_last_slot_of_day: "false" },
   },
-  { localTime: "11:25", workflow: "maintain_store.yml" },
+  { localTime: "11:25", workflow: "maintain_store.yml", inputs: { sync_mode: "relevant-only" } },
   {
     localTime: "11:40",
     workflow: "submit.yml",
     inputs: { nominal_slot: "11:40", is_last_slot_of_day: "false" },
   },
-  { localTime: "11:45", workflow: "maintain_store.yml" },
+  { localTime: "11:45", workflow: "maintain_store.yml", inputs: { sync_mode: "relevant-only" } },
   {
     localTime: "11:55",
     workflow: "submit.yml",
@@ -170,7 +181,7 @@ const SLOTS: Slot[] = [
   // instead of only confirming weather-run availability. This is also the
   // point at which the header-migrating maintenance run for Schritt 13's
   // new logs/store_sync.csv columns is expected to actually land live.
-  { localTime: "18:30", workflow: "maintain_store.yml" },
+  { localTime: "18:30", workflow: "maintain_store.yml", inputs: { sync_mode: "all" } },
 ];
 
 function localHHMM(utcMillis: number): string {

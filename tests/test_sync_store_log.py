@@ -66,6 +66,7 @@ def test_write_log_row_migrates_header_when_the_column_set_grows(
         "ok",
         ec_load_target_day=dt.date(2026, 9, 12),
         ec_load_complete_for_target_day=False,
+        sync_mode="all",
     )
 
     # Must be readable without error, both rows present, old value
@@ -92,6 +93,7 @@ def test_write_log_row_appends_normally_when_the_column_set_is_unchanged(
         "ok",
         ec_load_target_day=dt.date(2026, 9, 2),
         ec_load_complete_for_target_day=False,
+        sync_mode="all",
     )
     sync_store._write_log_row(
         pd.Timestamp("2026-09-02", tz="UTC"),
@@ -102,6 +104,7 @@ def test_write_log_row_appends_normally_when_the_column_set_is_unchanged(
         "ok",
         ec_load_target_day=dt.date(2026, 9, 3),
         ec_load_complete_for_target_day=True,
+        sync_mode="relevant-only",
     )
 
     restored = pd.read_csv(log_path)

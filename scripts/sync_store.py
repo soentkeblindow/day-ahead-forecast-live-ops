@@ -32,7 +32,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Final
+from typing import Final, Literal
 
 import pandas as pd
 
@@ -98,10 +98,46 @@ WEATHER_BACKFILL_DAYS = 2
 # eating into the margin the hard 1200s (20 min) kill needs for one more
 # slow step plus publish_store() plus the commit step -- see the log for
 # the full derivation.
+#
+# Still the applicable budget for --mode relevant-only (docs/
+# bugs_in_live_system.md entry 6, 2026-10-01): that mode skips exactly the
+# sources this constant's own worst case never included to begin with
+# (generation/scheduled_exchanges/cross_border_flows -- see
+# SourceExpectation.relevant_only_eligible), so the original 715s-worst-case
+# derivation still applies unchanged.
 SYNC_SOFT_BUDGET_SECONDS: Final[int] = 900
 
+# --mode all's own, separately derived budget (docs/bugs_in_live_system.md
+# entry 6, 2026-10-01): a real near-timeout (1085s "Sync the data store",
+# only ~115s clear of the then-only timeout-minutes: 20) on 2026-10-01
+# prompted a fresh look at SYNC_SOFT_BUDGET_SECONDS' own 2026-09-16
+# derivation above -- the worst case has grown well past 715s since. Sample:
+# all 40 real maintain_store.yml runs from 2026-09-25 to 2026-10-01
+# (gh api .../actions/runs/<id>/jobs, "Sync the data store" step wall time).
+# Worst observed 1085s, second-worst 1056s, third-worst 906s -- the three
+# slowest runs in the whole sample, all three on 2026-10-01 itself (the
+# current-month cache-miss cascade entry 6 root-causes gets worse right at
+# a month boundary, when up to two months are simultaneously uncached).
+# Median across all 40: ~202s. 1800s (30 min) leaves ~65% headroom above the
+# worst observed run, while still leaving 600s (10 min) of margin below the
+# matching 40-minute hard timeout (maintain_store.yml's own
+# ``timeout-minutes`` expression) for one more slow step plus
+# publish_store() plus the commit step -- double the proportional margin
+# the original 900s/1200s pair kept, since a single step (the
+# cross_border_flows fetch cascade) has now been observed costing up to
+# ~1000s on its own, not just contributing to the run total.
+SYNC_SOFT_BUDGET_SECONDS_ALL: Final[int] = 1800
 
-def _budget_exhausted(started_at: float, clock: Callable[[], float]) -> bool:
+SyncMode = Literal["all", "relevant-only"]
+
+
+def _budget_for_mode(mode: SyncMode) -> int:
+    return SYNC_SOFT_BUDGET_SECONDS_ALL if mode == "all" else SYNC_SOFT_BUDGET_SECONDS
+
+
+def _budget_exhausted(
+    started_at: float, clock: Callable[[], float], budget_seconds: int = SYNC_SOFT_BUDGET_SECONDS
+) -> bool:
     """True once the soft budget is used up (spec 2.1).
 
     Checked before starting each new unit of work (every ENTSO-E source in
@@ -109,9 +145,27 @@ def _budget_exhausted(started_at: float, clock: Callable[[], float]) -> bool:
     the budget must leave room for the longest single step, publish_store()
     and the commit step -- see the derivation in the step log.
 
-    ``clock`` is injectable so tests never wait in real time.
+    ``clock`` is injectable so tests never wait in real time. ``budget_seconds``
+    defaults to the original (relevant-only-sized) budget for backward
+    compatibility with direct callers/tests that predate --mode
+    (docs/bugs_in_live_system.md entry 6) -- run_sync always passes the
+    mode-appropriate value explicitly via _budget_for_mode.
     """
-    return (clock() - started_at) >= SYNC_SOFT_BUDGET_SECONDS
+    return (clock() - started_at) >= budget_seconds
+
+
+# Sources with SourceExpectation.relevant_only_eligible=True are skipped
+# entirely in --mode relevant-only, in whichever loop below iterates them
+# (main ENTSO-E loop, heal loop, or the commodity loop) -- a single field on
+# EXPECTATION_TABLE drives all three sites, rather than a hardcoded source
+# list duplicated per loop (docs/bugs_in_live_system.md entry 6).
+def _relevant_only_skip(name: str, mode: SyncMode) -> bool:
+    return mode == "relevant-only" and store.EXPECTATION_TABLE[name].relevant_only_eligible
+
+
+_RELEVANT_ONLY_SKIP_VALIDATION: Final[str] = (
+    "skipped: relevant-only mode (ops/store.py SourceExpectation.relevant_only_eligible)"
+)
 
 
 @dataclass
@@ -609,6 +663,7 @@ def _write_log_row(
     *,
     ec_load_target_day: dt.date,
     ec_load_complete_for_target_day: bool,
+    sync_mode: str,
 ) -> None:
     row: dict[str, object] = {
         "run_timestamp_utc": as_of.isoformat(),
@@ -619,6 +674,7 @@ def _write_log_row(
         "exit_status": exit_status,
         "ec_load_target_day": ec_load_target_day.isoformat(),
         "ec_load_complete_for_target_day": ec_load_complete_for_target_day,
+        "sync_mode": sync_mode,
     }
     for name, source_row in sorted(log.sources.items()):
         row[f"{name}_fetched"] = source_row.fetched
@@ -658,6 +714,7 @@ def run_sync(
     *,
     only: set[str] | None,
     dry_run: bool,
+    mode: SyncMode = "all",
     clock: Callable[[], float] = time.monotonic,
 ) -> int:
     """The maintenance run itself (spec 6.7.3 section 2.1/5.2), taking the
@@ -665,9 +722,20 @@ def run_sync(
     as ``as_of`` elsewhere in this codebase, so a test can simulate a slow
     run without waiting in real time or patching the global clock. ``main()``
     is the only caller that uses the real ``time.monotonic``.
+
+    ``mode`` (docs/bugs_in_live_system.md entry 6, 2026-10-01): "all" runs
+    every source exactly as before this parameter existed (the default, and
+    the only behavior that ever existed before today). "relevant-only"
+    additionally skips every SourceExpectation.relevant_only_eligible
+    source in the main fetch loop, the heal loop, and the commodity loop --
+    for the gate-closure-adjacent window, where a slow, fully-carried,
+    unread-by-live-code source (generation/scheduled_exchanges/
+    cross_border_flows) must never again eat into the time budget a real
+    submission slot needs.
     """
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     started_at = clock()
+    budget_seconds = _budget_for_mode(mode)
     as_of = pd.Timestamp.now(tz="UTC")
     log = RunLog()
 
@@ -691,7 +759,11 @@ def run_sync(
     for source in ENTSOE_SOURCES:
         if only and source.name not in only:
             continue
-        if _budget_exhausted(started_at, clock):
+        if _relevant_only_skip(source.name, mode):
+            log.get(source.name).validation = _RELEVANT_ONLY_SKIP_VALIDATION
+            logger.info("Source %r skipped (relevant-only mode).", source.name)
+            continue
+        if _budget_exhausted(started_at, clock, budget_seconds):
             skipped_main.append(source.name)
             continue
         entry = _sync_entsoe_source(source, manifest, as_of, log)
@@ -700,13 +772,17 @@ def run_sync(
     if skipped_main:
         log.any_failure = True
         log.warnings.append(
-            f"sync budget ({SYNC_SOFT_BUDGET_SECONDS}s) exhausted -- "
+            f"sync budget ({budget_seconds}s) exhausted -- "
             f"{len(skipped_main)} source(s) skipped in the main fetch loop: "
             f"{', '.join(skipped_main)}"
         )
 
     for name, fetch, column in COMMODITY_SOURCES:
         if only and name not in only:
+            continue
+        if _relevant_only_skip(name, mode):
+            log.get(name).validation = _RELEVANT_ONLY_SKIP_VALIDATION
+            logger.info("Source %r skipped (relevant-only mode).", name)
             continue
         entry = _sync_commodity_source(name, fetch, column, manifest, as_of, log)
         if entry is not None:
@@ -744,7 +820,14 @@ def run_sync(
     for source in ENTSOE_SOURCES:
         if only and source.name not in only:
             continue
-        if _budget_exhausted(started_at, clock):
+        if _relevant_only_skip(source.name, mode):
+            # Already skipped (and logged) in the main fetch loop above --
+            # no heal attempt means no "still missing after heal" warning
+            # either, which is the point (docs/bugs_in_live_system.md entry
+            # 6: a deliberate, policy-driven skip must never look like a
+            # degraded/failed run).
+            continue
+        if _budget_exhausted(started_at, clock, budget_seconds):
             skipped_heal.append(source.name)
             continue
         current_entry = new_sources.get(source.name)
@@ -796,7 +879,7 @@ def run_sync(
     if skipped_heal:
         log.any_failure = True
         log.warnings.append(
-            f"sync budget ({SYNC_SOFT_BUDGET_SECONDS}s) exhausted -- "
+            f"sync budget ({budget_seconds}s) exhausted -- "
             f"{len(skipped_heal)} source(s) skipped in the heal loop: "
             f"{', '.join(skipped_heal)}"
         )
@@ -844,6 +927,7 @@ def run_sync(
         exit_status,
         ec_load_target_day=ec_load_target_day,
         ec_load_complete_for_target_day=ec_load_complete_for_target_day,
+        sync_mode=mode,
     )
     print(f"Store sync complete: {exit_status}, warnings={log.warnings}")
 
@@ -866,9 +950,21 @@ def main() -> int:
         default=None,
         help="Comma-separated subset of source names, for manual debugging.",
     )
+    parser.add_argument(
+        "--mode",
+        choices=["all", "relevant-only"],
+        default="all",
+        help=(
+            "'all' (default, unchanged prior behavior) runs every source. "
+            "'relevant-only' additionally skips every "
+            "SourceExpectation.relevant_only_eligible source -- for the "
+            "gate-closure-adjacent window (docs/bugs_in_live_system.md "
+            "entry 6)."
+        ),
+    )
     args = parser.parse_args()
     only = set(args.sources.split(",")) if args.sources else None
-    return run_sync(only=only, dry_run=args.dry_run)
+    return run_sync(only=only, dry_run=args.dry_run, mode=args.mode)
 
 
 if __name__ == "__main__":

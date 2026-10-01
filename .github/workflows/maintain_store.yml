@@ -5,9 +5,28 @@ on:
   # block. GitHub's own schedule trigger measured a median dispatch delay
   # of +242min (max +693min, docs/cron_jobs.md section 2); the external
   # trigger under ops/trigger/ is the sole timekeeper for this workflow,
-  # calling this exact dispatch endpoint from well-timed local slots
-  # (10:10 and 11:05 Europe/Berlin).
-  workflow_dispatch: {}
+  # calling this exact dispatch endpoint from well-timed local slots (see
+  # ops/trigger/src/index.ts's own SLOTS table for the current schedule).
+  #
+  # sync_mode input (docs/bugs_in_live_system.md entry 6, 2026-10-01): a
+  # real near-miss on this job's hard timeout (1085s "Sync the data store"
+  # against a then-20-minute limit) root-caused to a live API cache-miss
+  # cascade for cross_border_flows -- a source fully carried and read by no
+  # live code (SourceExpectation.relevant_only_eligible). The trigger passes
+  # 'relevant-only' for the four gate-closure-adjacent maintenance passes
+  # (10:10/10:55/11:25/11:45 Europe/Berlin), which skips that source (and
+  # the two others like it) entirely; 'all' for the two passes outside that
+  # window (09:00, 18:30), which keeps the store fully current, just
+  # time-shifted away from the submission-critical hours. A manual dispatch
+  # with no input, or any trigger slot that predates this change, gets
+  # 'all' -- the only behavior that ever existed before today.
+  workflow_dispatch:
+    inputs:
+      sync_mode:
+        description: "'all' (every source) or 'relevant-only' (skips carried, live-code-unread sources)"
+        required: false
+        default: "all"
+        type: string
 
 concurrency:
   # Two overlapping maintenance runs must never write the store at the same
@@ -28,7 +47,17 @@ jobs:
     # one weather run is normally a handful of minutes; generous headroom
     # without being audit.yml's old 360-min default (same reasoning as
     # audit.yml's own timeout-minutes, CLAUDE.md "Provenance" section).
-    timeout-minutes: 20
+    #
+    # Per-mode expression (docs/bugs_in_live_system.md entry 6, 2026-10-01):
+    # sync_mode=all's own worst observed "Sync the data store" step, sampled
+    # across all 40 real runs from 2026-09-25 to 2026-10-01, was 1085s --
+    # only ~115s clear of the single 20-minute limit this job used to have
+    # unconditionally. 40 minutes leaves that worst case well over 50%
+    # headroom (see SYNC_SOFT_BUDGET_SECONDS_ALL's own derivation comment in
+    # scripts/sync_store.py for the full numbers). relevant-only keeps the
+    # original 20-minute limit unchanged -- it skips exactly the sources
+    # that produced every one of the slow runs in that sample.
+    timeout-minutes: ${{ inputs.sync_mode == 'all' && 40 || 20 }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -56,7 +85,7 @@ jobs:
           ENTSOE_API_KEY: ${{ secrets.ENTSOE_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           STORE_ENCRYPTION_KEY: ${{ secrets.STORE_ENCRYPTION_KEY }}
-        run: uv run python scripts/sync_store.py
+        run: uv run python scripts/sync_store.py --mode ${{ inputs.sync_mode }}
 
       # Same push discipline as audit.yml/weather_availability_probe.yml
       # (spec section 3.1 point 4): a maintenance run that measures and
