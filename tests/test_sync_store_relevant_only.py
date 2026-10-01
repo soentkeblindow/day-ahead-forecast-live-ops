@@ -83,6 +83,15 @@ def _patch_common(
     monkeypatch.setattr(sync_store, "STORE_SYNC_LOG", tmp_path / "store_sync.csv")
     monkeypatch.setattr(sync_store, "ENTSOE_SOURCES", tuple(sources))
     monkeypatch.setattr(sync_store, "COMMODITY_SOURCES", ())
+    # Real CI finding (2026-10-01): leaving ENERGY_CHARTS_SOURCES unmocked
+    # makes a genuine network call to api.energy-charts.info, which CI's
+    # own run got rate-limited on -- a real warning that broke this test's
+    # strict warnings=="" assertion below. Not flakiness to tolerate: the
+    # EC loop isn't what either test in this file is about, so it must not
+    # run for real at all (test_sync_store_budget.py's own _patch_common
+    # leaves this unmocked too, but none of its assertions depend on the
+    # warnings column being empty, so it never surfaced there).
+    monkeypatch.setattr(sync_store, "ENERGY_CHARTS_SOURCES", ())
     monkeypatch.setattr(store, "load_store", lambda workdir: store.StoreState(workdir, manifest))
 
     def fake_sync_weather(
