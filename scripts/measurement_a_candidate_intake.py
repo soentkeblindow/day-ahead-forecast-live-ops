@@ -102,6 +102,7 @@ _FALLBACK_CANDIDATES = (
     "floor_core_gas",
 )
 _ALL_CANDIDATES = ("live", *_FALLBACK_CANDIDATES)
+_SUMMARY_PATH = Path("outputs/results/measurement_a_candidate_intake_summary.csv")
 
 
 @dataclass
@@ -378,6 +379,15 @@ def _parse_args() -> argparse.Namespace:
         help="section 2's once-only determinism check: run floor_core (cheapest candidate) "
         "twice with different random_state over a small fold subset and compare predictions",
     )
+    p.add_argument(
+        "--from-predictions",
+        type=Path,
+        default=None,
+        help="skip the fit/predict walk-forward entirely and recompute metrics plus "
+        "outputs/results/measurement_a_candidate_intake_summary.csv from an existing "
+        "predictions parquet (e.g. the one this script's own full run already wrote) -- "
+        "for regenerating the committed summary without redoing an expensive refit",
+    )
     return p.parse_args()
 
 
@@ -407,9 +417,107 @@ def _determinism_check(y_hourly: pd.Series, matrix: pd.DataFrame, folds: list) -
         )
 
 
+def _compute_metrics_and_gates(
+    predictions: pd.DataFrame,
+) -> tuple[dict[str, dict[str, float]], dict[str, GateResult]]:
+    metrics: dict[str, dict[str, float]] = {}
+    for name in (*_ALL_CANDIDATES, "baseline"):
+        t, p = predictions["y_true"], predictions[f"pred_{name}"]
+        metrics[name] = {"mae": mae(t, p), "rmse": rmse(t, p)}
+        print(f"{name:22s}  MAE={metrics[name]['mae']:.4f}  RMSE={metrics[name]['rmse']:.4f}")
+
+    print("\n--- gate check vs baseline (Entscheidung 24) ---\n")
+    gate_results: dict[str, GateResult] = {}
+    for name in _ALL_CANDIDATES:
+        native_vs_base, daily_vs_base = _run_dm(predictions, name, "baseline")
+        rmse_ok = metrics[name]["rmse"] < metrics["baseline"]["rmse"]
+        dm_ok = native_vs_base.mean_loss_diff < 0 and native_vs_base.p_value < _GATE_P_THRESHOLD
+        gate_pass = rmse_ok and dm_ok
+        gate_results[name] = GateResult(
+            native_vs_baseline=native_vs_base,
+            daily_vs_baseline=daily_vs_base,
+            gate_pass=gate_pass,
+        )
+        verdict = "PASS" if gate_pass else "FAIL"
+        print(
+            f"{name:22s} native p={native_vs_base.p_value:.4f} loss_diff={native_vs_base.mean_loss_diff:+.4f} "
+            f"| daily p={daily_vs_base.p_value:.4f} loss_diff={daily_vs_base.mean_loss_diff:+.4f} -> {verdict}"
+        )
+
+    print("\n--- informative: vs live ---\n")
+    for name in _FALLBACK_CANDIDATES:
+        native_vs_live, daily_vs_live = _run_dm(predictions, name, "live")
+        gate_results[name].native_vs_live = native_vs_live
+        gate_results[name].daily_vs_live = daily_vs_live
+        print(
+            f"{name:22s} native p={native_vs_live.p_value:.4f} loss_diff={native_vs_live.mean_loss_diff:+.4f} "
+            f"(negative = better than live)"
+        )
+
+    print(
+        "\nNOTE (spec section 4 Pflichthinweis): the shared window contains no gas crisis "
+        "(TTF CV in-window vs. full history is materially lower) -- an advantage for the "
+        "no-gas variants here is not evidence against gas in a crisis scenario. The choice "
+        "between core_*/floor_core* with vs. without gas is an owner decision, not settled here."
+    )
+    return metrics, gate_results
+
+
+def _write_summary_csv(
+    metrics: dict[str, dict[str, float]], gate_results: dict[str, GateResult]
+) -> None:
+    """Committed counterpart to the mlflow metrics below (outputs/results/,
+    not the gitignored mlruns/) -- the only place a README number citing this
+    measurement can actually be traced back to, per publication_spec.md
+    section 4's "every README number needs a repo source" rule."""
+    rows = []
+    for name in _ALL_CANDIDATES:
+        gr = gate_results[name]
+        row = {
+            "candidate": name,
+            "rmse": metrics[name]["rmse"],
+            "mae": metrics[name]["mae"],
+            "rmse_baseline": metrics["baseline"]["rmse"],
+            "vs_baseline_native_loss_diff": gr.native_vs_baseline.mean_loss_diff,
+            "vs_baseline_native_p": gr.native_vs_baseline.p_value,
+            "vs_baseline_daily_loss_diff": gr.daily_vs_baseline.mean_loss_diff,
+            "vs_baseline_daily_p": gr.daily_vs_baseline.p_value,
+            "gate_pass": gr.gate_pass,
+            "vs_live_native_loss_diff": (
+                gr.native_vs_live.mean_loss_diff if gr.native_vs_live is not None else None
+            ),
+            "vs_live_native_p": gr.native_vs_live.p_value
+            if gr.native_vs_live is not None
+            else None,
+            "vs_live_daily_loss_diff": (
+                gr.daily_vs_live.mean_loss_diff if gr.daily_vs_live is not None else None
+            ),
+            "vs_live_daily_p": gr.daily_vs_live.p_value if gr.daily_vs_live is not None else None,
+        }
+        rows.append(row)
+    summary = pd.DataFrame(rows)
+    _SUMMARY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with _SUMMARY_PATH.open("w", newline="\n") as f:
+        f.write(
+            "# refit_every=1 (production cadence), train_span_days=90, quantile/alpha=0.5, "
+            "shape_window_days=28 -- see this script's own module docstring for the six "
+            "candidates' feature sets.\n"
+        )
+        summary.to_csv(f, index=False, lineterminator="\n")
+    print(f"\nwrote {_SUMMARY_PATH}")
+
+
 def main() -> None:
     t0 = time.monotonic()
     args = _parse_args()
+
+    if args.from_predictions is not None:
+        print(f"\nrecomputing metrics from {args.from_predictions} (no refit)")
+        predictions = pd.read_parquet(args.from_predictions)
+        metrics, gate_results = _compute_metrics_and_gates(predictions)
+        _write_summary_csv(metrics, gate_results)
+        return
+
     cfg = FeatureConfig()
 
     y_hourly, matrices, prices_qh, evaluable_folds, end_day = _prepare(cfg)
@@ -456,46 +564,8 @@ def main() -> None:
         f"\nn_folds={n_folds}  refit_every={_REFIT_EVERY}  train_span_days={_TRAIN_SPAN_DAYS}  window_end={end_day}"
     )
 
-    metrics = {}
-    for name in (*_ALL_CANDIDATES, "baseline"):
-        t, p = predictions["y_true"], predictions[f"pred_{name}"]
-        metrics[name] = {"mae": mae(t, p), "rmse": rmse(t, p)}
-        print(f"{name:22s}  MAE={metrics[name]['mae']:.4f}  RMSE={metrics[name]['rmse']:.4f}")
-
-    print("\n--- gate check vs baseline (Entscheidung 24) ---\n")
-    gate_results: dict[str, GateResult] = {}
-    for name in _ALL_CANDIDATES:
-        native_vs_base, daily_vs_base = _run_dm(predictions, name, "baseline")
-        rmse_ok = metrics[name]["rmse"] < metrics["baseline"]["rmse"]
-        dm_ok = native_vs_base.mean_loss_diff < 0 and native_vs_base.p_value < _GATE_P_THRESHOLD
-        gate_pass = rmse_ok and dm_ok
-        gate_results[name] = GateResult(
-            native_vs_baseline=native_vs_base,
-            daily_vs_baseline=daily_vs_base,
-            gate_pass=gate_pass,
-        )
-        verdict = "PASS" if gate_pass else "FAIL"
-        print(
-            f"{name:22s} native p={native_vs_base.p_value:.4f} loss_diff={native_vs_base.mean_loss_diff:+.4f} "
-            f"| daily p={daily_vs_base.p_value:.4f} loss_diff={daily_vs_base.mean_loss_diff:+.4f} -> {verdict}"
-        )
-
-    print("\n--- informative: vs live ---\n")
-    for name in _FALLBACK_CANDIDATES:
-        native_vs_live, daily_vs_live = _run_dm(predictions, name, "live")
-        gate_results[name].native_vs_live = native_vs_live
-        gate_results[name].daily_vs_live = daily_vs_live
-        print(
-            f"{name:22s} native p={native_vs_live.p_value:.4f} loss_diff={native_vs_live.mean_loss_diff:+.4f} "
-            f"(negative = better than live)"
-        )
-
-    print(
-        "\nNOTE (spec section 4 Pflichthinweis): the shared window contains no gas crisis "
-        "(TTF CV in-window vs. full history is materially lower) -- an advantage for the "
-        "no-gas variants here is not evidence against gas in a crisis scenario. The choice "
-        "between core_*/floor_core* with vs. without gas is an owner decision, not settled here."
-    )
+    metrics, gate_results = _compute_metrics_and_gates(predictions)
+    _write_summary_csv(metrics, gate_results)
 
     elapsed = time.monotonic() - t0
     print(f"\nelapsed: {elapsed:.0f}s")
