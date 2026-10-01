@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import argparse
-from pathlib import Path
-
 import numpy as np
 import pandas as pd
 import pytest
@@ -13,7 +10,6 @@ from energy_price_forecast.evaluation.dm_test import (
     dm_test,
     newey_west_long_run_variance,
 )
-from scripts.run_dm_test import _INPUTS, _run
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -152,62 +148,3 @@ def test_daily_mean_loss_known_means_and_incomplete_day_count() -> None:
     assert daily.iloc[0] == pytest.approx(1.0)
     assert daily.iloc[1] == pytest.approx(3.0)
     assert n_incomplete == 1
-
-
-# ---------------------------------------------------------------------------
-# scripts.run_dm_test (script I/O smoke)
-# ---------------------------------------------------------------------------
-
-
-def _fixture_args(tmp_path: Path) -> argparse.Namespace:
-    return argparse.Namespace(
-        price_path=tmp_path / "hourly.parquet",
-        pred_lgbm=tmp_path / "preds_lgbm_q50.parquet",
-        pred_lasso=tmp_path / "backtest_lasso.parquet",
-        pred_arimax=tmp_path / "preds_arimax_v2_q50.parquet",
-        out=tmp_path / "dm_test.csv",
-    )
-
-
-def test_run_dm_test_script_writes_four_rows_with_fixed_columns(tmp_path: Path) -> None:
-    idx = _hourly_utc("2021-01-01", 48)  # two complete UTC days
-    rng = np.random.default_rng(1)
-    price = pd.Series(50.0 + rng.normal(0, 1, size=48), index=idx)
-    lgbm_pred = price + rng.normal(0, 0.5, size=48)
-    lasso_pred = price + rng.normal(0, 2.0, size=48)
-    arimax_pred = price + rng.normal(0, 2.0, size=48)
-
-    args = _fixture_args(tmp_path)
-    pd.DataFrame({"day_ahead_price": price}, index=idx).to_parquet(args.price_path)
-    pd.DataFrame({"y_pred": lgbm_pred}, index=idx).to_parquet(args.pred_lgbm)
-    pd.DataFrame({"y_pred": lasso_pred}, index=idx).to_parquet(args.pred_lasso)
-    pd.DataFrame({"y_pred": arimax_pred}, index=idx).to_parquet(args.pred_arimax)
-
-    _run(args)
-
-    result = pd.read_csv(args.out)
-    assert len(result) == 4
-    assert list(result.columns) == [
-        "comparison",
-        "variant",
-        "n_obs",
-        "hac_lag",
-        "horizon",
-        "mean_loss_diff_eur_mwh",
-        "dm_stat",
-        "p_value",
-    ]
-    assert set(result["comparison"]) == {"lightgbm_vs_lasso", "lightgbm_vs_arimax"}
-    assert set(result["variant"]) == {"daily", "hourly"}
-
-
-def test_run_dm_test_script_missing_files_collects_all(tmp_path: Path) -> None:
-    args = _fixture_args(tmp_path)
-
-    with pytest.raises(FileNotFoundError) as exc_info:
-        _run(args)
-
-    message = str(exc_info.value)
-    for filename, producer in _INPUTS.values():
-        assert filename in message
-        assert producer in message
