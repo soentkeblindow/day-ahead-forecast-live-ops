@@ -122,8 +122,8 @@ const POLL_INTERVAL_MINUTES = 5;
 // sync_mode: "relevant-only", which skips that source entirely; the two
 // passes outside the window (09:00, 18:30) keep sync_mode: "all", so the
 // store still gets a fully current refresh twice a day, just shifted away
-// from the hours that matter for submission timing. Pending owner approval
-// of this table before the next `wrangler deploy` (2026-10-01).
+// from the hours that matter for submission timing. Deployed 2026-10-01
+// (version f8d18247), owner-approved.
 const SLOTS: Slot[] = [
   // Fifth, earlier maintenance/submission pass added 2026-09-26 (owner
   // instruction, same day as the in-window probe removal above): an early
