@@ -1,6 +1,6 @@
 # Removed modules
 
-This repo was forked from `energy-price-forecast` (Sprints 1-5 there) to
+This repo was forked from `energy-price-forecast-risk-validation` (Sprints 1-5 there) to
 build and run a live, unattended day-ahead price forecast for the Energy
 Arena. Before publication, modules that are (a) not reachable from the
 Arena live/backtest/result-generating paths and (b) byte-identical to their
@@ -11,11 +11,11 @@ Everything listed below is still recoverable from this repo's own history at
 the tag `pre-publication-cleanup`, e.g.
 `git show pre-publication-cleanup:src/energy_price_forecast/evaluation/risk.py`.
 
-## Removed — risk/reporting track (byte-identical to `energy-price-forecast`, see there)
+## Removed — risk/reporting track (byte-identical to `energy-price-forecast-risk-validation`, see there)
 
 Market-risk backtesting (VaR / Expected Shortfall) and the dashboard
 reporting pipeline are not part of the Arena forecasting problem; for that
-side of the work, see `energy-price-forecast`.
+side of the work, see `energy-price-forecast-risk-validation`.
 
 - `src/energy_price_forecast/evaluation/backtest.py`
 - `src/energy_price_forecast/evaluation/bootstrap.py`
