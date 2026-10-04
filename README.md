@@ -21,7 +21,7 @@ As of 2026-10-04, [Energy Arena leaderboard](https://energy-arena.org/leaderboar
 | D-1, 11:00 | 19.92 | 2 |
 | D-1, 12:00 (gate closure) | 19.9 | 5 |
 
-All three are well ahead of the Arena's own persistence baseline — 45.27 EUR/MWh measured historically over the full backtest window (see [Fallback ladder](#fallback-ladder) below), 35.32 EUR/MWh over this same rolling 7-day window — and not at the top of the board. A 7-day rolling window moves daily and is not yet statistically stable — read this as a status check, not a final result.
+All three are well ahead of the Arena's own persistence baseline — 45.27 EUR/MWh measured historically over the full backtest window (see [Fallback ladder](#fallback-ladder) below), 35.32 EUR/MWh over this same rolling 7-day window — and not at the top of the board. A **7-day rolling window** moves daily and is **not yet statistically stable** — read this as a status check, **not a final result**.
 
 ## How it works
 
@@ -77,7 +77,7 @@ Roughly 1,050 tests exist; the count itself isn't the point. These are the ones 
 - **Open-Meteo** (ECMWF IFS) — weather model data for the renewables reconstruction, CC BY 4.0.
 - **Energy-Charts** (Fraunhofer ISE) — installed-capacity registry and a price/load mirror, CC BY 4.0.
 - **Yahoo Finance** (TTF gas) — a paid-exchange-derived series that may not be redistributed under Yahoo's terms. This is the reason the data store is encrypted end to end: code and every other data source here are public, this one series is not redistributable, so the whole store is encrypted rather than carving out one column.
-- **Submission payloads are committed at submission time** and are therefore visible before gate closure. This is deliberate: the full pipeline and every other data source here are already public, so a motivated reader could reconstruct the forecast anyway.
+- **Submission payloads are committed multiple times before gate closure** and the forecast is directly shared via the Arena's cooperative mode (Open immediately).
 
 ## Citation
 
