@@ -58,7 +58,7 @@ def _sample_manifest(
         store_format_version=store.STORE_FORMAT_VERSION,
         created_at_utc=created_at_utc,
         run_id="12345",
-        run_url="https://github.com/soentkeblindow/sbl-energy-forecast/actions/runs/12345",
+        run_url="https://github.com/soentkeblindow/day-ahead-forecast-live-ops/actions/runs/12345",
         code_sha="abc1234",
         sources=sources,
     )

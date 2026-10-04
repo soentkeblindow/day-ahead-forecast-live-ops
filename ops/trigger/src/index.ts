@@ -1,5 +1,5 @@
 /**
- * External scheduler for the sbl-energy-forecast Arena repo (spec 6.7.1,
+ * External scheduler for the day-ahead-forecast-live-ops Arena repo (spec 6.7.1,
  * Entscheidung 20 / section 5.1). GitHub Actions' own `schedule:` trigger
  * measured a median dispatch delay of +242min (max +693min, docs/cron_jobs.md
  * section 2) -- of 72 audit.yml runs since the 08-27 regime change, none
@@ -49,7 +49,7 @@ interface Slot {
 }
 
 const REPO_OWNER = "soentkeblindow";
-const REPO_NAME = "sbl-energy-forecast";
+const REPO_NAME = "day-ahead-forecast-live-ops";
 
 // Must match wrangler.toml's `crons = ["*/5 * * * *"]`. Deliberately kept
 // as one constant instead of two independent numbers, because the
@@ -248,7 +248,7 @@ async function dispatchWorkflow(
       Authorization: `Bearer ${token}`,
       Accept: "application/vnd.github+json",
       "X-GitHub-Api-Version": "2022-11-28",
-      "User-Agent": "sbl-energy-forecast-trigger",
+      "User-Agent": "day-ahead-forecast-live-ops-trigger",
       "Content-Type": "application/json",
     },
     body: JSON.stringify(body),

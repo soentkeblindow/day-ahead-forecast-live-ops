@@ -1,5 +1,5 @@
 [project]
-name = "sbl-energy-forecast"
+name = "day-ahead-forecast-live-ops"
 version = "0.1.0"
 description = "Day-ahead electricity price forecasting for Germany (DE-LU) with LightGBM, quantile regression, and walk-forward backtesting."
 readme = "README.md"

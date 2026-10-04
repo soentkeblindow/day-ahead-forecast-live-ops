@@ -1,4 +1,4 @@
-# sbl-energy-forecast
+# day-ahead-forecast-live-ops
 
 Daily, unattended day-ahead electricity price forecasting for Germany (DE-LU), submitted live and scored publicly by the [Energy Arena](https://energy-arena.org). Participant in the Energy Arena.
 

@@ -251,4 +251,4 @@ def test_repo_falls_back_to_known_coordinates_outside_actions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("GITHUB_REPOSITORY", raising=False)
-    assert ra._repo() == ("soentkeblindow", "sbl-energy-forecast")
+    assert ra._repo() == ("soentkeblindow", "day-ahead-forecast-live-ops")

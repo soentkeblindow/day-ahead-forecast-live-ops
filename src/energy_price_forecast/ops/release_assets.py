@@ -30,10 +30,10 @@ _UPLOAD_BASE: Final[str] = "https://uploads.github.com"
 _API_VERSION: Final[str] = "2022-11-28"
 _TIMEOUT_S: Final[float] = 30.0
 _UPLOAD_TIMEOUT_S: Final[float] = 120.0  # a store-sized tar can take longer than a plain API call
-_USER_AGENT: Final[str] = "sbl-energy-forecast-store"
+_USER_AGENT: Final[str] = "day-ahead-forecast-live-ops-store"
 
 _DEFAULT_OWNER: Final[str] = "soentkeblindow"
-_DEFAULT_REPO: Final[str] = "sbl-energy-forecast"
+_DEFAULT_REPO: Final[str] = "day-ahead-forecast-live-ops"
 
 
 class ReleaseAssetsError(RuntimeError):

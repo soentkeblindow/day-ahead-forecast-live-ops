@@ -2,7 +2,7 @@
   "name": "sbl-energy-forecast-trigger",
   "private": true,
   "version": "0.1.0",
-  "description": "External scheduler (Cloudflare Workers Cron Triggers) for sbl-energy-forecast -- spec 6.7.1, Entscheidung 20. Dispatches audit.yml, weather_availability_probe.yml and maintain_store.yml via the GitHub Actions REST API at well-timed local slots, replacing GitHub's own unreliable schedule: trigger (see docs/cron_jobs.md).",
+  "description": "External scheduler (Cloudflare Workers Cron Triggers) for day-ahead-forecast-live-ops -- spec 6.7.1, Entscheidung 20. Dispatches audit.yml, weather_availability_probe.yml and maintain_store.yml via the GitHub Actions REST API at well-timed local slots, replacing GitHub's own unreliable schedule: trigger (see docs/cron_jobs.md).",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
