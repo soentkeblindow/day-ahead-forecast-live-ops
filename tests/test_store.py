@@ -242,10 +242,12 @@ def test_source_manifest_entry_carries_live_nan_cell_counts() -> None:
 def test_load_store_downloads_newest_and_unpacks(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    monkeypatch.setenv(store.STORE_ENCRYPTION_KEY_ENV_VAR, _TEST_KEY)
     root = tmp_path / "source_repo"
     _write(root / "data" / "raw" / "entsoe" / "day_ahead_prices" / "2026-08.parquet", b"payload")
     tar_path = tmp_path / "store-20260908T101000Z.tar"
     store.pack_store(root, _sample_manifest(), tar_path)
+    store._encrypt_store_archive(tar_path)
 
     release = ra.ReleaseRef(release_id=1, tag=store.STORE_RELEASE_TAG)
     newest = ra.AssetRef(1, "store-20260908T101000Z.tar", 1, True, tar_path.stat().st_size)
@@ -333,9 +335,8 @@ def test_encrypt_then_decrypt_archive_round_trips_byte_identical(
     store._encrypt_store_archive(path)
     assert path.read_bytes().startswith(store._FERNET_PREFIX)  # actually encrypted, not a no-op
 
-    store_format = store._decrypt_store_archive(path)
+    store._decrypt_store_archive(path)
 
-    assert store_format == "encrypted"
     assert path.read_bytes() == original
 
 
@@ -380,21 +381,21 @@ def test_missing_key_raises_a_clear_error_naming_the_env_var(
         store._decrypt_store_archive(path)
 
 
-def test_transitional_read_path_distinguishes_plaintext_from_encrypted(
+def test_plaintext_archive_raises_a_clear_error(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """The transitional read path (publication spec section 2.1) that used
+    to accept a legacy plaintext archive was removed in section 8 step 8 --
+    a plaintext archive is now rejected the same way a wrong key would be."""
     monkeypatch.setenv(store.STORE_ENCRYPTION_KEY_ENV_VAR, _TEST_KEY)
 
     plaintext_path = tmp_path / "plain.tar"
-    plaintext_path.write_bytes(b"a legacy plaintext archive, e.g. tar magic bytes")
-    assert store._decrypt_store_archive(plaintext_path) == "plaintext"
-    assert plaintext_path.read_bytes() == b"a legacy plaintext archive, e.g. tar magic bytes"
+    original = b"a legacy plaintext archive, e.g. tar magic bytes"
+    plaintext_path.write_bytes(original)
 
-    encrypted_path = tmp_path / "enc.tar"
-    encrypted_path.write_bytes(b"a fresh archive")
-    store._encrypt_store_archive(encrypted_path)
-    assert store._decrypt_store_archive(encrypted_path) == "encrypted"
-    assert encrypted_path.read_bytes() == b"a fresh archive"
+    with pytest.raises(store.StoreEncryptionError, match="not a Fernet-encrypted archive"):
+        store._decrypt_store_archive(plaintext_path)
+    assert plaintext_path.read_bytes() == original  # left untouched, not partially consumed
 
 
 def test_publish_store_never_uploads_without_a_valid_key(

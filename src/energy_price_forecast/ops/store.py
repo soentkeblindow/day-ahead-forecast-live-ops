@@ -272,10 +272,10 @@ STORE_ENCRYPTION_KEY_ENV_VAR: Final[str] = "STORE_ENCRYPTION_KEY"
 
 # A Fernet token is urlsafe-base64 of a fixed-format binary blob starting
 # with a version byte 0x80 -- base64-encoding that single byte always
-# produces the literal ASCII prefix "gAAAAA". This is what lets the
-# transitional read path below tell an already-encrypted archive apart from
-# a legacy plaintext one without a separate marker file or format flag: no
-# plaintext tar (magic bytes "ustar" at offset 257) can ever start this way.
+# produces the literal ASCII prefix "gAAAAA". Used below to reject a
+# plaintext archive with a clear error before ever attempting to decrypt
+# it (publication spec section 8: the transitional read path that used to
+# accept plaintext here was removed once the observation phase cleared).
 _FERNET_PREFIX: Final[bytes] = b"gAAAAA"
 
 
@@ -311,17 +311,17 @@ def _encrypt_store_archive(path: Path) -> None:
     path.write_bytes(token)
 
 
-def _decrypt_store_archive(path: Path) -> Literal["encrypted", "plaintext"]:
-    """Decrypt path's bytes in place if they look like a Fernet token; leave
-    a legacy plaintext archive untouched. This is the transitional read path
-    (publication spec section 2.1): as long as an already-published
-    plaintext asset can still be the newest one, load_store must keep being
-    able to read it. Removed once the observation phase (section 8 step 8)
-    is over and every remaining asset is encrypted. Returns which format was
-    read, so the caller can log it."""
+def _decrypt_store_archive(path: Path) -> None:
+    """Decrypt path's bytes in place. Raises StoreEncryptionError if the
+    archive is not a Fernet token -- plaintext store archives are no longer
+    supported (publication spec section 8, the transitional read path from
+    section 2.1 was removed once the observation phase cleared)."""
     raw = path.read_bytes()
     if not raw.startswith(_FERNET_PREFIX):
-        return "plaintext"
+        raise StoreEncryptionError(
+            f"{path.name!r} is not a Fernet-encrypted archive -- plaintext store "
+            "archives are no longer supported."
+        )
     try:
         plaintext = _fernet().decrypt(raw)
     except InvalidToken as exc:
@@ -330,7 +330,6 @@ def _decrypt_store_archive(path: Path) -> Literal["encrypted", "plaintext"]:
             "or corrupted key, or the file is damaged."
         ) from exc
     path.write_bytes(plaintext)
-    return "encrypted"
 
 
 # ---------------------------------------------------------------------------
@@ -355,8 +354,8 @@ def load_store(workdir: Path) -> StoreState:
     with tempfile.TemporaryDirectory() as tmp:
         tar_path = Path(tmp) / newest.name
         release_assets.download_asset(newest, tar_path)
-        store_format = _decrypt_store_archive(tar_path)
-        logger.info("Store archive %s read as %s", newest.name, store_format)
+        _decrypt_store_archive(tar_path)
+        logger.info("Store archive %s decrypted", newest.name)
         manifest = unpack_store(tar_path, workdir)
     return StoreState(workdir=workdir, manifest=manifest)
 
