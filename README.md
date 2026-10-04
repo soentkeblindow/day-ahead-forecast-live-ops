@@ -1,5 +1,10 @@
 # day-ahead-forecast-live-ops
 
+[![CI](https://github.com/soentkeblindow/day-ahead-forecast-live-ops/actions/workflows/ci.yml/badge.svg)](https://github.com/soentkeblindow/day-ahead-forecast-live-ops/actions/workflows/ci.yml)
+[![Checked with mypy](https://www.mypy-lang.org/static/mypy_badge.svg)](https://mypy-lang.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](.python-version)
+
 Daily, unattended day-ahead electricity price forecasting for Germany (DE-LU), submitted live and scored publicly by the [Energy Arena](https://energy-arena.org). Participant in the Energy Arena.
 
 ## What this is
@@ -8,12 +13,15 @@ A day-ahead model is easy to make look good in a backtest: the information actua
 
 ## Current status
 
-<!-- OWNER: fill in before publishing — current rank, RMSE, and window from
-     https://energy-arena.org's Point Forecast DE-LU leaderboard, e.g.
-     "Rank 8, RMSE 33.9 EUR/MWh (last 7 days), as of 2026-10-06." These
-     numbers move daily; after 1-2 weeks on a rolling leaderboard they are
-     not yet statistically stable — read them as a status check, not a
-     result. -->
+As of 2026-10-04, [Energy Arena leaderboard](https://energy-arena.org/leaderboard), Point Forecast DE-LU, rolling 7-day window. The Arena scores results separately by information cutoff (how much lead time the forecast had before the D-1 12:00 gate closure) — this project's own fallback ladder exists because of exactly that distinction (see [The information-set problem](#the-information-set-problem) below):
+
+| Information cutoff | RMSE (EUR/MWh) | Rank |
+|---|---|---|
+| D-1, 10:00 | 23.17 | 2 |
+| D-1, 11:00 | 19.92 | 2 |
+| D-1, 12:00 (gate closure) | 19.9 | 5 |
+
+All three are well ahead of the Arena's own persistence baseline — 45.27 EUR/MWh measured historically over the full backtest window (see [Fallback ladder](#fallback-ladder) below), 35.32 EUR/MWh over this same rolling 7-day window — and not at the top of the board. A 7-day rolling window moves daily and is not yet statistically stable — read this as a status check, not a final result.
 
 ## How it works
 
@@ -31,7 +39,7 @@ flowchart LR
 
 ## The information-set problem
 
-The Arena's day-ahead auction closes at 12:00 local time, but the TSOs' own wind/solar forecasts (ENTSO-E 14.1.D) aren't published until roughly 18:00 the day before — after the deadline that matters. Many backtests use these series as features anyway, which quietly assumes information a live system never actually has (a point the [platform paper](#citation) itself raises). This pipeline instead reconstructs wind, solar, and residual load from ECMWF weather model data (a fixed 00-UTC run, read out at the lead times actually available before gate closure), at a measured cost of about 1.3 EUR/MWh RMSE against an upper-bound model trained on the real TSO forecasts.
+The day-ahead auction closes at 12:00 local time, which is also the Arena's submission deadline, but the TSOs' own wind/solar forecasts (ENTSO-E 14.1.D) aren't published until roughly 18:00 the day before — after the deadline that matters. Many backtests use these series as features anyway, which quietly assumes information a live system never actually has (a point the [platform paper](#citation) itself raises). This pipeline instead reconstructs wind, solar, and residual load from ECMWF weather model data (a fixed 00-UTC run, read out at the lead times actually available before gate closure), at a measured cost of about 1.3 EUR/MWh RMSE against an upper-bound model trained on the real TSO forecasts.
 
 ## Fallback ladder
 
@@ -40,7 +48,7 @@ Three independently-measured candidates, tried in rank order; the first one whos
 | Rank | Row | Reads | Load source | Measured RMSE (EUR/MWh) |
 |---|---|---|---|---|
 | 1 | `core_gas` | calendar, NWP residual-load reconstruction, price lags, TTF gas | ENTSO-E day-ahead load forecast | 28.97 |
-| 2 | `core_gas_loadpatch` | identical model and training to rank 1 | Similar-Day-Patch (same weekday, last week or last available Sunday) | 29.01 |
+| 2 | `core_gas_loadpatch` | identical model and training to rank 1 | Similar-Day-Patch (previous day for Tue–Fri targets, same weekday of the previous week for Sat/Sun/Mon, last Sunday for public holidays) | 29.01 |
 | 3 | `base` | calendar, price lags only — no gas, no weather reconstruction | — | 38.39 |
 | — | silence | — | — | Arena persistence baseline, 45.27 |
 
