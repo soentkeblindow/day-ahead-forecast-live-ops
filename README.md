@@ -84,20 +84,26 @@ Roughly 1,050 tests exist; the count itself isn't the point. These are the ones 
 If you reference the Energy Arena platform itself, its maintainers ask for this citation:
 
 ```
-Kleinebrahm, M., Berrisch, J., Eiser, P., et al. (2026).
+Kleinebrahm, M., Berrisch, J., Eiser, P., Fichtner, W., Hagenmeyer, V., Hertel, M.,
+Koster, N., Lerch, S., Mikut, R., Priesmann, J., Schienle, M., Schäfer, B.,
+Weinand, J., & Ziel, F. (2026).
 Energy-Arena: A Dynamic Benchmark for Operational Energy Forecasting.
-arXiv:2604.24705. https://arxiv.org/abs/2604.24705
+In 2026 22nd International Conference on the European Energy Market (EEM), pp. 1-6.
+https://doi.org/10.1109/EEM68581.2026.11589800
 ```
 
 ```bibtex
-@misc{kleinebrahm2026energyarena,
-  title  = {Energy-Arena: A Dynamic Benchmark for Operational Energy Forecasting},
-  author = {Kleinebrahm, Max and Berrisch, Jonathan and Eiser, Philipp and others},
-  year   = {2026},
-  eprint = {2604.24705},
-  archivePrefix = {arXiv}
+@inproceedings{kleinebrahm2026energyarena,
+  author    = {Kleinebrahm, Max and Berrisch, Jonathan and Eiser, Philipp and Fichtner, Wolf and Hagenmeyer, Veit and Hertel, Matthias and Koster, Nils and Lerch, Sebastian and Mikut, Ralf and Priesmann, Jan and Schienle, Melanie and Sch{\"a}fer, Benjamin and Weinand, Jann and Ziel, Florian},
+  title     = {Energy-Arena: A Dynamic Benchmark for Operational Energy Forecasting},
+  booktitle = {2026 22nd International Conference on the European Energy Market (EEM)},
+  year      = {2026},
+  pages     = {1--6},
+  doi       = {10.1109/EEM68581.2026.11589800}
 }
 ```
+
+A preprint is available at [arXiv:2604.24705](https://arxiv.org/abs/2604.24705).
 
 ## Reproducing / running it
 
