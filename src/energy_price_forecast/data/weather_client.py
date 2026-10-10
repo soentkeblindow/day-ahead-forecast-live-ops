@@ -320,6 +320,28 @@ def run_init_for_target_day(target_day: dt.date) -> pd.Timestamp:
     return run_init_utc
 
 
+def run_init_at_hour_for_target_day(target_day: dt.date, run_hour: int) -> pd.Timestamp:
+    """The run of ``run_hour`` UTC on the calendar day before ``target_day``.
+
+    Sibling of ``run_init_for_target_day`` for spec 8.0a's arrival-time probe,
+    which needs run hours other than 00 UTC (03/06). Deliberately NOT a
+    generalisation of that function -- the live path's run is fixed at 00
+    UTC by decision 9 and must stay that way; this exists next to it so a
+    probe-only run-hour parameter can never be mistaken for a live-path
+    knob. Same "Kalender ja, Uhr nein" discipline: the day offset is plain
+    ``dt.timedelta`` on a bare ``date``, never ``pd.Timedelta``/
+    ``pd.DateOffset`` on a tz-aware ``Timestamp`` (spec 6.5.1 §11).
+
+    No gate-closure assertion here (unlike run_init_for_target_day): this
+    function is probe-only, never feeds a submission, and a future
+    afternoon run hour added to the probe's own pair list should not be
+    blocked by an assertion that has nothing to do with this probe's own
+    purpose.
+    """
+    run_day = target_day - dt.timedelta(days=1)
+    return pd.Timestamp(run_day, tz="UTC") + pd.Timedelta(hours=run_hour)
+
+
 _AVAILABILITY_LOG_PATH: Final[Path] = Path("logs/weather_availability_probe.csv")
 _AVAILABILITY_LOG_COLUMNS: Final[tuple[str, ...]] = (
     "probe_time_utc",

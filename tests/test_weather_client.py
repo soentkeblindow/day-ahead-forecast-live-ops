@@ -37,6 +37,7 @@ from energy_price_forecast.data.weather_client import (
     WeatherRunUnavailable,
     fetch_run,
     log_availability_attempt,
+    run_init_at_hour_for_target_day,
     run_init_for_target_day,
 )
 from energy_price_forecast.data.weather_grid import GRID_POINTS, HOURLY_VARIABLES, expected_columns
@@ -360,6 +361,37 @@ def test_run_init_for_target_day_gate_closure_assertion_fires(
 
     with pytest.raises(AssertionError):
         run_init_for_target_day(dt.date(2026, 8, 31))
+
+
+# ---------------------------------------------------------------------------
+# run_init_at_hour_for_target_day (spec 8.0a §2.2)
+# ---------------------------------------------------------------------------
+
+
+def test_run_init_at_hour_for_target_day_normal_day() -> None:
+    result = run_init_at_hour_for_target_day(dt.date(2026, 8, 31), 6)
+    assert result == pd.Timestamp("2026-08-30T06:00", tz="UTC")
+
+
+@pytest.mark.parametrize("run_hour", [0, 3, 6])
+@pytest.mark.parametrize(
+    "target_day",
+    [
+        dt.date(2026, 3, 29),  # spring-forward DST day
+        dt.date(2026, 3, 30),  # day after
+        dt.date(2025, 10, 26),  # fall-back DST day
+        dt.date(2025, 10, 27),  # day after
+        dt.date(2026, 10, 25),  # this sprint's own named DST changeover day
+        dt.date(2026, 10, 26),  # day after
+    ],
+)
+def test_run_init_at_hour_for_target_day_no_dst_shift(target_day: dt.date, run_hour: int) -> None:
+    result = run_init_at_hour_for_target_day(target_day, run_hour)
+    expected = pd.Timestamp(target_day - dt.timedelta(days=1), tz="UTC") + pd.Timedelta(
+        hours=run_hour
+    )
+    assert result == expected
+    assert result.hour == run_hour
 
 
 def test_dst_conversion_produces_correct_local_hour_counts() -> None:

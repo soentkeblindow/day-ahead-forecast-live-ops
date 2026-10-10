@@ -1,0 +1,84 @@
+name: Weather run arrival-time probe
+
+on:
+  # Dispatch-only, same as the two existing probe workflows -- the
+  # Cloudflare Worker under ops/trigger/ is the sole timekeeper (spec
+  # 8.0a section 4: new slots in SLOTS, no new cron expression here).
+  workflow_dispatch: {}
+
+# Deliberately its OWN concurrency group, not maintain-store (spec 8.0a
+# section 4, point 1): this probe must never queue behind, or block, a
+# maintenance/submission run.
+concurrency:
+  group: weather-run-arrival-probe
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    # Target is under 2 minutes for the script itself (spec section 4);
+    # this is a generous outer bound, not the measured figure.
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      # Leaner than the existing probes' "--all-extras --dev" (spec
+      # section 4, "wenn möglich ein schlankeres Setup"): this script only
+      # needs pandas/requests, both already in the unconditional
+      # [project.dependencies] list (this repo has no optional-dependencies
+      # groups to select a true subset from) -- plain "uv sync" skips only
+      # the dev dependency-group (pytest/mypy/jupyter/...), which this job
+      # never needs.
+      - name: Install dependencies
+        run: uv sync
+
+      # No secret: Open-Meteo's non-commercial tier needs no API key.
+      - name: Probe weather run arrival time
+        run: uv run python scripts/probe_weather_run_arrival.py
+
+      # Commit only on new information (spec section 4, point 4): a probe
+      # run where every pair was either out of its own window or already
+      # fully covered writes nothing, so the diff is empty and this is a
+      # deliberate no-op, not a failure. Same retry/conflict mechanics as
+      # the other two probe workflows: git pull --rebase covers overlapping
+      # runs; a real conflict resolves in favour of a maintenance/
+      # submission commit, which --rebase already does by construction
+      # (this job's own commit is replayed on top, never the other way
+      # round).
+      - name: Commit and push the arrival log
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add logs/weather_run_arrival_probe.csv
+
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "data: weather run arrival probe run $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          for attempt in 1 2 3; do
+            if git push; then
+              echo "Push succeeded on attempt $attempt."
+              exit 0
+            fi
+            echo "Push failed (attempt $attempt/3); pulling --rebase and retrying."
+            git pull --rebase
+          done
+
+          echo "::error::Push failed after 3 attempts -- probe result was computed but not saved."
+          exit 1

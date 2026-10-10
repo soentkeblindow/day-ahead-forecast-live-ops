@@ -32,8 +32,16 @@ interface Env {
 }
 
 interface Slot {
-  /** HH:MM in Europe/Berlin, the intended local fire time. */
+  /** HH:MM, the intended fire time. Interpreted in Europe/Berlin unless
+   * `timeZone: "utc"` is set (spec 8.0a section 4: the weather-run
+   * arrival-time probe's measurement window is bound to UTC, not local
+   * time -- a fixed Berlin localTime would drift by an hour across the
+   * 2026-10-25 DST change relative to the UTC run-init times it needs to
+   * sit near, which is the opposite of every other slot below, whose
+   * local meaning (gate closure, maintenance cadence) is what must stay
+   * fixed across DST instead. */
   localTime: string;
+  timeZone?: "utc";
   workflow: string;
   /** Extra workflow_dispatch inputs to send with this slot's dispatch
    * (spec 6.7.3 section 2.2) -- submit.yml reads nominal_slot/
@@ -182,6 +190,64 @@ const SLOTS: Slot[] = [
   // point at which the header-migrating maintenance run for Schritt 13's
   // new logs/store_sync.csv columns is expected to actually land live.
   { localTime: "18:30", workflow: "maintain_store.yml", inputs: { sync_mode: "all" } },
+
+  // Weather-run arrival-time probe (spec 8.0a, section 4). UTC-anchored
+  // (timeZone: "utc") on purpose -- model run-init times are UTC, so this
+  // window must NOT shift with Europe/Berlin's DST change on 2026-10-25
+  // the way every slot above deliberately does. Covers the union of both
+  // named pairs' own 1-7h windows (icon_d2 03 UTC: ~04:00-08:00; the four
+  // 06 UTC pairs: ~07:00-13:00) -- the probe script itself re-checks each
+  // pair's own window and the "already fully covered" early exit, so one
+  // shared slot grid across the full 04:00-13:00 UTC span is sufficient;
+  // no need to encode per-pair sub-windows here too.
+  //
+  // Grid is :05/:20/:35/:50 past each hour, not :00/:15/:30/:45 -- offset
+  // five minutes from the "natural" quarter-hour marks specifically to
+  // dodge every maintain_store.yml/submit.yml slot above at its effective
+  // UTC minute in EITHER DST regime (CEST before 2026-10-25, CET after).
+  // Checked by hand against both regimes when this was added: 07:00,
+  // 07:30, 08:00, 08:10, 08:30, 08:40, 08:55, 09:10, 09:15, 09:25, 09:40,
+  // 09:45, 09:55, 10:15, 10:25, 10:40, 10:45, 10:55 are all taken by a
+  // maintenance/submission slot in at least one regime -- none of them
+  // falls on :05/:20/:35/:50, so this grid is collision-free both before
+  // and after the change. tests/test_trigger_slots.py re-proves this
+  // rather than trusting the by-hand check alone.
+  { localTime: "04:05", workflow: "weather_run_arrival_probe.yml", timeZone: "utc" },
+  { localTime: "04:20", workflow: "weather_run_arrival_probe.yml", timeZone: "utc" },
+  { localTime: "04:35", workflow: "weather_run_arrival_probe.yml", timeZone: "utc" },
+  { localTime: "04:50", workflow: "weather_run_arrival_probe.yml", timeZone: "utc" },
+  { localTime: "05:05", workflow: "weather_run_arrival_probe.yml", timeZone: "utc" },
+  { localTime: "05:20", workflow: "weather_run_arrival_probe.yml", timeZone: "utc" },
+  { localTime: "05:35", workflow: "weather_run_arrival_probe.yml", timeZone: "utc" },
+  { localTime: "05:50", workflow: "weather_run_arrival_probe.yml", timeZone: "utc" },
+  { localTime: "06:05", workflow: "weather_run_arrival_probe.yml", timeZone: "utc" },
+  { localTime: "06:20", workflow: "weather_run_arrival_probe.yml", timeZone: "utc" },
+  { localTime: "06:35", workflow: "weather_run_arrival_probe.yml", timeZone: "utc" },
+  { localTime: "06:50", workflow: "weather_run_arrival_probe.yml", timeZone: "utc" },
+  { localTime: "07:05", workflow: "weather_run_arrival_probe.yml", timeZone: "utc" },
+  { localTime: "07:20", workflow: "weather_run_arrival_probe.yml", timeZone: "utc" },
+  { localTime: "07:35", workflow: "weather_run_arrival_probe.yml", timeZone: "utc" },
+  { localTime: "07:50", workflow: "weather_run_arrival_probe.yml", timeZone: "utc" },
+  { localTime: "08:05", workflow: "weather_run_arrival_probe.yml", timeZone: "utc" },
+  { localTime: "08:20", workflow: "weather_run_arrival_probe.yml", timeZone: "utc" },
+  { localTime: "08:35", workflow: "weather_run_arrival_probe.yml", timeZone: "utc" },
+  { localTime: "08:50", workflow: "weather_run_arrival_probe.yml", timeZone: "utc" },
+  { localTime: "09:05", workflow: "weather_run_arrival_probe.yml", timeZone: "utc" },
+  { localTime: "09:20", workflow: "weather_run_arrival_probe.yml", timeZone: "utc" },
+  { localTime: "09:35", workflow: "weather_run_arrival_probe.yml", timeZone: "utc" },
+  { localTime: "09:50", workflow: "weather_run_arrival_probe.yml", timeZone: "utc" },
+  { localTime: "10:05", workflow: "weather_run_arrival_probe.yml", timeZone: "utc" },
+  { localTime: "10:20", workflow: "weather_run_arrival_probe.yml", timeZone: "utc" },
+  { localTime: "10:35", workflow: "weather_run_arrival_probe.yml", timeZone: "utc" },
+  { localTime: "10:50", workflow: "weather_run_arrival_probe.yml", timeZone: "utc" },
+  { localTime: "11:05", workflow: "weather_run_arrival_probe.yml", timeZone: "utc" },
+  { localTime: "11:20", workflow: "weather_run_arrival_probe.yml", timeZone: "utc" },
+  { localTime: "11:35", workflow: "weather_run_arrival_probe.yml", timeZone: "utc" },
+  { localTime: "11:50", workflow: "weather_run_arrival_probe.yml", timeZone: "utc" },
+  { localTime: "12:05", workflow: "weather_run_arrival_probe.yml", timeZone: "utc" },
+  { localTime: "12:20", workflow: "weather_run_arrival_probe.yml", timeZone: "utc" },
+  { localTime: "12:35", workflow: "weather_run_arrival_probe.yml", timeZone: "utc" },
+  { localTime: "12:50", workflow: "weather_run_arrival_probe.yml", timeZone: "utc" },
 ];
 
 function localHHMM(utcMillis: number): string {
@@ -196,6 +262,16 @@ function localHHMM(utcMillis: number): string {
     hourCycle: "h23",
   });
   return formatter.format(new Date(utcMillis));
+}
+
+function utcHHMM(utcMillis: number): string {
+  // No tz database lookup, deliberately: this is the whole point of a
+  // "utc" slot -- its wall-clock meaning never shifts with DST, so there
+  // is nothing to re-resolve per instant the way localHHMM must.
+  const date = new Date(utcMillis);
+  const hh = String(date.getUTCHours()).padStart(2, "0");
+  const mm = String(date.getUTCMinutes()).padStart(2, "0");
+  return `${hh}:${mm}`;
 }
 
 function minutesSinceMidnight(hhmm: string): number {
@@ -258,12 +334,18 @@ async function dispatchWorkflow(
 export default {
   async scheduled(event: ScheduledEvent, env: Env, _ctx: ExecutionContext): Promise<void> {
     const actualLocal = localHHMM(event.scheduledTime);
-    const matches = SLOTS.filter((slot) => inSlotWindow(actualLocal, slot.localTime));
+    const actualUtc = utcHHMM(event.scheduledTime);
+    const matches = SLOTS.filter((slot) =>
+      slot.timeZone === "utc"
+        ? inSlotWindow(actualUtc, slot.localTime)
+        : inSlotWindow(actualLocal, slot.localTime)
+    );
 
     if (matches.length === 0) {
-      // Almost every tick lands here -- five slots out of 288 ticks/day is
-      // the expected, silent no-op path, not an error condition.
-      console.log(`Tick at ${actualLocal} local -- no slot in window, no dispatch.`);
+      // Almost every tick lands here -- the known slots are a small
+      // fraction of 288 ticks/day, the expected, silent no-op path, not
+      // an error condition.
+      console.log(`Tick at ${actualLocal} local / ${actualUtc} UTC -- no slot in window, no dispatch.`);
       return;
     }
 
@@ -279,7 +361,8 @@ export default {
         );
         continue;
       }
-      console.log(`Dispatched ${slot.workflow} at ${actualLocal} local (slot ${slot.localTime}).`);
+      const basis = slot.timeZone === "utc" ? `${actualUtc} UTC` : `${actualLocal} local`;
+      console.log(`Dispatched ${slot.workflow} at ${basis} (slot ${slot.localTime}).`);
     }
   },
 };
