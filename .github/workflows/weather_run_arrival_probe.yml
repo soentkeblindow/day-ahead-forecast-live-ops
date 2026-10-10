@@ -62,6 +62,18 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Unlike the other two probe logs, this one can legitimately
+          # never be created at all: every pair outside its own 1-7h
+          # window or already fully covered means zero rows written (spec
+          # 8.0a section 2.4, "beendet sich der Lauf ohne Request und ohne
+          # Commit"). `git add` on a path that has never existed is a hard
+          # error, not an empty no-op -- caught by this workflow's own
+          # first real dispatch landing outside every pair's window.
+          if [ ! -f logs/weather_run_arrival_probe.csv ]; then
+            echo "No arrival log file yet -- nothing to commit."
+            exit 0
+          fi
           git add logs/weather_run_arrival_probe.csv
 
           if git diff --staged --quiet; then
