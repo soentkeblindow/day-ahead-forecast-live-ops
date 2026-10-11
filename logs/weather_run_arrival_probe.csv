@@ -1,0 +1,2 @@
+probe_timestamp_utc,run_id,target_day,model,run_init_utc,minutes_since_run_init,minutes_to_gate_closure,http_status,error_kind,n_hours_expected,n_hours_covered,coverage_ratio,variables_missing,first_ts,last_ts
+2026-10-11T04:06:09.479452+00:00,38110494086,2026-10-12,icon_d2,2026-10-11T03:00:00+00:00,66.2,353.8,400,not_available,24,0,0.0,,,
