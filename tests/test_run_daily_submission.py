@@ -27,6 +27,7 @@ from energy_price_forecast.arena.live_inputs import (
     read_quarterhourly_prices,
     read_weather_runs,
 )
+from energy_price_forecast.arena.load_patch import LoadPatchReference
 from energy_price_forecast.arena.payload import PayloadValidationError
 from energy_price_forecast.arena.preflight import (
     CapacityAnchorReport,
@@ -42,6 +43,7 @@ from energy_price_forecast.evaluation.walkforward import Fold
 from energy_price_forecast.features.build import build_feature_set_for_day
 from energy_price_forecast.features.nwp_fundamentals import IncompleteReconstructionError
 from energy_price_forecast.ops import protocol, store
+from energy_price_forecast.ops.oos_store import LADDER_ROW_NAMES, OOS_MODEL_VERSION
 from energy_price_forecast.ops.store_sources import EntsoeSource
 from energy_price_forecast.ops.windows import LOCAL_TZ, local_day_bounds
 from scripts.run_daily_submission import (
@@ -56,6 +58,8 @@ from scripts.run_daily_submission import (
     build_submission_record,
     check_a_global,
     check_a_nwp,
+    compute_oos_rows_for_day,
+    evaluate_ladder_row,
     fit_predict_expand,
     holiday_calendar_covers_target,
     is_past_gate_closure,
@@ -573,6 +577,433 @@ def _one_row_ladder(
             measured_as="test",
         ),
     )
+
+
+def _base_candidate(required: frozenset[str] = frozenset({"feat_a"})) -> Candidate:
+    return Candidate(
+        name="base",
+        rank=3,
+        groups=(FeatureGroup("all", required, GapPolicy.STRICT),),
+        requires_nwp=False,
+        load_source=None,
+        measured_as="test",
+    )
+
+
+def _similar_day_candidate(required: frozenset[str] = frozenset({"feat_a"})) -> Candidate:
+    return Candidate(
+        name="core_gas_loadpatch",
+        rank=2,
+        groups=(FeatureGroup("all", required, GapPolicy.STRICT),),
+        requires_nwp=True,
+        load_source="similar_day",
+        measured_as="test",
+    )
+
+
+def _last_train_day(fold: Fold) -> dt.date:
+    return fold.train_index.tz_convert(LOCAL_TZ).normalize().max().date()
+
+
+def test_evaluate_ladder_row_fails_closed_when_nwp_required_but_unavailable() -> None:
+    """spec 7.1 section 2.2: a candidate that requires_nwp never reaches its
+    own matrix build at all once nwp_usable is False -- the same gate
+    run_submission_for_day's own ladder loop used to apply inline."""
+    fold = _fake_fold(_TARGET_DAY)
+    evaluation = evaluate_ladder_row(
+        _one_row_ladder()[0],
+        df=pd.DataFrame(),
+        fold=fold,
+        target_day=_TARGET_DAY,
+        row1_row2_matrix=None,
+        renewables_predictions=None,
+        nwp_usable=False,
+        nwp_unusable_reason="weather run missing",
+        last_train_day=_last_train_day(fold),
+    )
+
+    assert evaluation.ok is False
+    assert "NWP unavailable" in evaluation.reasons[0]
+    assert "weather run missing" in evaluation.reasons[0]
+    assert evaluation.row_matrix is None
+
+
+def test_evaluate_ladder_row_row3_propagates_a_build_value_error() -> None:
+    """spec 6.9 section 2.1: row 3 has no NWP dependency, so its own build
+    is attempted even when nwp_usable is False -- but a genuine ValueError
+    from build_price_feature_matrix (e.g. no day produced a usable row)
+    still fails this one row, not an exception the caller must catch."""
+    fold = _fake_fold(_TARGET_DAY)
+    with patch(
+        "scripts.run_daily_submission.build_price_feature_matrix",
+        side_effect=ValueError("no day produced a usable feature row"),
+    ):
+        evaluation = evaluate_ladder_row(
+            _base_candidate(),
+            df=pd.DataFrame({"day_ahead_price": []}),
+            fold=fold,
+            target_day=_TARGET_DAY,
+            row1_row2_matrix=None,
+            renewables_predictions=None,
+            nwp_usable=False,
+            nwp_unusable_reason="weather run missing",
+            last_train_day=_last_train_day(fold),
+        )
+
+    assert evaluation.ok is False
+    assert "no day produced a usable feature row" in evaluation.reasons[0]
+
+
+def test_evaluate_ladder_row_row3_fails_when_its_own_build_excludes_target_day() -> None:
+    fold = _fake_fold(_TARGET_DAY)
+    matrix = pd.DataFrame({"feat_a": 1.0}, index=fold.train_index)
+    with patch(
+        "scripts.run_daily_submission.build_price_feature_matrix",
+        return_value=(matrix, {_TARGET_DAY}),
+    ):
+        evaluation = evaluate_ladder_row(
+            _base_candidate(),
+            df=pd.DataFrame({"day_ahead_price": []}),
+            fold=fold,
+            target_day=_TARGET_DAY,
+            row1_row2_matrix=None,
+            renewables_predictions=None,
+            nwp_usable=False,
+            nwp_unusable_reason="weather run missing",
+            last_train_day=_last_train_day(fold),
+        )
+
+    assert evaluation.ok is False
+    assert "excluded" in evaluation.reasons[0]
+
+
+def test_evaluate_ladder_row_row3_succeeds_without_nwp() -> None:
+    """Row 3 is gas-/NWP-free (spec 6.9 section 2.1) -- it must succeed on a
+    day where nwp_usable is False, the exact scenario the fallback ladder
+    exists for."""
+    fold = _fake_fold(_TARGET_DAY)
+    matrix_index = fold.train_index.union(fold.test_index)
+    matrix = pd.DataFrame({"feat_a": 1.0}, index=matrix_index)
+    df = pd.DataFrame({"day_ahead_price": 50.0}, index=matrix_index)
+    with patch(
+        "scripts.run_daily_submission.build_price_feature_matrix",
+        return_value=(matrix, set()),
+    ):
+        evaluation = evaluate_ladder_row(
+            _base_candidate(),
+            df=df,
+            fold=fold,
+            target_day=_TARGET_DAY,
+            row1_row2_matrix=None,
+            renewables_predictions=None,
+            nwp_usable=False,
+            nwp_unusable_reason="weather run missing",
+            last_train_day=_last_train_day(fold),
+        )
+
+    assert evaluation.ok is True
+    assert evaluation.row_matrix is not None
+    assert evaluation.fills == ()
+    assert evaluation.training_report is not None
+    assert evaluation.load_patch_reference is None
+
+
+def test_evaluate_ladder_row_fails_the_training_window_check() -> None:
+    """spec 6.9 section 2.6: a 10-day gap drops n_training_days below
+    MIN_TRAINING_DAYS=83 -- caught directly off the shared matrix, no
+    build_price_feature_matrix call needed for a rank-1 row at all."""
+    fold = _fake_fold(_TARGET_DAY)
+    kept_train_index = fold.train_index[10 * 24 :]
+    matrix_index = kept_train_index.union(fold.test_index)
+    matrix = pd.DataFrame({"feat_a": 1.0}, index=matrix_index)
+    df = pd.DataFrame({"day_ahead_price": 50.0}, index=matrix_index)
+
+    evaluation = evaluate_ladder_row(
+        _one_row_ladder()[0],
+        df=df,
+        fold=fold,
+        target_day=_TARGET_DAY,
+        row1_row2_matrix=matrix,
+        renewables_predictions=pd.DataFrame(),
+        nwp_usable=True,
+        nwp_unusable_reason=None,
+        last_train_day=_last_train_day(fold),
+    )
+
+    assert evaluation.ok is False
+    assert evaluation.row_matrix is None
+
+
+def test_evaluate_ladder_row_fails_check_b_with_named_missing_feature() -> None:
+    fold = _fake_fold(_TARGET_DAY)
+    matrix_index = fold.train_index.union(fold.test_index)
+    matrix = pd.DataFrame({"feat_a": 1.0}, index=matrix_index)
+    matrix.loc[fold.test_index, "feat_a"] = float("nan")
+    df = pd.DataFrame({"day_ahead_price": 50.0}, index=matrix_index)
+
+    evaluation = evaluate_ladder_row(
+        _one_row_ladder()[0],
+        df=df,
+        fold=fold,
+        target_day=_TARGET_DAY,
+        row1_row2_matrix=matrix,
+        renewables_predictions=pd.DataFrame(),
+        nwp_usable=True,
+        nwp_unusable_reason=None,
+        last_train_day=_last_train_day(fold),
+    )
+
+    assert evaluation.ok is False
+    assert "feat_a" in evaluation.missing_features
+
+
+def test_evaluate_ladder_row_similar_day_patch_fails_without_a_reference_day() -> None:
+    """spec 6.9 section 2.2: no usable reference within MAX_LOAD_PATCH_WEEKS_BACK
+    fails row 2 alone -- row1_row2_matrix is never even sliced."""
+    fold = _fake_fold(_TARGET_DAY)
+    with patch("scripts.run_daily_submission.determine_load_patch_reference", return_value=None):
+        evaluation = evaluate_ladder_row(
+            _similar_day_candidate(),
+            df=pd.DataFrame(),
+            fold=fold,
+            target_day=_TARGET_DAY,
+            row1_row2_matrix=pd.DataFrame({"feat_a": 1.0}, index=fold.train_index),
+            renewables_predictions=pd.DataFrame(),
+            nwp_usable=True,
+            nwp_unusable_reason=None,
+            last_train_day=_last_train_day(fold),
+        )
+
+    assert evaluation.ok is False
+    assert "Similar-Day-Patch" in evaluation.reasons[0]
+
+
+def test_evaluate_ladder_row_similar_day_patch_succeeds_and_patches_only_the_test_row() -> None:
+    """spec 6.9 section 2.2: row 2 shares row 1's exact training rows
+    ('gleiche Features, gleiches Training') -- only target_day's own test
+    row comes from build_row2_target_row, never the training index."""
+    fold = _fake_fold(_TARGET_DAY)
+    matrix_index = fold.train_index.union(fold.test_index)
+    matrix = pd.DataFrame({"feat_a": 1.0}, index=matrix_index)
+    df = pd.DataFrame({"day_ahead_price": 50.0}, index=matrix_index)
+    reference = LoadPatchReference(
+        reference_day=_TARGET_DAY - dt.timedelta(days=1), weeks_back=0, skipped=()
+    )
+    patched_row = pd.DataFrame({"feat_a": 2.0}, index=fold.test_index)
+
+    with (
+        patch(
+            "scripts.run_daily_submission.determine_load_patch_reference",
+            return_value=reference,
+        ),
+        patch("scripts.run_daily_submission.build_row2_target_row", return_value=patched_row),
+    ):
+        evaluation = evaluate_ladder_row(
+            _similar_day_candidate(),
+            df=df,
+            fold=fold,
+            target_day=_TARGET_DAY,
+            row1_row2_matrix=matrix,
+            renewables_predictions=pd.DataFrame(),
+            nwp_usable=True,
+            nwp_unusable_reason=None,
+            last_train_day=_last_train_day(fold),
+        )
+
+    assert evaluation.ok is True
+    assert evaluation.load_patch_reference == reference
+    assert evaluation.row_matrix is not None
+    assert (evaluation.row_matrix.loc[fold.test_index, "feat_a"] == 2.0).all()
+    assert (evaluation.row_matrix.loc[fold.train_index, "feat_a"] == 1.0).all()
+
+
+def test_evaluate_ladder_row_rank1_succeeds_with_the_shared_matrix() -> None:
+    fold = _fake_fold(_TARGET_DAY)
+    matrix_index = fold.train_index.union(fold.test_index)
+    matrix = pd.DataFrame({"feat_a": 1.0}, index=matrix_index)
+    df = pd.DataFrame({"day_ahead_price": 50.0}, index=matrix_index)
+
+    evaluation = evaluate_ladder_row(
+        _one_row_ladder()[0],
+        df=df,
+        fold=fold,
+        target_day=_TARGET_DAY,
+        row1_row2_matrix=matrix,
+        renewables_predictions=pd.DataFrame(),
+        nwp_usable=True,
+        nwp_unusable_reason=None,
+        last_train_day=_last_train_day(fold),
+    )
+
+    assert evaluation.ok is True
+    assert evaluation.row_matrix is not None
+    assert evaluation.fills == ()
+    assert evaluation.load_patch_reference is None
+
+
+def _three_row_test_ladder() -> tuple[Candidate, ...]:
+    """Stand-in three_row_ladder() for compute_oos_rows_for_day tests
+    (spec 7.1 section 2.2) -- all three rows require the same single
+    "feat_a" column, so one shared synthetic matrix covers every row."""
+    return (_one_row_ladder()[0], _similar_day_candidate(), _base_candidate())
+
+
+def test_compute_oos_rows_for_day_returns_all_three_rows_when_all_are_viable() -> None:
+    fold = _fake_fold(_TARGET_DAY)
+    matrix_index = fold.train_index.union(fold.test_index)
+    matrix = pd.DataFrame({"feat_a": 1.0}, index=matrix_index)
+    df = pd.DataFrame({"day_ahead_price": 50.0}, index=matrix_index)
+    forecast = _quarterhourly_series(_TARGET_DAY)
+    weather_run = pd.Timestamp("2026-07-14T00:00:00", tz="UTC")
+    reference = LoadPatchReference(
+        reference_day=_TARGET_DAY - dt.timedelta(days=1), weeks_back=0, skipped=()
+    )
+    patched_row = pd.DataFrame({"feat_a": 2.0}, index=fold.test_index)
+
+    with (
+        patch("scripts.run_daily_submission.check_a_global", return_value=PreflightResult(ok=True)),
+        patch("scripts.run_daily_submission.check_a_nwp", return_value=_OK_NWP),
+        patch("scripts.run_daily_submission.target_day_fold", return_value=fold),
+        patch(
+            "scripts.run_daily_submission.nwp_group_columns_for_day",
+            return_value=(frozenset(), frozenset()),
+        ),
+        patch("scripts.run_daily_submission.build_ladder", return_value=_three_row_test_ladder()),
+        patch(
+            "scripts.run_daily_submission.build_price_feature_matrix",
+            return_value=(matrix, set()),
+        ),
+        patch("scripts.run_daily_submission.run_init_for_target_day", return_value=weather_run),
+        patch(
+            "scripts.run_daily_submission.determine_load_patch_reference",
+            return_value=reference,
+        ),
+        patch("scripts.run_daily_submission.build_row2_target_row", return_value=patched_row),
+        patch(
+            "scripts.run_daily_submission.fit_predict_expand",
+            return_value=(forecast, 2160, 2160),
+        ),
+    ):
+        rows = compute_oos_rows_for_day(
+            df, pd.DataFrame(), pd.DataFrame(), _TARGET_DAY, source="backfill"
+        )
+
+    assert {row.ladder_row for row in rows} == {"core_gas", "core_gas_loadpatch", "base"}
+    assert len(rows) == 3 * len(forecast)
+    by_row = {name: [r for r in rows if r.ladder_row == name] for name in LADDER_ROW_NAMES}
+    assert all(r.weather_run_init_utc == weather_run for r in by_row["core_gas"])
+    assert all(r.weather_run_init_utc == weather_run for r in by_row["core_gas_loadpatch"])
+    assert all(r.weather_run_init_utc is None for r in by_row["base"])
+    assert all(r.source == "backfill" for r in rows)
+    assert all(r.model_version == OOS_MODEL_VERSION for r in rows)
+    assert all(r.target_day == _TARGET_DAY for r in rows)
+
+
+def test_compute_oos_rows_for_day_returns_only_base_when_nwp_is_unavailable() -> None:
+    fold = _fake_fold(_TARGET_DAY)
+    matrix_index = fold.train_index.union(fold.test_index)
+    matrix = pd.DataFrame({"feat_a": 1.0}, index=matrix_index)
+    df = pd.DataFrame({"day_ahead_price": 50.0}, index=matrix_index)
+    forecast = _quarterhourly_series(_TARGET_DAY)
+
+    with (
+        patch("scripts.run_daily_submission.check_a_global", return_value=PreflightResult(ok=True)),
+        patch(
+            "scripts.run_daily_submission.check_a_nwp",
+            return_value=NwpAvailability(
+                ok=False,
+                reasons=("weather run for D-1 00 UTC could not be loaded",),
+                anchor=CapacityAnchorReport(warning=False, days_until_expiry=45.0),
+            ),
+        ),
+        patch("scripts.run_daily_submission.target_day_fold", return_value=fold),
+        patch("scripts.run_daily_submission.build_ladder", return_value=_three_row_test_ladder()),
+        patch(
+            "scripts.run_daily_submission.build_price_feature_matrix",
+            return_value=(matrix, set()),
+        ),
+        patch(
+            "scripts.run_daily_submission.fit_predict_expand",
+            return_value=(forecast, 2160, 2160),
+        ),
+    ):
+        rows = compute_oos_rows_for_day(
+            df, pd.DataFrame(), pd.DataFrame(), _TARGET_DAY, source="daily"
+        )
+
+    assert {row.ladder_row for row in rows} == {"base"}
+    assert all(row.weather_run_init_utc is None for row in rows)
+
+
+def test_compute_oos_rows_for_day_only_rows_skips_candidates_before_evaluation() -> None:
+    fold = _fake_fold(_TARGET_DAY)
+    matrix_index = fold.train_index.union(fold.test_index)
+    matrix = pd.DataFrame({"feat_a": 1.0}, index=matrix_index)
+    df = pd.DataFrame({"day_ahead_price": 50.0}, index=matrix_index)
+    forecast = _quarterhourly_series(_TARGET_DAY)
+
+    with (
+        patch("scripts.run_daily_submission.check_a_global", return_value=PreflightResult(ok=True)),
+        patch("scripts.run_daily_submission.check_a_nwp", return_value=_OK_NWP),
+        patch("scripts.run_daily_submission.target_day_fold", return_value=fold),
+        patch(
+            "scripts.run_daily_submission.nwp_group_columns_for_day",
+            return_value=(frozenset(), frozenset()),
+        ),
+        patch("scripts.run_daily_submission.build_ladder", return_value=_three_row_test_ladder()),
+        patch(
+            "scripts.run_daily_submission.build_price_feature_matrix",
+            return_value=(matrix, set()),
+        ),
+        patch("scripts.run_daily_submission.determine_load_patch_reference") as mock_reference,
+        patch(
+            "scripts.run_daily_submission.fit_predict_expand",
+            return_value=(forecast, 2160, 2160),
+        ),
+    ):
+        rows = compute_oos_rows_for_day(
+            df,
+            pd.DataFrame(),
+            pd.DataFrame(),
+            _TARGET_DAY,
+            source="daily",
+            only_rows=frozenset({"base"}),
+        )
+
+    assert {row.ladder_row for row in rows} == {"base"}
+    mock_reference.assert_not_called()
+
+
+def test_compute_oos_rows_for_day_returns_nothing_for_a_global_check_a_failure() -> None:
+    with (
+        patch(
+            "scripts.run_daily_submission.check_a_global",
+            return_value=PreflightResult(ok=False, reasons=("holiday calendar gap",)),
+        ),
+        patch("scripts.run_daily_submission.check_a_nwp") as mock_nwp,
+    ):
+        rows = compute_oos_rows_for_day(
+            pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), _TARGET_DAY, source="backfill"
+        )
+
+    assert rows == []
+    mock_nwp.assert_not_called()
+
+
+def test_compute_oos_rows_for_day_returns_nothing_without_an_evaluable_fold() -> None:
+    with (
+        patch("scripts.run_daily_submission.check_a_global", return_value=PreflightResult(ok=True)),
+        patch("scripts.run_daily_submission.check_a_nwp", return_value=_OK_NWP),
+        patch(
+            "scripts.run_daily_submission.target_day_fold",
+            side_effect=ValueError("no evaluable fold"),
+        ),
+    ):
+        rows = compute_oos_rows_for_day(
+            pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), _TARGET_DAY, source="backfill"
+        )
+
+    assert rows == []
 
 
 def test_run_submission_for_day_stops_at_the_global_check_without_running_renewables() -> None:

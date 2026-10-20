@@ -1,0 +1,133 @@
+name: OOS-store daily top-up
+
+on:
+  # Dispatch-only -- ops/trigger/'s Cloudflare Worker is the sole
+  # timekeeper (spec 7.1 section 2.3: its own slot, not maintain_store.yml/
+  # submit.yml's).
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "'daily' (default, re-attempts the last DAILY_TOPUP_LOOKBACK_DAYS days) or 'backfill' for a manual re-run over a date range."
+        required: false
+        default: "daily"
+      end:
+        description: "backfill mode only -- last day to attempt (YYYY-MM-DD), defaults to yesterday."
+        required: false
+        default: ""
+
+# Deliberately its OWN concurrency group, not maintain-store (spec section
+# 2.3: "nicht in der Concurrency Group maintain-store, keine Slots auf
+# Pflege- oder Einreich-Minuten") -- a failure here must never queue
+# behind, or block, a maintenance/submission run.
+concurrency:
+  group: oos-store-job
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  top-up:
+    runs-on: ubuntu-latest
+    # Spec section 9's own Rückfrage trigger is ~10 minutes for the daily
+    # top-up (it only ever re-attempts DAILY_TOPUP_LOOKBACK_DAYS=7 days,
+    # not the full backfill range); generous headroom above that.
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      # Full stack, same as submit.yml/maintain_store.yml: this job builds
+      # real feature matrices and fits real LightGBM/renewables models, not
+      # the lean subset the probe workflows get away with.
+      - name: Install dependencies
+        run: uv sync --all-extras --dev
+
+      # No ENTSOE_API_KEY (same "no fetch client" contract as submit.yml --
+      # this job reads the store's on-disk caches only, never a live ENTSO-E/
+      # weather/commodity fetch). GITHUB_TOKEN downloads the store release
+      # asset and pushes the oos_store.csv commit below. STORE_ENCRYPTION_KEY
+      # decrypts the downloaded store (this job never publishes, only
+      # load_store, but that still needs the key).
+      # Single-line `run:` on purpose (not a multi-line if/else block):
+      # tests/test_workflow_script_entrypoints.py's script-import safety
+      # net only discovers a script invoked as `run: ... python scripts/
+      # <name>.py` on the SAME line as `run:` (same convention submit.yml/
+      # maintain_store.yml already follow) -- a multi-line `run: |` block
+      # with the python call on a later line is structurally invisible to
+      # that regex, silently exempting the script from the exact check
+      # spec 6.9 step 16 built. `--end` is optional on the CLI itself
+      # (scripts/oos_store_job.py's own argparse default), so an empty
+      # ``inputs.end`` just expands to nothing here rather than needing a
+      # shell conditional.
+      - name: Run the OOS-store job
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STORE_ENCRYPTION_KEY: ${{ secrets.STORE_ENCRYPTION_KEY }}
+        run: uv run python scripts/oos_store_job.py --mode ${{ inputs.mode }} ${{ inputs.end != '' && format('--end={0}', inputs.end) || '' }}
+
+      # Spec section 2.4: "Dieser Vergleich läuft danach dauerhaft im
+      # täglichen Lauf mit" -- the parity check against real submitted
+      # payloads is not a one-off, it re-runs every day alongside the
+      # top-up itself. `if: always()` so a top-up failure still leaves a
+      # fresh parity report comparing whatever the store already has
+      # against real payloads, rather than skipping the check entirely.
+      - name: Run the OOS-store parity check
+        if: always()
+        run: uv run python scripts/oos_store_parity_check.py
+
+      # Same push discipline as submit.yml/maintain_store.yml.
+      - name: Commit and push the OOS-store and parity report
+        if: always()
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # A top-up run that found nothing missing writes nothing at all
+          # (spec section 2.3's idempotency contract) -- logs/oos_store.csv
+          # may not exist on a fresh checkout's first ever run either.
+          # `git add` on a path that has never existed is a hard error, not
+          # an empty no-op (the same lesson weather_run_arrival_probe.yml's
+          # own commit step already encodes) -- each file is guarded on its
+          # own, since one script can succeed while the other's own file
+          # still doesn't exist yet.
+          paths=""
+          if [ -f logs/oos_store.csv ]; then
+            paths="$paths logs/oos_store.csv"
+          fi
+          if [ -f logs/oos_store_parity_check.csv ]; then
+            paths="$paths logs/oos_store_parity_check.csv"
+          fi
+          if [ -z "$paths" ]; then
+            echo "Neither file exists yet -- nothing to commit."
+            exit 0
+          fi
+          git add $paths
+
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "data: OOS-store job run $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          for attempt in 1 2 3; do
+            if git push; then
+              echo "Push succeeded on attempt $attempt."
+              exit 0
+            fi
+            echo "Push failed (attempt $attempt/3); pulling --rebase and retrying."
+            git pull --rebase
+          done
+
+          echo "::error::Push failed after 3 attempts -- OOS-store result was computed but not saved."
+          exit 1

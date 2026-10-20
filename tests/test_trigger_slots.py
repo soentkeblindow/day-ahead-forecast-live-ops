@@ -131,17 +131,59 @@ def test_utc_probe_slots_are_identical_before_and_after_the_dst_change() -> None
     assert "Intl.DateTimeFormat" not in utc_fn
 
 
+def _concurrency_group(path: Path) -> str:
+    text = path.read_text(encoding="utf-8")
+    match = re.search(r"^\s*group:\s*(\S+)", text, re.MULTILINE)
+    assert match is not None, f"no concurrency group found in {path}"
+    return match.group(1)
+
+
 def test_weather_run_arrival_probe_workflow_has_its_own_concurrency_group() -> None:
     workflow_path = PROJECT_ROOT / ".github" / "workflows" / "weather_run_arrival_probe.yml"
     maintain_path = PROJECT_ROOT / ".github" / "workflows" / "maintain_store.yml"
 
-    def _group(path: Path) -> str:
-        text = path.read_text(encoding="utf-8")
-        match = re.search(r"^\s*group:\s*(\S+)", text, re.MULTILINE)
-        assert match is not None, f"no concurrency group found in {path}"
-        return match.group(1)
-
-    probe_group = _group(workflow_path)
-    maintain_group = _group(maintain_path)
+    probe_group = _concurrency_group(workflow_path)
+    maintain_group = _concurrency_group(maintain_path)
     assert probe_group != maintain_group
     assert probe_group != "maintain-store"
+
+
+def test_no_two_berlin_local_slots_share_the_same_minute() -> None:
+    """spec 7.1 section 2.3: a new Berlin-local slot (the OOS-store daily
+    top-up) must not silently collide with an existing maintenance/
+    submission minute. No such check existed before this slot was added
+    -- test_no_utc_probe_slot_collides_with_a_local_slot_in_either_dst_regime
+    only ever checked UTC-anchored probe slots against Berlin-local ones,
+    never two Berlin-local slots against each other. This closes that gap
+    permanently, not just for this one addition.
+    """
+    slots = _parse_slots()
+    berlin_minutes = [s["minute_of_day"] for s in slots if s["time_zone"] != "utc"]
+    assert len(berlin_minutes) == len(set(berlin_minutes)), (
+        f"duplicate Berlin-local slot minute(s): {sorted(berlin_minutes)}"
+    )
+
+
+def test_oos_store_job_workflow_has_its_own_concurrency_group() -> None:
+    workflow_path = PROJECT_ROOT / ".github" / "workflows" / "oos_store_job.yml"
+    maintain_path = PROJECT_ROOT / ".github" / "workflows" / "maintain_store.yml"
+
+    oos_store_group = _concurrency_group(workflow_path)
+    maintain_group = _concurrency_group(maintain_path)
+    assert oos_store_group != maintain_group
+    assert oos_store_group != "maintain-store"
+
+
+def test_oos_store_job_slot_does_not_collide_with_any_existing_slot() -> None:
+    slots = _parse_slots()
+    oos_store_slots = [s for s in slots if s["workflow"] == "oos_store_job.yml"]
+    other_berlin_slots = [
+        s
+        for s in slots
+        if s["time_zone"] != "utc" and s["workflow"] != "oos_store_job.yml"
+    ]
+
+    assert oos_store_slots, "expected at least one oos_store_job.yml slot in SLOTS"
+    oos_store_minutes = {int(s["minute_of_day"]) for s in oos_store_slots}
+    other_minutes = {int(s["minute_of_day"]) for s in other_berlin_slots}
+    assert not (oos_store_minutes & other_minutes)

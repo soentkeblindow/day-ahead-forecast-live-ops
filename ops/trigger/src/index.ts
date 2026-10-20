@@ -191,6 +191,18 @@ const SLOTS: Slot[] = [
   // new logs/store_sync.csv columns is expected to actually land live.
   { localTime: "18:30", workflow: "maintain_store.yml", inputs: { sync_mode: "all" } },
 
+  // OOS-store daily top-up (spec 7.1, section 2.3). Deliberately its own
+  // workflow/concurrency group, NOT maintain_store.yml/submit.yml's --
+  // this job must never block a submission if it fails. 20:30 is well
+  // clear of every maintenance/submission minute above (09:00-11:55,
+  // 18:30) and of the UTC weather-probe grid below in either DST regime
+  // (that grid's own Berlin-local equivalent tops out around 13:50-14:50,
+  // hours before 20:30) -- the job itself has no real time-of-day
+  // sensitivity (it reconstructs a frozen historical info-state, never
+  // reads "now"), so an evening slot after the day's last maintenance
+  // pass was simply the least contested choice.
+  { localTime: "20:30", workflow: "oos_store_job.yml", inputs: { mode: "daily" } },
+
   // Weather-run arrival-time probe (spec 8.0a, section 4). UTC-anchored
   // (timeZone: "utc") on purpose -- model run-init times are UTC, so this
   // window must NOT shift with Europe/Berlin's DST change on 2026-10-25

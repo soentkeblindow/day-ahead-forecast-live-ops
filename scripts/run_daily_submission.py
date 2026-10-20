@@ -21,7 +21,7 @@ import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, Literal
 
 import holidays
 import pandas as pd
@@ -50,6 +50,7 @@ from energy_price_forecast.arena.payload import build_payload, validate_payload
 from energy_price_forecast.arena.preflight import (
     CapacityAnchorReport,
     PreflightResult,
+    TrainingWindowReport,
     check_capacity_anchor,
     check_commodity_staleness,
     check_holiday_calendar,
@@ -92,6 +93,7 @@ from energy_price_forecast.models.arena_baseline import persistence_forecast
 from energy_price_forecast.models.bridge import expand_to_quarterhour, fit_shape_profile
 from energy_price_forecast.models.lgbm import LGBMForecaster
 from energy_price_forecast.ops import store
+from energy_price_forecast.ops.oos_store import LADDER_ROW_NAMES, OOS_MODEL_VERSION, OosStoreRow
 from energy_price_forecast.ops.protocol import (
     SubmissionRecord,
     append_submission_record,
@@ -715,6 +717,250 @@ def _base_builder(day: dt.date, df: pd.DataFrame, _renewables: pd.DataFrame) -> 
     return build_floor_for_day(day, df, FeatureConfig(), commodities="none")
 
 
+@dataclass(frozen=True)
+class RowEvaluation:
+    """One candidate row's own outcome for one target_day (spec 6.9 section
+    5.1 steps 5-8) -- the ladder loop's per-candidate body, factored out of
+    ``run_submission_for_day`` (spec 7.1 section 2.2) so a caller that needs
+    EVERY row's own outcome for a day (``scripts/oos_store_job.py``'s
+    backfill, which must not stop at the first viable row the way the live
+    path does) shares this implementation instead of a second one.
+    """
+
+    candidate: Candidate
+    ok: bool
+    reasons: tuple[str, ...] = ()
+    missing_features: tuple[str, ...] = ()
+    row_matrix: pd.DataFrame | None = None
+    fills: tuple[GroupFill, ...] = ()
+    training_report: TrainingWindowReport | None = None
+    load_patch_reference: LoadPatchReference | None = None
+
+
+def evaluate_ladder_row(
+    candidate: Candidate,
+    *,
+    df: pd.DataFrame,
+    fold: Fold,
+    target_day: dt.date,
+    row1_row2_matrix: pd.DataFrame | None,
+    renewables_predictions: pd.DataFrame | None,
+    nwp_usable: bool,
+    nwp_unusable_reason: str | None,
+    last_train_day: dt.date,
+) -> RowEvaluation:
+    """Whether and how ``candidate`` is viable for ``target_day`` (spec 6.9
+    section 5.1 steps 5-8): NWP gate, row-specific matrix build (Similar-
+    Day-Patch for row 2, the gas-free builder for row 3, the shared matrix
+    for row 1), required-columns slice, the measured training-window
+    tolerance, and the target-day gap policy. Returns a result instead of
+    mutating a shared list or ``break``-ing, so both ``run_submission_for_
+    day`` (stops at the first ``ok=True``, rank order) and a backfill caller
+    (evaluates every row, unconditionally) can call this once per candidate
+    and decide for themselves what to do with the outcome -- never a second
+    walk-forward implementation.
+    """
+    if candidate.requires_nwp and not nwp_usable:
+        return RowEvaluation(
+            candidate, ok=False, reasons=(f"NWP unavailable: {nwp_unusable_reason}",)
+        )
+
+    reference: LoadPatchReference | None = None
+    if candidate.load_source == "similar_day":
+        reference = determine_load_patch_reference(target_day, df)
+        if reference is None:
+            return RowEvaluation(
+                candidate,
+                ok=False,
+                reasons=("no usable Similar-Day-Patch reference day found",),
+            )
+        assert row1_row2_matrix is not None and renewables_predictions is not None
+        row2_target_row = build_row2_target_row(
+            df, renewables_predictions, target_day, reference.reference_day
+        )
+        row_matrix = row1_row2_matrix.copy()
+        row_matrix.loc[fold.test_index, row2_target_row.columns] = row2_target_row.reindex(
+            fold.test_index
+        )
+    elif candidate.rank == 3:
+        try:
+            row_matrix, base_excluded = build_price_feature_matrix(
+                df, pd.DataFrame(), target_day, fold, builder=_base_builder
+            )
+        except ValueError as exc:
+            return RowEvaluation(candidate, ok=False, reasons=(str(exc),))
+        if target_day in base_excluded:
+            return RowEvaluation(
+                candidate, ok=False, reasons=(f"row 3's own build excluded {target_day}",)
+            )
+    else:
+        assert row1_row2_matrix is not None
+        row_matrix = row1_row2_matrix
+
+    required = candidate.required_columns()
+    row_matrix = row_matrix[sorted(required)]
+    training_matrix = row_matrix.loc[row_matrix.index.isin(fold.train_index)]
+    window_result, window_report = check_training_window(
+        training_matrix,
+        df["day_ahead_price"],
+        required,
+        must_reach=last_train_day,
+        window_days=PRICE_TRAIN_SPAN_DAYS,
+    )
+    if not window_result.ok:
+        return RowEvaluation(candidate, ok=False, reasons=window_result.reasons)
+
+    fill_plan = plan_target_day_fill(row_matrix.loc[fold.test_index], candidate)
+    if isinstance(fill_plan, PreflightResult):
+        return RowEvaluation(
+            candidate,
+            ok=False,
+            reasons=fill_plan.reasons,
+            missing_features=fill_plan.missing_features,
+        )
+    row_matrix = apply_forward_fill(row_matrix, fill_plan)
+
+    return RowEvaluation(
+        candidate,
+        ok=True,
+        row_matrix=row_matrix,
+        fills=fill_plan,
+        training_report=window_report,
+        load_patch_reference=reference,
+    )
+
+
+def compute_oos_rows_for_day(
+    df: pd.DataFrame,
+    renewables_predictions: pd.DataFrame,
+    prices_qh: pd.DataFrame,
+    target_day: dt.date,
+    *,
+    source: Literal["backfill", "daily"],
+    weather_root: Path = CACHE_ROOT,
+    only_rows: frozenset[str] | None = None,
+) -> list[OosStoreRow]:
+    """Every viable ladder row's own out-of-sample median forecast for
+    ``target_day`` (spec 7.1 section 2.2) -- the OOS-Store's counterpart to
+    ``run_submission_for_day``'s rank-ordered, break-at-first-success loop.
+    The OOS-Store needs EVERY row, not just whichever one would actually
+    be selected live, so this function never stops early.
+
+    Unlike ``run_submission_for_day`` (which calls ``run_renewables_step``
+    itself, once per day, since a single live run only ever needs one
+    day), this function takes ``renewables_predictions`` as an INPUT
+    rather than computing it: a real first backfill run measured that
+    re-running the renewables walk-forward independently per target day
+    costs roughly one minute per day (a ~90-fold refit_every=1 backtest
+    each time), which multiplies to several hours over the OOS-Store's
+    full backfill range for no benefit, since consecutive target days'
+    own 90+365-day lookback windows overlap almost completely.
+    ``scripts/oos_store_job.py`` instead calls ``run_renewables_backtest``
+    ONCE over the whole requested day range and passes the single
+    resulting table to every ``compute_oos_rows_for_day`` call -- the
+    SAME underlying walk-forward (``run_renewables_backtest`` itself,
+    unmodified), just called with a wider window and a different caller,
+    not a second implementation. The row1/row2 matrix build, ladder
+    assembly, and ``evaluate_ladder_row``/``fit_predict_expand``/
+    ``apply_partial_fill`` per candidate are still exactly
+    ``run_submission_for_day``'s own functions, shared once per day
+    across every row (spec section 2.3's "einmal je Tag rechnen und für
+    alle Zeilen wiederverwenden").
+
+    A row that is not viable for ``target_day`` (Check B, no NWP, no
+    training window) is simply absent from the return value -- an
+    expected, logged skip at the caller
+    (``scripts/oos_store_job.py``), never an exception for an ordinary
+    non-viability. ``only_rows`` restricts which candidates are even
+    attempted (default: every ``LADDER_ROW_NAMES`` entry) -- a daily top-up
+    that already has e.g. ``base`` stored for this day can ask for only
+    the other two, so ``evaluate_ladder_row``/``fit_predict_expand`` are
+    never re-run for a row ``scripts/oos_store_job.py::missing_target_days``
+    already found present.
+    """
+    only_rows = only_rows if only_rows is not None else LADDER_ROW_NAMES
+    check_global = check_a_global(target_day)
+    if not check_global.ok:
+        return []
+
+    nwp = check_a_nwp(target_day, weather_root=weather_root)
+
+    try:
+        fold = target_day_fold(df, target_day)
+    except ValueError:
+        return []
+
+    nwp_usable = nwp.ok
+    row1_row2_matrix: pd.DataFrame | None = None
+    nwp_group_columns: tuple[frozenset[str], frozenset[str]] | None = None
+    nwp_unusable_reason = "; ".join(nwp.reasons) if not nwp.ok else None
+    weather_run_init_utc = run_init_for_target_day(target_day) if nwp_usable else None
+
+    if nwp_usable:
+        try:
+            row1_row2_matrix, excluded = build_price_feature_matrix(
+                df, renewables_predictions, target_day, fold
+            )
+        except ValueError as exc:
+            nwp_usable = False
+            nwp_unusable_reason = str(exc)
+        else:
+            if target_day in excluded:
+                nwp_usable = False
+                nwp_unusable_reason = f"NWP reconstruction incomplete for {target_day} itself"
+            else:
+                nwp_group_columns = nwp_group_columns_for_day(
+                    target_day, df, renewables_predictions
+                )
+
+    ladder = build_ladder(target_day, df, nwp_group_columns=nwp_group_columns)
+    last_train_day = fold.train_index.tz_convert(LOCAL_TZ).normalize().max().date()
+    created_at_utc = _utcnow()
+
+    rows: list[OosStoreRow] = []
+    for candidate in ladder:
+        if candidate.name not in only_rows:
+            continue
+        evaluation = evaluate_ladder_row(
+            candidate,
+            df=df,
+            fold=fold,
+            target_day=target_day,
+            row1_row2_matrix=row1_row2_matrix,
+            renewables_predictions=renewables_predictions,
+            nwp_usable=nwp_usable,
+            nwp_unusable_reason=nwp_unusable_reason,
+            last_train_day=last_train_day,
+        )
+        if not evaluation.ok or evaluation.row_matrix is None:
+            continue
+
+        forecast, _, _ = fit_predict_expand(df, evaluation.row_matrix, fold, prices_qh)
+        if any(fill.action == "partial_fill" for fill in evaluation.fills):
+            persistence = persistence_forecast(
+                prices_qh["day_ahead_price"], pd.Timestamp(target_day, tz=LOCAL_TZ)
+            )
+            forecast = apply_partial_fill(forecast, persistence, evaluation.fills)
+
+        row_weather_run = weather_run_init_utc if candidate.requires_nwp else None
+        forecast_sorted = forecast.sort_index()
+        timestamps = pd.DatetimeIndex(forecast_sorted.index)
+        for timestamp, value in zip(timestamps, forecast_sorted.to_numpy(), strict=True):
+            rows.append(
+                OosStoreRow(
+                    target_day=target_day,
+                    timestamp_utc=timestamp,
+                    ladder_row=candidate.name,
+                    forecast=float(value),
+                    model_version=OOS_MODEL_VERSION,
+                    weather_run_init_utc=row_weather_run,
+                    source=source,
+                    created_at_utc=created_at_utc,
+                )
+            )
+    return rows
+
+
 def run_submission_for_day(
     df: pd.DataFrame,
     weather: pd.DataFrame,
@@ -846,110 +1092,34 @@ def run_submission_for_day(
     training_report = None
 
     for candidate in ladder:
-        if candidate.requires_nwp and not nwp_usable:
-            candidates_evaluated.append(
-                {
-                    "name": candidate.name,
-                    "rank": candidate.rank,
-                    "ok": False,
-                    "reasons": (f"NWP unavailable: {nwp_unusable_reason}",),
-                }
-            )
-            continue
-
-        reference: LoadPatchReference | None = None
-        if candidate.load_source == "similar_day":
-            reference = determine_load_patch_reference(target_day, df)
-            if reference is None:
-                candidates_evaluated.append(
-                    {
-                        "name": candidate.name,
-                        "rank": candidate.rank,
-                        "ok": False,
-                        "reasons": ("no usable Similar-Day-Patch reference day found",),
-                    }
-                )
-                continue
-            assert row1_row2_matrix is not None and renewables_predictions is not None
-            row2_target_row = build_row2_target_row(
-                df, renewables_predictions, target_day, reference.reference_day
-            )
-            row_matrix = row1_row2_matrix.copy()
-            row_matrix.loc[fold.test_index, row2_target_row.columns] = row2_target_row.reindex(
-                fold.test_index
-            )
-        elif candidate.rank == 3:
-            try:
-                row_matrix, base_excluded = build_price_feature_matrix(
-                    df, pd.DataFrame(), target_day, fold, builder=_base_builder
-                )
-            except ValueError as exc:
-                candidates_evaluated.append(
-                    {
-                        "name": candidate.name,
-                        "rank": candidate.rank,
-                        "ok": False,
-                        "reasons": (str(exc),),
-                    }
-                )
-                continue
-            if target_day in base_excluded:
-                candidates_evaluated.append(
-                    {
-                        "name": candidate.name,
-                        "rank": candidate.rank,
-                        "ok": False,
-                        "reasons": (f"row 3's own build excluded {target_day}",),
-                    }
-                )
-                continue
-        else:
-            assert row1_row2_matrix is not None
-            row_matrix = row1_row2_matrix
-
-        required = candidate.required_columns()
-        row_matrix = row_matrix[sorted(required)]
-        training_matrix = row_matrix.loc[row_matrix.index.isin(fold.train_index)]
-        window_result, window_report = check_training_window(
-            training_matrix,
-            df["day_ahead_price"],
-            required,
-            must_reach=last_train_day,
-            window_days=PRICE_TRAIN_SPAN_DAYS,
+        evaluation = evaluate_ladder_row(
+            candidate,
+            df=df,
+            fold=fold,
+            target_day=target_day,
+            row1_row2_matrix=row1_row2_matrix,
+            renewables_predictions=renewables_predictions,
+            nwp_usable=nwp_usable,
+            nwp_unusable_reason=nwp_unusable_reason,
+            last_train_day=last_train_day,
         )
-        if not window_result.ok:
-            candidates_evaluated.append(
-                {
-                    "name": candidate.name,
-                    "rank": candidate.rank,
-                    "ok": False,
-                    "reasons": window_result.reasons,
-                }
-            )
+        entry: dict[str, Any] = {
+            "name": candidate.name,
+            "rank": candidate.rank,
+            "ok": evaluation.ok,
+            "reasons": evaluation.reasons,
+        }
+        if evaluation.missing_features:
+            entry["missing_features"] = evaluation.missing_features
+        candidates_evaluated.append(entry)
+        if not evaluation.ok:
             continue
-
-        fill_plan = plan_target_day_fill(row_matrix.loc[fold.test_index], candidate)
-        if isinstance(fill_plan, PreflightResult):
-            candidates_evaluated.append(
-                {
-                    "name": candidate.name,
-                    "rank": candidate.rank,
-                    "ok": False,
-                    "reasons": fill_plan.reasons,
-                    "missing_features": fill_plan.missing_features,
-                }
-            )
-            continue
-        row_matrix = apply_forward_fill(row_matrix, fill_plan)
 
         selected = candidate
-        selected_matrix = row_matrix
-        selected_fills = fill_plan
-        training_report = window_report
-        load_patch_reference = reference
-        candidates_evaluated.append(
-            {"name": candidate.name, "rank": candidate.rank, "ok": True, "reasons": ()}
-        )
+        selected_matrix = evaluation.row_matrix
+        selected_fills = evaluation.fills
+        training_report = evaluation.training_report
+        load_patch_reference = evaluation.load_patch_reference
         break
 
     training_window_fields: dict[str, Any] = {}
