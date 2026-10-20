@@ -178,9 +178,7 @@ def test_oos_store_job_slot_does_not_collide_with_any_existing_slot() -> None:
     slots = _parse_slots()
     oos_store_slots = [s for s in slots if s["workflow"] == "oos_store_job.yml"]
     other_berlin_slots = [
-        s
-        for s in slots
-        if s["time_zone"] != "utc" and s["workflow"] != "oos_store_job.yml"
+        s for s in slots if s["time_zone"] != "utc" and s["workflow"] != "oos_store_job.yml"
     ]
 
     assert oos_store_slots, "expected at least one oos_store_job.yml slot in SLOTS"
