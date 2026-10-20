@@ -22,3 +22,5 @@ target_day,ladder_row,n_matched_timestamps,mean_abs_diff,max_abs_diff,note
 2026-10-17,core_gas,96,4.8516922974608825,9.775857566057311,
 2026-10-18,core_gas,96,3.192494147485629,11.063325262413798,
 2026-10-19,core_gas,96,2.5538766490476275,6.13613085128884,
+2026-10-20,core_gas,0,,,no OOS-store row for this ladder_row/day
+2026-10-21,core_gas,0,,,no OOS-store row for this ladder_row/day
