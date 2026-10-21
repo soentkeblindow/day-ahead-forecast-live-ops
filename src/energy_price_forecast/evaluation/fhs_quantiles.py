@@ -30,6 +30,20 @@ from .rearrangement import rearrange_quantiles
 
 DEFAULT_LEVELS: tuple[float, ...] = (0.025, 0.25, 0.5, 0.75, 0.975)
 
+# Sprint 7.1 Teil B follow-up measurement (scripts/check_fhs_pool_gap_
+# sensitivity.py, docs/sprint7_step7_1_log.md section 9): a real finding
+# showed a single missing calendar day inside the pool window (a known
+# weather defect) blocks the pool for every subsequent day until the
+# window rolls past it -- window_days (e.g. 180) days of silence from
+# ONE bad day. Measured sensitivity is low and grows smoothly with k (no
+# cliff); gap position barely matters (pool_by_day has no recency
+# weighting). 14 is comfortably above the real case (k=1, ~0.1% WIS
+# change) and comfortably below where real degradation starts (k>=20,
+# concentrated in trailing-edge coverage_95) -- the same "stay
+# conservative, don't go to the measured edge" convention
+# arena/preflight.py's MAX_TRAINING_EDGE_AGE_DAYS=7 already follows.
+POOL_GAP_TOLERANCE_DAYS: int = 14
+
 
 def compute_fhs_quantiles_for_row(
     forecast: pd.Series,
@@ -39,6 +53,7 @@ def compute_fhs_quantiles_for_row(
     config: ConformalConfig,
     levels: tuple[float, ...] = DEFAULT_LEVELS,
     periods_per_day: int = 96,
+    pool_gap_tolerance_days: int = POOL_GAP_TOLERANCE_DAYS,
 ) -> dict[float, pd.Series]:
     """FHS quantiles for one ladder row over the full range covered by
     ``forecast``/``realized_price``'s common index.
@@ -53,13 +68,14 @@ def compute_fhs_quantiles_for_row(
     realized_price) index, monotonically increasing per timestamp
     (``rearrangement.rearrange_quantiles``). A timestamp whose day's pool
     is too small (``fhs_pool.pool_by_day``'s own ``min_pool_days`` gate,
-    called here with ``min_pool_days=window_days`` -- a "full pool"
-    means a pool covering the entire requested window) or whose sigma is
-    not yet calibrated (``conformal.quarterhour_sigma``) is NaN at every
-    level, never partially -- both gates share one sigma series and one
-    per-day pool, so a timestamp's NaN-ness never differs by level
-    (safe for ``rearrange_quantiles``, which would otherwise risk
-    misplacing a real value against a NaN one in the same row).
+    called here with ``min_pool_days=window_days - pool_gap_tolerance_
+    days`` -- a measured tolerance, not a literally-full-pool requirement,
+    see ``POOL_GAP_TOLERANCE_DAYS``) or whose sigma is not yet calibrated
+    (``conformal.quarterhour_sigma``) is NaN at every level, never
+    partially -- both gates share one sigma series and one per-day pool,
+    so a timestamp's NaN-ness never differs by level (safe for
+    ``rearrange_quantiles``, which would otherwise risk misplacing a real
+    value against a NaN one in the same row).
     """
     if 0.5 not in levels:
         raise ValueError("compute_fhs_quantiles_for_row requires a median (0.5) level")
@@ -80,7 +96,7 @@ def compute_fhs_quantiles_for_row(
         residuals,
         window_days=window_days,
         embargo_days=config.embargo_days,
-        min_pool_days=window_days,
+        min_pool_days=window_days - pool_gap_tolerance_days,
         periods_per_day=periods_per_day,
     )
 

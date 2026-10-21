@@ -3,7 +3,10 @@ import pandas as pd
 import pytest
 
 from energy_price_forecast.evaluation.config import ConformalConfig
-from energy_price_forecast.evaluation.fhs_quantiles import compute_fhs_quantiles_for_row
+from energy_price_forecast.evaluation.fhs_quantiles import (
+    POOL_GAP_TOLERANCE_DAYS,
+    compute_fhs_quantiles_for_row,
+)
 
 _LEVELS = (0.025, 0.25, 0.5, 0.75, 0.975)
 
@@ -63,6 +66,58 @@ def test_early_history_is_nan_at_every_level_consistently() -> None:
     assert ((is_na.sum(axis=1) == 0) | (is_na.sum(axis=1) == len(_LEVELS))).all()
     # 30 days never reaches a 90-day full pool -> entirely NaN
     assert is_na.all().all()
+
+
+def test_pool_gap_tolerance_survives_a_gap_up_to_the_configured_size() -> None:
+    """A real gap of exactly POOL_GAP_TOLERANCE_DAYS inside the pool
+    window must not blank out the quantiles -- the 2026-10-21 measurement
+    (docs/sprint7_step7_1_log.md section 9) this constant is based on."""
+    window_days = 90
+    index = _quarterhourly_utc("2020-12-31 23:00", 96 * (window_days + 40))
+    rng = np.random.default_rng(10)
+    price = pd.Series(50 + rng.normal(0, 5, len(index)), index=index)
+    forecast = pd.Series(50.0, index=index)
+
+    gap_start = index[96 * 60]
+    gap_end = gap_start + pd.Timedelta(days=POOL_GAP_TOLERANCE_DAYS)
+    price_gapped = price.copy()
+    price_gapped.loc[(price_gapped.index >= gap_start) & (price_gapped.index < gap_end)] = float(
+        "nan"
+    )
+
+    quantiles = compute_fhs_quantiles_for_row(
+        forecast, price_gapped, window_days=window_days, config=_config(window_days)
+    )
+    # the last 5 days are comfortably past both the gap and the (reduced)
+    # pool requirement.
+    tail = quantiles[0.5].iloc[-96 * 5 :]
+    assert tail.notna().all()
+
+
+def test_pool_gap_larger_than_the_tolerance_still_blanks_the_pool() -> None:
+    """The tolerance has a real boundary -- it is not unconditionally
+    permissive."""
+    window_days = 90
+    index = _quarterhourly_utc("2020-12-31 23:00", 96 * (window_days + 40))
+    rng = np.random.default_rng(11)
+    price = pd.Series(50 + rng.normal(0, 5, len(index)), index=index)
+    forecast = pd.Series(50.0, index=index)
+
+    gap_start = index[96 * 60]
+    gap_end = gap_start + pd.Timedelta(days=POOL_GAP_TOLERANCE_DAYS + 5)
+    price_gapped = price.copy()
+    price_gapped.loc[(price_gapped.index >= gap_start) & (price_gapped.index < gap_end)] = float(
+        "nan"
+    )
+
+    quantiles = compute_fhs_quantiles_for_row(
+        forecast, price_gapped, window_days=window_days, config=_config(window_days)
+    )
+    # the last 5 days: fully in the rolling regime (window_days + 40
+    # total history) and the gap (days 60-79) still sits inside their
+    # own ~90-day trailing window.
+    tail = quantiles[0.5].iloc[-96 * 5 :]
+    assert tail.isna().all()
 
 
 def test_leakage_future_realized_price_never_changes_an_earlier_days_quantiles() -> None:
