@@ -9,7 +9,7 @@ Daily, unattended day-ahead electricity price forecasting for Germany (DE-LU), s
 
 ## What this is
 
-A day-ahead model is easy to make look good in a backtest: the information actually available at the moment a real forecast has to be made is easy to get wrong by accident. This repository runs the forecast live, every day, against the Energy Arena's gate-closure deadline, which prospectively evaluates whatever was submitted before the deadline — not a replay with hindsight. Model development, calibration, and risk-side validation (VaR/ES backtesting, quantile reliability) live in the sibling project, [`energy-price-forecast-risk-validation`](https://github.com/soentkeblindow/energy-price-forecast-risk-validation); this repository is the production pipeline built on top of it: live data, a fallback ladder for when an input is late or missing, and the submission itself.
+A day-ahead model is easy to make look good in a backtest: the information actually available at the moment a real forecast has to be made is easy to get wrong by accident. This repository runs the forecast live, every day, against the Energy Arena's gate-closure deadline, which prospectively evaluates whatever was submitted before the deadline — not a replay with hindsight. Research lives in the sibling project, [`energy-price-forecast-risk-validation`](https://github.com/soentkeblindow/energy-price-forecast-risk-validation): the hourly price model with its calibration and VaR/ES backtesting, the weather model, and the backtests and diagnostics of the live model. This repository is the production pipeline built on top of them: live data, a fallback ladder for when an input is late or missing, and the submission itself. It keeps its own copy of the model code on purpose, so that research work there can never change what runs here by accident; improvements are ported over deliberately.
 
 ## Current status
 
@@ -22,6 +22,20 @@ As of 2026-10-21, [Energy Arena leaderboard](https://energy-arena.org/leaderboar
 | D-1, 12:00 (gate closure) | 28.79 | 7 | 28 |
 
 All three are well ahead of the Arena's own persistence baseline — 45.27 EUR/MWh measured historically over the full backtest window (see [Fallback ladder](#fallback-ladder) below), 53.4 EUR/MWh over this same rolling 30-day window — and not at the top of the board. A **30-day rolling window** is far more stable than the 7-day snapshot this section previously reported, but it still moves daily — read this as a status check, **not a final result**.
+
+**Operational record**, delivery days 19 Sep to 22 Oct 2026 (from [`logs/submissions.jsonl`](logs/submissions.jsonl)):
+
+| | Delivery days |
+|---|---|
+| Submitted | 32 of 34 |
+| ... with the single model used before the fallback ladder (until 27 Sep) | 8 |
+| ... with ladder rank 1 `core_gas` (since 29 Sep) | 23 |
+| ... with ladder rank 2 `core_gas_loadpatch` | 1 |
+| Not submitted | 2: 21 Sep, a deliberate silence after a real ENTSO-E data gap (the run refused to submit on incomplete inputs); 28 Sep, a `ModuleNotFoundError` in production: after a change, a workflow script could not be imported under the runner's real `sys.path`, which the tests did not cover. Closed by [`test_workflow_script_entrypoints.py`](#tests-worth-reading). |
+
+On every ladder day, rank 2 was submitted first, because the morning slots run before the ENTSO-E load forecast is published. On 23 of 24 days a later rank-1 run replaced it, which is exactly what the ladder and its downgrade protection are for.
+
+**Known issue since mid-October 2026:** the forecast gets the daily shape right but under-forecasts the price level. The main cause is the gas price rising above the range of the 90-day training window, which a tree model cannot extrapolate. The analysis, a candidate fix and its limits are in the research repository: [autumn 2026 findings](https://github.com/soentkeblindow/energy-price-forecast-risk-validation/blob/main/outputs/autumn_2026_findings.md).
 
 ## How it works
 
@@ -40,6 +54,8 @@ flowchart LR
 ## The information-set problem
 
 The day-ahead auction closes at 12:00 local time, which is also the Arena's submission deadline, but the TSOs' own wind/solar forecasts (ENTSO-E 14.1.D) aren't published until roughly 18:00 the day before — after the deadline that matters. Many backtests use these series as features anyway, which quietly assumes information a live system never actually has (a point the [platform paper](#citation) itself raises). This pipeline instead reconstructs wind, solar, and residual load from ECMWF weather model data (a fixed 00-UTC run, read out at the lead times actually available before gate closure), at a measured cost of about 1.3 EUR/MWh RMSE against an upper-bound model trained on the real TSO forecasts.
+
+The renewables models predict the **capacity factor** (generation divided by installed capacity), not megawatts. Installed capacity comes from the public Energy-Charts registry, month by month (end of September 2026: 130.4 GW solar, 71.3 GW onshore wind, 11.4 GW offshore wind), and is extrapolated at most four months past the last published value. The model therefore does not have to learn the steady capacity build-out from 365 days of history: today's weather is scaled by today's fleet. Each live run logs how many days the capacity table remains valid and warns 14 days before it expires. Grid points, features and accuracy: [weather model in the research repository](https://github.com/soentkeblindow/energy-price-forecast-risk-validation#weather-model-wind-and-solar-before-gate-closure).
 
 ## Fallback ladder
 
@@ -92,6 +108,9 @@ In 2026 22nd International Conference on the European Energy Market (EEM), pp. 1
 https://doi.org/10.1109/EEM68581.2026.11589800
 ```
 
+<details>
+<summary>BibTeX</summary>
+
 ```bibtex
 @inproceedings{kleinebrahm2026energyarena,
   author    = {Kleinebrahm, Max and Berrisch, Jonathan and Eiser, Philipp and Fichtner, Wolf and Hagenmeyer, Veit and Hertel, Matthias and Koster, Nils and Lerch, Sebastian and Mikut, Ralf and Priesmann, Jan and Schienle, Melanie and Sch{\"a}fer, Benjamin and Weinand, Jann and Ziel, Florian},
@@ -102,6 +121,8 @@ https://doi.org/10.1109/EEM68581.2026.11589800
   doi       = {10.1109/EEM68581.2026.11589800}
 }
 ```
+
+</details>
 
 A preprint is available at [arXiv:2604.24705](https://arxiv.org/abs/2604.24705).
 
