@@ -10,6 +10,7 @@ the definition (the Arena's stated persistence rule, spec 6.4 section 2.1).
 
 import datetime as dt
 
+import numpy as np
 import pandas as pd
 
 
@@ -81,6 +82,65 @@ def persistence_forecast(
 
     values = [lookup[k] for k in keys]
     return pd.Series(values, index=target_index, name="baseline")
+
+
+def baseline_quantiles(
+    prices_qh: pd.Series,
+    target_day: pd.Timestamp,
+    levels: tuple[float, ...],
+    *,
+    lookback_days: int = 10,
+    tz: str = "Europe/Berlin",
+) -> dict[float, pd.Series]:
+    """Replicate the Energy-Arena's quantile-track baseline (Sprint 7.1
+    Teil B, spec section 3.1): "empirische Quantile der letzten zehn Tage".
+    Separate from ``persistence_forecast`` (the point-track baseline, D-1
+    only) -- a different platform rule for a different challenge, not a
+    generalisation of it. Used only for the Teil B report's WIS comparison
+    column, never for submission.
+
+    For each quarter-hour-of-day wall-clock slot in ``target_day``, pools
+    the realised prices at that SAME slot over the preceding
+    ``lookback_days`` calendar days, then returns the empirical
+    ``levels``-quantiles of that pool -- mirroring ``persistence_forecast``'s
+    wall-clock alignment (DST handled the same way: a repeated local hour
+    on a fall-back target day reads the same pooled quantile for both
+    occurrences; a lookback day that is itself a spring-forward day simply
+    contributes no sample for the skipped wall-clock slot, with no special
+    case needed since pooling only ever adds whatever slots a day
+    actually has).
+
+    Raises if any required realised price is missing -- the baseline is
+    never silently partial, same contract as ``persistence_forecast``.
+    """
+    target_date = pd.Timestamp(target_day).date()
+    target_index = _local_day_index(target_date, tz)
+    target_local = target_index.tz_convert(tz)
+    target_keys = list(zip(target_local.hour, target_local.minute, strict=True))
+
+    pooled: dict[tuple[int, int], list[float]] = {k: [] for k in set(target_keys)}
+    for days_back in range(1, lookback_days + 1):
+        day = target_date - dt.timedelta(days=days_back)
+        day_index = _local_day_index(day, tz)
+        day_values = prices_qh.reindex(day_index)
+        if day_values.isna().any():
+            missing = day_index[day_values.isna()]
+            raise ValueError(
+                f"Missing realised price(s) for {len(missing)} quarter-hour(s) on {day} "
+                f"-- cannot build the quantile baseline for {target_date}. "
+                f"First missing timestamp: {missing[0]}."
+            )
+        day_local = day_index.tz_convert(tz)
+        day_keys = zip(day_local.hour, day_local.minute, strict=True)
+        for key, value in zip(day_keys, day_values.to_numpy(), strict=True):
+            if key in pooled:
+                pooled[key].append(value)
+
+    result: dict[float, pd.Series] = {}
+    for level in levels:
+        values = [float(np.quantile(pooled[key], level)) for key in target_keys]
+        result[level] = pd.Series(values, index=target_index, name=f"baseline_q{level:.3f}")
+    return result
 
 
 def _local_day_index(date: dt.date, tz: str) -> pd.DatetimeIndex:

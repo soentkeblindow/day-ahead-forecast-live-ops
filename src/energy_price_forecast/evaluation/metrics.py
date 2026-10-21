@@ -55,6 +55,32 @@ def pinball(y_true: pd.Series, y_pred: pd.Series, alpha: float) -> float:
     return float(np.maximum(alpha * err, (alpha - 1.0) * err).mean())
 
 
+def weighted_interval_score(y_true: pd.Series, preds: dict[float, pd.Series]) -> float:
+    """Weighted Interval Score (WIS, Bracher et al. 2021) -- the Energy
+    Arena's own metric for the quantile track (Challenge 8, spec section
+    3.1, Sprint 7.1 Teil B).
+
+    ``preds`` must map a set of levels forming symmetric central-interval
+    pairs around the median (e.g. the spec's five levels 0.025/0.25/0.5/
+    0.75/0.975: a 95% interval, a 50% interval, and the median) to their
+    prediction series.
+
+    Exact identity, derived rather than assumed: for M such levels,
+    WIS = (2 / M) * mean over levels of ``pinball``. Expanding the
+    standard interval-score definition ``IS_alpha = (u-l) +
+    (2/alpha)*max(l-y,0) + (2/alpha)*max(y-u,0)`` into pinball-loss pairs
+    per interval, plus ``pinball_0.5(y, m) == 0.5*|y-m|`` for the median
+    term, collapses the weighted sum ``0.5*|y-m| + sum_k (alpha_k/2)*IS_k``
+    exactly onto ``sum_levels pinball_level``. Built on the existing
+    ``pinball`` rather than a second, independent interval-score
+    implementation that could silently drift from it.
+    """
+    levels = sorted(preds)
+    if 0.5 not in levels:
+        raise ValueError("weighted_interval_score requires a median (0.5) level")
+    return float(np.mean([2.0 * pinball(y_true, preds[a], a) for a in levels]))
+
+
 def quantile_coverage(y_true: pd.Series, y_pred: pd.Series) -> float:
     """Empirical one-sided coverage P(y_true <= q_pred) for an alpha-quantile.
 

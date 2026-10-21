@@ -15,6 +15,7 @@ from energy_price_forecast.evaluation.metrics import (
     summarise,
     summarise_quantiles,
     wape,
+    weighted_interval_score,
 )
 
 # ---------------------------------------------------------------------------
@@ -208,6 +209,49 @@ def test_pinball_nan_dropped() -> None:
     q = _series(8.0, 99.0, 12.0)
     # Only rows 0 and 2: losses 1.8 and 0.2, mean=1.0
     assert pinball(y, q, 0.9) == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
+# weighted_interval_score
+# ---------------------------------------------------------------------------
+
+
+def test_weighted_interval_score_matches_hand_computed_classic_interval_score() -> None:
+    """y=10 falls inside both the 95% interval [5,15] and the 50% interval
+    [8,12] (no violations) -- the classic weighted-interval-score formula
+    (Bracher et al. 2021) gives, by hand:
+
+    IS_0.05 = u-l = 10, weight 0.025 -> 0.25
+    IS_0.5  = u-l = 4,  weight 0.25  -> 1.0
+    median term 0.5*|10-10| = 0
+    WIS = (0.25 + 1.0 + 0) / (K=2 + 0.5) = 1.25 / 2.5 = 0.5
+
+    Checked independently of the pinball-average identity the
+    implementation actually uses, so this is a real cross-check, not a
+    circular re-statement of the code under test.
+    """
+    y = _series(10.0)
+    preds = {
+        0.025: _series(5.0),
+        0.25: _series(8.0),
+        0.5: _series(10.0),
+        0.75: _series(12.0),
+        0.975: _series(15.0),
+    }
+    assert weighted_interval_score(y, preds) == pytest.approx(0.5)
+
+
+def test_weighted_interval_score_zero_for_a_perfect_point_forecast() -> None:
+    y = _series(10.0, 20.0, 30.0)
+    preds = {a: y.copy() for a in (0.025, 0.25, 0.5, 0.75, 0.975)}
+    assert weighted_interval_score(y, preds) == pytest.approx(0.0)
+
+
+def test_weighted_interval_score_requires_a_median_level() -> None:
+    y = _series(10.0)
+    preds = {0.25: _series(8.0), 0.75: _series(12.0)}
+    with pytest.raises(ValueError, match="0.5"):
+        weighted_interval_score(y, preds)
 
 
 # ---------------------------------------------------------------------------

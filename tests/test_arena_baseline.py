@@ -10,7 +10,11 @@ import datetime as dt
 import pandas as pd
 import pytest
 
-from energy_price_forecast.models.arena_baseline import _local_day_index, persistence_forecast
+from energy_price_forecast.models.arena_baseline import (
+    _local_day_index,
+    baseline_quantiles,
+    persistence_forecast,
+)
 
 _TZ = "Europe/Berlin"
 
@@ -109,6 +113,72 @@ def test_missing_d1_value_raises() -> None:
 
     with pytest.raises(ValueError, match=r"2026-06-14"):
         persistence_forecast(prices, pd.Timestamp(target_date))
+
+
+def _constant_day_prices(date: dt.date, value: float) -> pd.Series:
+    idx = _local_day_index(date, _TZ)
+    return pd.Series(value, index=idx, dtype=float)
+
+
+def _ten_lookback_days_with_values_1_to_10(target_date: dt.date) -> pd.Series:
+    """Ten preceding calendar days, each internally constant at a distinct
+    value 1..10 -- every wall-clock slot's 10-day pool is then exactly
+    {1, 2, ..., 10} regardless of which slot it is, making the expected
+    quantiles pure arithmetic on that fixed set."""
+    return pd.concat(
+        [
+            _constant_day_prices(target_date - dt.timedelta(days=days_back), float(days_back))
+            for days_back in range(1, 11)
+        ]
+    )
+
+
+# ---------------------------------------------------------------------------
+# baseline_quantiles: the Energy-Arena's quantile-track baseline
+# ---------------------------------------------------------------------------
+
+
+def test_baseline_quantiles_normal_day_matches_hand_computed_example() -> None:
+    target_date = dt.date(2026, 6, 15)
+    prices = _ten_lookback_days_with_values_1_to_10(target_date)
+
+    result = baseline_quantiles(
+        prices, pd.Timestamp(target_date), levels=(0.0, 0.5, 1.0), lookback_days=10
+    )
+
+    assert set(result) == {0.0, 0.5, 1.0}
+    for level in result:
+        assert len(result[level]) == 96
+    # every slot's pool is exactly {1..10} -> min=1, median=5.5, max=10
+    assert (result[0.0] == 1.0).all()
+    assert (result[0.5] == 5.5).all()
+    assert (result[1.0] == 10.0).all()
+
+
+def test_baseline_quantiles_fall_back_day_has_100_slots() -> None:
+    target_date = dt.date(2026, 10, 25)  # DE/LU fall back -- none of the 10
+    # preceding lookback days (10-15 through 10-24) is itself a DST day.
+    prices = _ten_lookback_days_with_values_1_to_10(target_date)
+
+    result = baseline_quantiles(
+        prices, pd.Timestamp(target_date), levels=(0.0, 0.5, 1.0), lookback_days=10
+    )
+
+    for level in result:
+        assert len(result[level]) == 100
+        assert (result[level].notna()).all()
+    # both occurrences of the doubled local hour read the same pooled
+    # quantile, same convention as persistence_forecast's DST handling.
+    assert result[0.5].iloc[8:12].to_numpy().tolist() == result[0.5].iloc[12:16].to_numpy().tolist()
+
+
+def test_baseline_quantiles_missing_lookback_value_raises() -> None:
+    target_date = dt.date(2026, 6, 15)
+    prices = _ten_lookback_days_with_values_1_to_10(target_date)
+    prices = prices.drop(prices.index[10])  # a gap on D-1 (2026-06-14, days_back=1)
+
+    with pytest.raises(ValueError, match=r"2026-06-14"):
+        baseline_quantiles(prices, pd.Timestamp(target_date), levels=(0.5,), lookback_days=10)
 
 
 def test_no_leakage_past_end_of_d_minus_1() -> None:

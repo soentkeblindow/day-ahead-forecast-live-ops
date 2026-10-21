@@ -218,6 +218,94 @@ def hourly_sigma(
     return sigma
 
 
+def _calibration_state_for_periods(
+    day: pd.Timestamp,
+    q50: pd.Series,
+    y_true: pd.Series,
+    *,
+    config: ConformalConfig,
+    window_days: int,
+    min_calibration_periods: int,
+) -> _CalibrationState:
+    """Quarter-hourly sibling of ``_calibration_state`` (Sprint 7.1 Teil B,
+    spec section 3.2/4.2) -- gates on ``min_calibration_periods`` (an
+    explicit period count) instead of ``config.min_calibration_hours``
+    directly, since a quarter-hourly calibration window has ~4x as many
+    raw periods as an hourly one over the same number of days.
+    ``quarterhour_sigma`` derives ``min_calibration_periods`` from
+    ``config.min_calibration_hours`` reinterpreted as DAYS
+    (``config.min_calibration_hours // 24``) times the real periods-per-day
+    -- so the minimum stays "N days", not "N periods", regardless of
+    resolution. A separate function rather than a parameter added to
+    ``_calibration_state`` because spec section 4.2 requires the existing
+    hourly path to stay byte-for-byte unchanged.
+    """
+    cal_idx = calibration_window(
+        day,
+        pd.DatetimeIndex(y_true.index),
+        window_days=window_days,
+        embargo_days=config.embargo_days,
+    )
+    n_cal = len(cal_idx)
+    if n_cal < min_calibration_periods:
+        return _CalibrationState(cal_idx, None, None, 0.0, True, n_cal)
+    cal_y = y_true.loc[cal_idx]
+    cal_med = q50.loc[cal_idx]
+    floor = config.sigma_floor_fraction * float(cal_y.std(ddof=1))
+    return _CalibrationState(cal_idx, cal_med, cal_y, floor, False, n_cal)
+
+
+def quarterhour_sigma(
+    y_true: pd.Series,
+    q50_raw: pd.Series,
+    *,
+    config: ConformalConfig,
+    window_days: int,
+    periods_per_day: int = 96,
+) -> pd.Series:
+    """Quarter-hourly sibling of ``hourly_sigma`` (Sprint 7.1 Teil B, spec
+    section 3.2) -- added alongside it, not a modification: ``hourly_sigma``
+    and ``ConformalConfig`` stay untouched (spec section 4.2).
+
+    Same day-iteration / recompute-cadence structure as ``hourly_sigma``,
+    reusing the unchanged ``local_scale``. The one real difference is the
+    minimum-calibration gate: ``config.min_calibration_hours`` (``24 * 14``
+    by construction, i.e. "14 days" expressed as hours) is reinterpreted as
+    DAYS -- ``(config.min_calibration_hours // 24) * periods_per_day`` --
+    rather than used as a raw period count, so the minimum stays "14 days"
+    regardless of how many periods a day actually has (spec section 3.2's
+    "vierfach zu frueh" fix: a flat period-count reuse of the hourly
+    constant would calibrate a quarter-hourly day after only ~3.5 days of
+    history).
+    """
+    min_calibration_periods = (config.min_calibration_hours // 24) * periods_per_day
+    test_index = pd.DatetimeIndex(q50_raw.index)
+    local_days = test_index.tz_convert(LOCAL_TZ).normalize()
+    delivery_days = pd.DatetimeIndex(sorted(pd.unique(local_days)))
+
+    sigma = pd.Series(float("nan"), index=test_index)
+    state: _CalibrationState | None = None
+    for day_num, day in enumerate(delivery_days):
+        if day_num % config.recompute_cadence_days == 0:
+            state = _calibration_state_for_periods(
+                day,
+                q50_raw,
+                y_true,
+                config=config,
+                window_days=window_days,
+                min_calibration_periods=min_calibration_periods,
+            )
+        assert state is not None  # day_num == 0 always recomputes
+        mask = local_days == day
+        d_idx = test_index[mask]
+        if state.uncalibrated or state.cal_med is None or state.cal_y is None:
+            continue
+        sigma.loc[mask] = local_scale(
+            q50_raw.loc[d_idx], state.cal_med, state.cal_y, k=config.n_neighbors, floor=state.floor
+        ).to_numpy()
+    return sigma
+
+
 def scaled_conformal_calibrate(
     y_true: pd.Series,
     preds: dict[float, pd.Series],

@@ -8,12 +8,17 @@ from energy_price_forecast.evaluation.conformal import (
     hourly_sigma,
     local_scale,
     quantile_shift,
+    quarterhour_sigma,
     scaled_conformal_calibrate,
 )
 
 
 def _hourly_utc(start: str, periods: int) -> pd.DatetimeIndex:
     return pd.date_range(start, periods=periods, freq="h", tz="UTC")
+
+
+def _quarterhourly_utc(start: str, periods: int) -> pd.DatetimeIndex:
+    return pd.date_range(start, periods=periods, freq="15min", tz="UTC")
 
 
 # ---------------------------------------------------------------------------
@@ -473,3 +478,95 @@ def test_hourly_sigma_constant_within_cadence_group_and_nan_when_uncalibrated() 
     assert len(values_a) == 1
     assert len(values_b) == 1
     assert values_a != values_b
+
+
+# ---------------------------------------------------------------------------
+# quarterhour_sigma: quarter-hourly sibling of hourly_sigma (Sprint 7.1 Teil B)
+# ---------------------------------------------------------------------------
+
+
+def test_quarterhour_sigma_constant_within_cadence_group_and_nan_when_uncalibrated() -> None:
+    index = _quarterhourly_utc("2021-01-01", 96 * 15)
+    rng = np.random.default_rng(6)
+    y = pd.Series(50 + rng.normal(0, 5, len(index)), index=index)
+    q50 = pd.Series(50.0, index=index)  # constant query level: isolates cadence effects
+    config = ConformalConfig(
+        window_days=10,
+        embargo_days=1,
+        n_neighbors=50,
+        sigma_floor_fraction=0.0,
+        recompute_cadence_days=3,
+        min_calibration_hours=24,  # "1 day" minimum
+    )
+
+    sigma = quarterhour_sigma(y, q50, config=config, window_days=10)
+    local_days = _local_days(index)
+    delivery_days = pd.DatetimeIndex(sorted(pd.unique(local_days)))
+
+    # day_num 0: zero prior history -> always uncalibrated regardless of
+    # threshold; day_num 1-2 reuse that same (uncalibrated) recompute.
+    for day in delivery_days[:3]:
+        assert sigma.loc[local_days == day].isna().all()
+
+    # groups sharing one recompute (day_num % 3 == 0): constant within, and
+    # differs from the next group once the calibration window has shifted.
+    group_a_days = delivery_days[3:6]
+    group_b_days = delivery_days[6:9]
+    values_a = {float(sigma.loc[local_days == d].iloc[0]) for d in group_a_days}
+    values_b = {float(sigma.loc[local_days == d].iloc[0]) for d in group_b_days}
+    assert len(values_a) == 1
+    assert len(values_b) == 1
+    assert values_a != values_b
+
+
+def test_quarterhour_sigma_min_calibration_reinterpreted_as_days_not_periods() -> None:
+    """config.min_calibration_hours=24*5 means 5 DAYS for quarter-hourly
+    data (480 periods), not 5 raw periods and not a naive 5*24=120-period
+    reuse of the hourly constant -- the "vierfach zu frueh" fix spec
+    section 3.2 calls for."""
+    # start aligned to Europe/Berlin local midnight (UTC+1 in January) so
+    # every local delivery day spans exactly 96 periods of this UTC index.
+    index = _quarterhourly_utc("2020-12-31 23:00", 96 * 10)
+    y = pd.Series(50.0, index=index)
+    q50 = pd.Series(50.0, index=index)
+    config = ConformalConfig(
+        window_days=90,
+        embargo_days=1,
+        min_calibration_hours=24 * 5,  # "5 days"
+        recompute_cadence_days=1,
+    )
+
+    sigma = quarterhour_sigma(y, q50, config=config, window_days=90, periods_per_day=96)
+    local_days = _local_days(index)
+    delivery_days = pd.DatetimeIndex(sorted(pd.unique(local_days)))
+
+    # day_num=d's calibration window (1-day embargo) covers days 0..(d-2) --
+    # day_num=6 is the first day with 5 full prior days (days 0-4, 480
+    # periods) available; days before it have fewer than 5 full days.
+    for day in delivery_days[:6]:
+        assert sigma.loc[local_days == day].isna().all()
+    assert not sigma.loc[local_days == delivery_days[6]].isna().any()
+
+
+def test_quarterhour_sigma_runs_through_a_dst_fall_back_day() -> None:
+    """A local day with 100 quarter-hours (fall back, Europe/Berlin
+    2026-10-25) must not crash the day-iteration loop and must still
+    produce one sigma value per input period."""
+    index = _quarterhourly_utc("2026-10-01", 96 * 40)  # spans 2026-10-25
+    rng = np.random.default_rng(7)
+    y = pd.Series(50 + rng.normal(0, 5, len(index)), index=index)
+    q50 = pd.Series(50.0, index=index)
+    config = ConformalConfig(
+        window_days=10,
+        embargo_days=1,
+        n_neighbors=50,
+        recompute_cadence_days=1,
+        min_calibration_hours=24 * 5,
+    )
+
+    sigma = quarterhour_sigma(y, q50, config=config, window_days=10)
+
+    assert len(sigma) == len(index)
+    local_days = _local_days(index)
+    fall_back_day = pd.Timestamp("2026-10-25", tz="Europe/Berlin")
+    assert int((local_days == fall_back_day).sum()) == 100
