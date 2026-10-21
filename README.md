@@ -13,15 +13,15 @@ A day-ahead model is easy to make look good in a backtest: the information actua
 
 ## Current status
 
-As of 2026-10-04, [Energy Arena leaderboard](https://energy-arena.org/leaderboard), Point Forecast DE-LU, rolling 7-day window. The Arena scores results separately by information cutoff (how much lead time the forecast had before the D-1 12:00 gate closure) — this project's own fallback ladder exists because of exactly that distinction (see [The information-set problem](#the-information-set-problem) below):
+As of 2026-10-21, [Energy Arena leaderboard](https://energy-arena.org/leaderboard), Point Forecast DE-LU, rolling 30-day window. The Arena scores results separately by information cutoff (how much lead time the forecast had before the D-1 12:00 gate closure) — this project's own fallback ladder exists because of exactly that distinction (see [The information-set problem](#the-information-set-problem) below):
 
-| Information cutoff | RMSE (EUR/MWh) | Rank |
-|---|---|---|
-| D-1, 10:00 | 23.17 | 2 |
-| D-1, 11:00 | 19.92 | 2 |
-| D-1, 12:00 (gate closure) | 19.9 | 5 |
+| Information cutoff | RMSE (EUR/MWh) | Rank | Participants |
+|---|---|---|---|
+| D-1, 10:00 | 28.54 | 6 | 20 |
+| D-1, 11:00 | 31.67 | 4 | 22 |
+| D-1, 12:00 (gate closure) | 28.79 | 7 | 28 |
 
-All three are well ahead of the Arena's own persistence baseline — 45.27 EUR/MWh measured historically over the full backtest window (see [Fallback ladder](#fallback-ladder) below), 35.32 EUR/MWh over this same rolling 7-day window — and not at the top of the board. A **7-day rolling window** moves daily and is **not yet statistically stable** — read this as a status check, **not a final result**.
+All three are well ahead of the Arena's own persistence baseline — 45.27 EUR/MWh measured historically over the full backtest window (see [Fallback ladder](#fallback-ladder) below), 53.4 EUR/MWh over this same rolling 30-day window — and not at the top of the board. A **30-day rolling window** is far more stable than the 7-day snapshot this section previously reported, but it still moves daily — read this as a status check, **not a final result**.
 
 ## How it works
 
