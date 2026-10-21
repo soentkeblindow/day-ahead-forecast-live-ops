@@ -55,8 +55,8 @@ def compute_fhs_quantiles_for_row(
     periods_per_day: int = 96,
     pool_gap_tolerance_days: int = POOL_GAP_TOLERANCE_DAYS,
 ) -> dict[float, pd.Series]:
-    """FHS quantiles for one ladder row over the full range covered by
-    ``forecast``/``realized_price``'s common index.
+    """FHS quantiles for one ladder row over ``forecast``'s own full
+    range, including a day whose realized price is not known yet.
 
     ``forecast`` MUST already be filtered to a single ``model_version``
     (spec section 3.2's rule 1, enforced by the caller -- this function
@@ -64,13 +64,29 @@ def compute_fhs_quantiles_for_row(
     series it is given). ``realized_price`` is the realised quarter-hourly
     price (e.g. ``arena.live_inputs.read_quarterhourly_prices()``).
 
-    Returns one Series per level, aligned to the common (forecast,
-    realized_price) index, monotonically increasing per timestamp
-    (``rearrangement.rearrange_quantiles``). A timestamp whose day's pool
-    is too small (``fhs_pool.pool_by_day``'s own ``min_pool_days`` gate,
-    called here with ``min_pool_days=window_days - pool_gap_tolerance_
-    days`` -- a measured tolerance, not a literally-full-pool requirement,
-    see ``POOL_GAP_TOLERANCE_DAYS``) or whose sigma is not yet calibrated
+    Returns one Series per level, aligned to ``forecast``'s OWN full index
+    (never intersected down to where ``realized_price`` also has a value)
+    -- monotonically increasing per timestamp
+    (``rearrangement.rearrange_quantiles``). This is deliberate, not an
+    oversight: the live case this function also serves (spec section 3.5)
+    asks for today's quantile on a day whose real price does not exist
+    yet BY DEFINITION (that is what is being forecast) -- a day whose
+    sigma/pool only ever depend on calibration data strictly BEFORE it
+    (the embargo), never on that day's own price. Intersecting away any
+    timestamp ``realized_price`` doesn't cover would silently make this
+    function incapable of ever answering the one question the live path
+    needs it for. ``realized_price`` is reindexed onto ``forecast``'s
+    index instead (NaN wherever it has no value, e.g. "today" in the live
+    case, or any day beyond its own real coverage) -- harmless, since
+    ``standardised_residuals``/``pool_by_day`` already drop NaN residuals
+    before pooling, and a day's own price is never part of its own pool
+    anyway (the 1-day embargo excludes it regardless of NaN-ness).
+
+    A timestamp whose day's pool is too small (``fhs_pool.pool_by_day``'s
+    own ``min_pool_days`` gate, called here with
+    ``min_pool_days=window_days - pool_gap_tolerance_days`` -- a measured
+    tolerance, not a literally-full-pool requirement, see
+    ``POOL_GAP_TOLERANCE_DAYS``) or whose sigma is not yet calibrated
     (``conformal.quarterhour_sigma``) is NaN at every level, never
     partially -- both gates share one sigma series and one per-day pool,
     so a timestamp's NaN-ness never differs by level (safe for
@@ -80,9 +96,9 @@ def compute_fhs_quantiles_for_row(
     if 0.5 not in levels:
         raise ValueError("compute_fhs_quantiles_for_row requires a median (0.5) level")
 
-    common_index = pd.DatetimeIndex(forecast.index.intersection(realized_price.index)).sort_values()
+    common_index = pd.DatetimeIndex(forecast.index).sort_values()
     forecast_aligned = forecast.loc[common_index]
-    price_aligned = realized_price.loc[common_index]
+    price_aligned = realized_price.reindex(common_index)
 
     sigma = quarterhour_sigma(
         price_aligned,

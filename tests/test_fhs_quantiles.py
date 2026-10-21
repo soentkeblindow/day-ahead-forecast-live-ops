@@ -164,6 +164,32 @@ def test_runs_through_a_dst_fall_back_day() -> None:
     assert int((local_days == fall_back_day).sum()) == 100
 
 
+def test_live_case_today_has_no_realized_price_yet() -> None:
+    """The live path (spec section 3.5) asks for today's quantile on a day
+    whose real price does not exist yet BY DEFINITION -- forecast's own
+    index may extend one day beyond realized_price's, and that extra day
+    must still get a real (non-NaN) quantile, computed from calibration
+    data strictly before it."""
+    history_index = _quarterhourly_utc("2020-12-31 23:00", 96 * 150)
+    rng = np.random.default_rng(20)
+    price = pd.Series(50 + rng.normal(0, 5, len(history_index)), index=history_index)
+
+    today_index = _quarterhourly_utc(str(history_index[-1] + pd.Timedelta(minutes=15)), 96)
+    forecast_index = history_index.append(today_index)
+    forecast = pd.Series(50.0, index=forecast_index)
+
+    quantiles = compute_fhs_quantiles_for_row(
+        forecast, price, window_days=90, config=_config(90), levels=_LEVELS
+    )
+
+    for level in _LEVELS:
+        assert len(quantiles[level]) == len(forecast_index)
+    today_grid = pd.DataFrame({a: quantiles[a].loc[today_index] for a in _LEVELS})
+    assert today_grid.notna().all().all()
+    for i in range(len(_LEVELS) - 1):
+        assert (today_grid[_LEVELS[i]] <= today_grid[_LEVELS[i + 1]]).all()
+
+
 def test_requires_a_median_level() -> None:
     index = _quarterhourly_utc("2021-01-01", 96 * 10)
     price = pd.Series(50.0, index=index)
