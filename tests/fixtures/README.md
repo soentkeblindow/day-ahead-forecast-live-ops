@@ -27,6 +27,19 @@ Golden Fixture (a), the payload example from the `energy-arena-participate` star
 retrieved (spec §3, Entscheidung 3) — Fixture (b) above is authoritative because it comes from the
 Arena API itself, not from a reference implementation.
 
+## `arena_public_example_challenge_8.json`
+
+- **Retrieved:** 2026-10-21 (Sprint 7.1 Teil B → Probephase, phase 1: real-format discovery)
+- **Endpoint:** `GET /api/v1/challenges/8` (the `latest_public_example.payload` field, same sub-object convention as `arena_public_example.json` above)
+- **Command:** same as above, with `8` in place of `2`.
+
+Challenge 8 is "Day-Ahead Prices | Germany-Luxembourg | Quantile Forecast (5 quantiles)" — the quantile-track sibling of Challenge 2. Real, structurally confirmed shape (not guessed, per `docs/sprint7_step7_1_spec.md` §3.1):
+
+- `values` is a **list of 96 lists** (one per quarter-hour, same calendar-day grid as Challenge 2), each inner list holding exactly **5 floats in ascending order** — `[q0.025, q0.25, q0.5, q0.75, q0.975]`, matching the challenge detail's own `probabilistic_quantiles` field exactly (`evaluation/fhs_quantiles.py::DEFAULT_LEVELS` already uses this same tuple).
+- `target_start` uses the same local-offset ISO-8601 form as Challenge 2 (`+02:00`, not UTC `Z`).
+- `constraints`: `precision_decimals=2`, `allow_negative=true` — same as Challenge 2.
+- This specific example's values are flat/identical within each inner list (a dummy baseline submission, not informative numerically) — compared *structurally* in tests, same convention as `arena_public_example.json`.
+
 ## `energy_charts_installed_power.json`
 
 - **Retrieved:** 2026-09-02 (source's own `last_update` field: 2026-09-01T13:03:43 UTC)

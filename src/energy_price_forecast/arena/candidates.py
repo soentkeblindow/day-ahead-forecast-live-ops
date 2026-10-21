@@ -204,6 +204,8 @@ def best_accepted_rank(
     protocol_rows: Iterable[Mapping[str, object]],
     target_day: object,
     ladder: tuple[Candidate, ...],
+    *,
+    challenge_id: str = "2",
 ) -> int | None:
     """Spec 6.9 section 2.9 (Downgrade-Schutz): the best (lowest) rank among
     already-accepted LIVE submissions for ``target_day``. Rejected
@@ -218,12 +220,23 @@ def best_accepted_rank(
     a name not present in the current ladder (e.g. a retired candidate from
     before a future re-measurement) is silently ignored, never an error --
     an old record naming a since-removed row must not crash a live run.
+
+    ``challenge_id`` (Sprint 7.1 Teil B -> Probephase, protocol_version 6):
+    a row belongs to this function's accounting only if its own
+    ``challenge_id`` matches, defaulting a MISSING field to ``"2"`` --
+    every record written before this field existed really was challenge 2
+    (the only one that existed yet). Without this filter, Challenge 8's
+    own records would be compared against Challenge 2's accepted ranks
+    (and vice versa) in the SAME ``logs/submissions.jsonl`` file, wrongly
+    blocking one challenge's submission by the other's accepted rank.
     """
     name_to_rank = {c.name: c.rank for c in ladder}
     target_day_str = target_day.isoformat() if hasattr(target_day, "isoformat") else str(target_day)
     best: int | None = None
     for row in protocol_rows:
         if row.get("target_day") != target_day_str:
+            continue
+        if row.get("challenge_id", "2") != challenge_id:
             continue
         if row.get("submitted") is not True or row.get("submission_mode") != "live":
             continue

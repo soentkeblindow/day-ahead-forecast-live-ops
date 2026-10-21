@@ -198,6 +198,99 @@ def get_challenge(challenge_id: str) -> ChallengeSpec:
 
 
 @dataclass(frozen=True)
+class QuantileChallengeSpec:
+    """One Arena quantile-track challenge's submission format and
+    constraints (Sprint 7.1 Teil B -> Probephase). Sibling of
+    ``ChallengeSpec`` for nested (quantile) challenges, added alongside it
+    rather than generalising it -- ``ChallengeSpec``/``get_challenge``/
+    ``_infer_resolution_minutes`` stay unchanged (the same convention
+    ``evaluation.conformal.quarterhour_sigma`` already follows next to
+    ``hourly_sigma``).
+
+    ``quantile_levels`` is read directly from the detail endpoint's own
+    ``probabilistic_quantiles`` field (confirmed against the real API,
+    2026-10-21: ``[0.025, 0.25, 0.5, 0.75, 0.975]`` for challenge 8,
+    ascending -- matches ``evaluation.fhs_quantiles.DEFAULT_LEVELS``) --
+    never inferred from the example payload the way resolution is,
+    since the field already names them explicitly.
+    """
+
+    challenge_id: str
+    name: str
+    timezone: str
+    resolution_minutes: int
+    quantile_levels: tuple[float, ...]
+    precision_decimals: int
+    allow_negative: bool
+    max_forecast_points: int | None
+    raw: dict[str, Any]
+
+
+def _infer_resolution_minutes_nested(detail: dict[str, Any]) -> int:
+    """Nested-values sibling of ``_infer_resolution_minutes``: each element
+    of the example's ``values`` is itself a list (one per quantile level),
+    so the OUTER length is the period count. Same DST-shift-aware check
+    against 15/30/60-minute candidates as the Point-challenge version.
+    """
+    target_period = detail["target_period"]
+    if target_period["type"] != _SUPPORTED_TARGET_PERIOD_TYPE:
+        raise UnsupportedChallengeError(
+            f"target_period.type {target_period['type']!r} is not supported "
+            "(only calendar_day; see spec §12)"
+        )
+
+    example = detail.get("latest_public_example") or detail["example"]
+    values = example["payload"]["values"]
+    if not values or not isinstance(values[0], list):
+        raise UnsupportedChallengeError(
+            "expected nested (quantile) values, got a flat list -- use "
+            "get_challenge()/ChallengeSpec for Point challenges instead"
+        )
+    n_values = len(values)
+
+    for candidate_minutes in (15, 30, 60):
+        normal_count = 24 * 60 // candidate_minutes
+        dst_shift = 60 // candidate_minutes
+        if n_values in (normal_count, normal_count - dst_shift, normal_count + dst_shift):
+            return candidate_minutes
+
+    raise UnsupportedChallengeError(
+        f"could not infer resolution from {n_values} nested values in the example payload"
+    )
+
+
+def _parse_quantile_challenge(detail: dict[str, Any]) -> QuantileChallengeSpec:
+    constraints = detail["constraints"]
+    levels = detail.get("probabilistic_quantiles")
+    if not levels:
+        raise UnsupportedChallengeError(
+            "challenge has no probabilistic_quantiles field -- not a quantile challenge"
+        )
+    return QuantileChallengeSpec(
+        challenge_id=detail["code"],
+        name=detail["name"],
+        timezone=detail["reference_timezone"],
+        resolution_minutes=_infer_resolution_minutes_nested(detail),
+        quantile_levels=tuple(levels),
+        precision_decimals=constraints["precision_decimals"],
+        allow_negative=constraints["allow_negative"],
+        max_forecast_points=None,  # not exposed by the API; see module docstring
+        raw=detail,
+    )
+
+
+def get_quantile_challenge(challenge_id: str) -> QuantileChallengeSpec:
+    """GET /api/v1/challenges/{challenge_id}, for a quantile-track
+    challenge. Sibling of ``get_challenge()`` for nested-value challenges
+    (spec §12's original scope was Point-only) -- same endpoint, same
+    retry/error semantics (``_call_with_retry`` via ``_get``), a different
+    parsing path since the payload shape genuinely differs.
+    """
+    detail = _get(f"/api/v1/challenges/{challenge_id}")
+    return _parse_quantile_challenge(detail)
+
+
+@dataclass(frozen=True)
 class OpenChallengeSummary:
     """One entry from GET /challenges/open.
 

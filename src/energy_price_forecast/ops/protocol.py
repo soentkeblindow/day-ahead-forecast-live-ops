@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
 
-PROTOCOL_VERSION: Final[int] = 5
+PROTOCOL_VERSION: Final[int] = 6
 
 # Fixed so every appended line writes its keys in the same order (spec
 # section 2.8: "sonst sind die Git-Diffs verrauscht"). New fields are
@@ -95,6 +95,8 @@ _KEY_ORDER: Final[tuple[str, ...]] = (
     "load_patch_reference_day",
     "load_patch_weeks_back",
     "load_patch_skipped",
+    # protocol_version 6 (Sprint 7.1 Teil B -> Probephase) -- appended, same rule.
+    "challenge_id",
 )
 
 
@@ -218,6 +220,18 @@ class SubmissionRecord:
       and rejected before settling on ``load_patch_reference_day``, each
       ``[date_iso, "holiday"|"incomplete"]`` -- empty if the first candidate
       was usable, or if row 2 was never selected.
+
+    protocol_version 6 field (Sprint 7.1 Teil B -> Probephase), additive:
+
+    - ``challenge_id``: which Arena challenge this run's row belongs to
+      (``"2"`` for the existing point-forecast run, ``"8"`` for the new
+      quantile-track run that shares the same job). Every record written
+      BEFORE this field existed is implicitly challenge 2 (the only
+      challenge that existed yet) -- readers that need to distinguish
+      challenges (``arena.candidates.best_accepted_rank``) default a
+      missing field to ``"2"`` rather than treating it as unknown, so
+      the downgrade-protection history for Challenge 2 is unaffected by
+      this field's introduction.
     """
 
     run_timestamp_utc: str
@@ -266,6 +280,7 @@ class SubmissionRecord:
     load_patch_reference_day: str | None = None
     load_patch_weeks_back: int | None = None
     load_patch_skipped: list[list[str]] = field(default_factory=list)
+    challenge_id: str = "2"
     protocol_version: int = PROTOCOL_VERSION
 
     def to_dict(self) -> dict[str, Any]:

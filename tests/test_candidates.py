@@ -129,14 +129,22 @@ def test_measured_as_names_a_real_measurement_for_every_row() -> None:
 
 
 def _record(
-    *, target_day: str, submitted: bool, mode: str, candidate: str | None
+    *,
+    target_day: str,
+    submitted: bool,
+    mode: str,
+    candidate: str | None,
+    challenge_id: str | None = None,
 ) -> dict[str, object]:
-    return {
+    record: dict[str, object] = {
         "target_day": target_day,
         "submitted": submitted,
         "submission_mode": mode,
         "candidate_selected": candidate,
     }
+    if challenge_id is not None:
+        record["challenge_id"] = challenge_id
+    return record
 
 
 def test_best_accepted_rank_is_none_with_no_prior_submissions() -> None:
@@ -178,6 +186,45 @@ def test_best_accepted_rank_ignores_an_unknown_candidate_name() -> None:
     must not crash a live run."""
     records = [_record(target_day="2026-10-02", submitted=True, mode="live", candidate="live")]
     assert best_accepted_rank(records, "2026-10-02", _ladder()) is None
+
+
+# --- challenge_id filter (Sprint 7.1 Teil B -> Probephase, protocol_version 6) --
+
+
+def test_best_accepted_rank_a_different_challenges_accepted_row_does_not_count() -> None:
+    """The real collision this filter exists to prevent: a Challenge 8
+    (quantile) row accepted at rank 1 must not block/appear as the best
+    rank for a Challenge 2 (point) query on the same target_day, and vice
+    versa -- both challenges share logs/submissions.jsonl."""
+    records = [
+        _record(
+            target_day="2026-10-02",
+            submitted=True,
+            mode="live",
+            candidate="core_gas",
+            challenge_id="8",
+        )
+    ]
+    assert best_accepted_rank(records, "2026-10-02", _ladder(), challenge_id="2") is None
+    assert best_accepted_rank(records, "2026-10-02", _ladder(), challenge_id="8") == 1
+
+
+def test_best_accepted_rank_defaults_missing_challenge_id_to_challenge_2() -> None:
+    """Every record written before this field existed really was challenge
+    2 -- a missing field must behave exactly like an explicit "2", not like
+    "unknown"/excluded, so pre-existing downgrade-protection history for
+    Challenge 2 is unaffected by this field's introduction."""
+    records = [_record(target_day="2026-10-02", submitted=True, mode="live", candidate="core_gas")]
+    assert "challenge_id" not in records[0]
+    assert best_accepted_rank(records, "2026-10-02", _ladder(), challenge_id="2") == 1
+    assert best_accepted_rank(records, "2026-10-02", _ladder(), challenge_id="8") is None
+
+
+def test_best_accepted_rank_default_challenge_id_parameter_is_2() -> None:
+    """Calling without challenge_id at all (existing Challenge-2 call sites,
+    unchanged) must behave exactly as before this field existed."""
+    records = [_record(target_day="2026-10-02", submitted=True, mode="live", candidate="core_gas")]
+    assert best_accepted_rank(records, "2026-10-02", _ladder()) == 1
 
 
 def test_may_submit_true_when_nothing_accepted_yet() -> None:

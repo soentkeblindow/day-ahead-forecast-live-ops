@@ -77,6 +77,7 @@ _EXPECTED_KEY_ORDER = [
     "load_patch_reference_day",
     "load_patch_weeks_back",
     "load_patch_skipped",
+    "challenge_id",
 ]
 
 _SECTION_5_7_FIELDS = (
@@ -415,7 +416,37 @@ def test_v5_load_patch_fields_default_and_round_trip(tmp_path: Path) -> None:
     assert r["load_patch_skipped"] == [["2026-10-08", "holiday"]]
 
 
-def test_protocol_version_is_5() -> None:
-    """spec 6.9 section 5.7, Schritt 11: v5 adds load_patch_reference_day/
-    weeks_back/skipped, appended to the end of _KEY_ORDER."""
-    assert PROTOCOL_VERSION == 5
+def test_reader_tolerates_a_real_protocol_version_5_line_without_v6_fields(
+    tmp_path: Path,
+) -> None:
+    """Same compatibility guarantee as the earlier version-jump tests, for
+    the Sprint 7.1 Teil B jump from protocol_version 5 to 6."""
+    path = tmp_path / "submissions.jsonl"
+    v5_line = _sample_record().to_dict()
+    v5_line["protocol_version"] = 5
+    del v5_line["challenge_id"]
+    path.write_text(json.dumps(v5_line) + "\n", encoding="utf-8")
+
+    records = read_submission_records(path)
+    assert len(records) == 1
+    assert records[0]["protocol_version"] == 5
+    assert records[0].get("challenge_id") is None
+
+
+def test_v6_challenge_id_defaults_and_round_trips(tmp_path: Path) -> None:
+    """Sprint 7.1 Teil B -> Probephase: challenge_id defaults to "2" (every
+    record written before this field existed really was challenge 2), and
+    a real value round-trips for the new Challenge-8 quantile-track run."""
+    default_record = _sample_record()
+    assert default_record.challenge_id == "2"
+
+    path = tmp_path / "submissions.jsonl"
+    append_submission_record(path, _sample_record(challenge_id="8"))
+    records = read_submission_records(path)
+    assert records[0]["challenge_id"] == "8"
+
+
+def test_protocol_version_is_6() -> None:
+    """Sprint 7.1 Teil B -> Probephase: v6 adds challenge_id, appended to
+    the end of _KEY_ORDER."""
+    assert PROTOCOL_VERSION == 6
