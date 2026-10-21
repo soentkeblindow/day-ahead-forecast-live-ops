@@ -317,3 +317,45 @@ def test_invalid_payload_rejected_before_transport_live() -> None:
         submit(CHALLENGE, bad_payload, live=True, transport=transport)
 
     assert transport.call_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Injectable validate (Sprint 7.1 Teil B -> Probephase): a real bug found by
+# mypy while wiring Challenge 8 -- submit()'s own internal validate_payload
+# call defaulted to the Point-challenge validator, which would have
+# rejected every nested (quantile) payload Challenge 8 ever sends,
+# regardless of the caller already having validated it correctly.
+# ---------------------------------------------------------------------------
+
+
+def test_default_validate_rejects_a_nested_payload_the_point_way() -> None:
+    """Confirms the OLD behavior still holds for every unchanged
+    (Point-challenge) call site: nested values are rejected by default."""
+    transport = _ExplodingTransport()
+    nested_payload: dict[str, Any] = {
+        "challenge_id": "8",
+        "target_start": "2026-08-20T00:00:00+02:00",
+        "values": [[1.0, 2.0, 3.0, 4.0, 5.0]] * 96,
+    }
+
+    with pytest.raises(PayloadValidationError, match="list of lists|flat list"):
+        submit(CHALLENGE, nested_payload, transport=transport)
+
+    assert transport.call_count == 0
+
+
+def test_injected_validate_is_the_one_actually_called() -> None:
+    """A payload the DEFAULT validator would reject must be accepted when
+    an injected validator says it's fine -- proves ``validate`` genuinely
+    replaces the default, not just gets called alongside it."""
+    accepting_validate = MagicMock(return_value=None)
+    nested_payload: dict[str, Any] = {
+        "challenge_id": "8",
+        "target_start": "2026-08-20T00:00:00+02:00",
+        "values": [[1.0, 2.0, 3.0, 4.0, 5.0]] * 96,
+    }
+
+    result = submit(CHALLENGE, nested_payload, validate=accepting_validate)
+
+    accepting_validate.assert_called_once_with(nested_payload, CHALLENGE)
+    assert result.sent is False  # dry-run default, unrelated to validation

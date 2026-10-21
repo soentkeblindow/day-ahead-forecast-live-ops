@@ -24,14 +24,31 @@ import logging
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 import pandas as pd
 import requests
 from dotenv import load_dotenv
 
-from energy_price_forecast.arena.catalog import ChallengeSpec
 from energy_price_forecast.arena.payload import validate_payload
+
+
+class _ChallengeLike(Protocol):
+    """The one field submit() itself ever reads off ``challenge`` --
+    everything else is the injected ``validate`` callable's own concern.
+    A ``Protocol`` rather than ``arena.catalog.ChallengeSpec`` directly
+    (Sprint 7.1 Teil B -> Probephase) so ``arena.catalog.
+    QuantileChallengeSpec`` -- a genuinely different dataclass, not a
+    subclass -- satisfies this structurally without either challenge
+    type needing to inherit from the other. A read-only ``@property``,
+    not a plain annotation: both real implementations are frozen
+    dataclasses (read-only attributes), which a plain (implicitly
+    settable) Protocol attribute does not structurally match.
+    """
+
+    @property
+    def challenge_id(self) -> str: ...
+
 
 logger = logging.getLogger(__name__)
 
@@ -166,13 +183,14 @@ def _confirm_via_query(submission_id: int) -> bool:
 
 
 def submit(
-    challenge: ChallengeSpec,
+    challenge: _ChallengeLike,
     payload: dict[str, Any],
     *,
     live: bool = False,
     transport: Transport = _post,
     clock: Clock = _utcnow,
     confirm: ConfirmQuery = _confirm_via_query,
+    validate: Callable[[dict[str, Any], Any], None] = validate_payload,
 ) -> SubmissionResult:
     """Validate payload against challenge, then submit it -- or not.
 
@@ -184,8 +202,15 @@ def submit(
 
     ``clock``/``confirm`` are injectable for the same testability reason
     ``transport`` already is (no real time, no real network in tests).
+
+    ``validate`` (Sprint 7.1 Teil B -> Probephase) defaults to
+    ``arena.payload.validate_payload`` -- every existing (Point-challenge)
+    call site is unaffected. Challenge 8's own call site passes
+    ``arena.quantile_payload.validate_payload`` instead, since a nested
+    (quantile) payload would otherwise be rejected by the Point
+    validator's own "no nested values" check.
     """
-    validate_payload(payload, challenge)
+    validate(payload, challenge)
 
     if not live:
         logger.info(

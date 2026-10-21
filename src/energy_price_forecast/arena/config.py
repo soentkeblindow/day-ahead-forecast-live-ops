@@ -22,9 +22,25 @@ from typing import Final
 # ops/availability_audit.py's own ARENA_CHALLENGE_ID (spec section 5.4 there).
 ARENA_CHALLENGE_ID: Final[str] = "2"
 
+# "Day-Ahead Prices | Germany-Luxembourg | Quantile Forecast (5 quantiles)"
+# (Sprint 7.1 Teil B -> Probephase) -- the quantile-track sibling of
+# ARENA_CHALLENGE_ID, confirmed real/open against the live API 2026-10-21
+# (tests/fixtures/arena_public_example_challenge_8.json).
+ARENA_QUANTILE_CHALLENGE_ID: Final[str] = "8"
+
 # Name of the GitHub repository variable that is the actual switch (spec
 # section 2.3). Not the switch's value -- see is_live_enabled().
 ARENA_LIVE_ENV_VAR: Final[str] = "ARENA_LIVE"
+
+# Deliberately a SEPARATE switch from ARENA_LIVE_ENV_VAR (Sprint 7.1 Teil B
+# -> Probephase) -- the quantile track must stay in dry-run through its own
+# >=3-day Probephase and its own owner Haltepunkt (spec section 6 step 5)
+# regardless of Challenge 2's own live status. Same fail-safe-by-default
+# mechanism: this repository variable simply does not exist yet, so
+# is_quantile_live_enabled() returns False unconditionally until the owner
+# both creates it AND sets it to "true", mirroring ARENA_LIVE's own
+# go-live sequence (spec 6.7.3).
+ARENA_QUANTILE_LIVE_ENV_VAR: Final[str] = "ARENA_QUANTILE_LIVE"
 
 
 def is_live_enabled(env: Mapping[str, str]) -> bool:
@@ -35,3 +51,10 @@ def is_live_enabled(env: Mapping[str, str]) -> bool:
     "True", "1", "yes" -- keeps the job in dry-run mode. Fail-safe by design.
     """
     return env.get(ARENA_LIVE_ENV_VAR) == "true"
+
+
+def is_quantile_live_enabled(env: Mapping[str, str]) -> bool:
+    """Challenge 8's own go-live switch (Sprint 7.1 Teil B -> Probephase) --
+    same fail-safe semantics as ``is_live_enabled``, but a genuinely
+    separate variable/decision, not a generalisation of it."""
+    return env.get(ARENA_QUANTILE_LIVE_ENV_VAR) == "true"

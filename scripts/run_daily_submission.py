@@ -32,8 +32,13 @@ from energy_price_forecast.arena.candidates import (
     may_submit,
     three_row_ladder,
 )
-from energy_price_forecast.arena.catalog import ChallengeSpec, get_challenge
-from energy_price_forecast.arena.config import ARENA_CHALLENGE_ID, is_live_enabled
+from energy_price_forecast.arena.catalog import ChallengeSpec, get_challenge, get_quantile_challenge
+from energy_price_forecast.arena.config import (
+    ARENA_CHALLENGE_ID,
+    ARENA_QUANTILE_CHALLENGE_ID,
+    is_live_enabled,
+    is_quantile_live_enabled,
+)
 from energy_price_forecast.arena.live_inputs import (
     DEFAULT_WEATHER_MODEL,
     assemble_price_model_inputs,
@@ -59,6 +64,13 @@ from energy_price_forecast.arena.preflight import (
     check_training_window,
     check_weather_run,
 )
+from energy_price_forecast.arena.quantile_payload import (
+    build_payload as quantile_build_payload,
+)
+from energy_price_forecast.arena.quantile_payload import (
+    validate_payload as quantile_validate_payload,
+)
+from energy_price_forecast.arena.quantile_step import run_quantile_step
 from energy_price_forecast.arena.submit import SubmissionResult, submit
 from energy_price_forecast.arena.target_day_fill import (
     GroupFill,
@@ -113,6 +125,10 @@ logger = logging.getLogger(__name__)
 
 SUBMISSIONS_LOG = PROJECT_ROOT / "logs" / "submissions.jsonl"
 PAYLOADS_DIR = PROJECT_ROOT / "logs" / "submission_payloads"
+# Sprint 7.1 Teil B -> Probephase: Challenge 8's own archive, separate from
+# PAYLOADS_DIR since both challenges build a payload for the same
+# target_day and must not overwrite each other.
+QUANTILE_PAYLOADS_DIR = PROJECT_ROOT / "logs" / "submission_payloads_quantile"
 
 # The price model's own rolling training window (spec section 5.6, ops/availability_audit.py's
 # existing TRAINING_WINDOW_DAYS).
@@ -1503,6 +1519,208 @@ def write_payload_to_repo(payload: dict[str, Any], target_day: dt.date) -> Path:
     return path
 
 
+def write_quantile_payload_to_repo(payload: dict[str, Any], target_day: dt.date) -> Path:
+    """Challenge 8's own sibling of ``write_payload_to_repo`` -- same
+    one-file-per-target_day, later-overwrites-earlier convention, kept in
+    ``QUANTILE_PAYLOADS_DIR`` so it never collides with Challenge 2's own
+    archive for the same day.
+    """
+    QUANTILE_PAYLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    path = QUANTILE_PAYLOADS_DIR / f"{target_day.isoformat()}.json"
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    return path
+
+
+@dataclass(frozen=True)
+class QuantileSubmissionOutcome:
+    """Outcome of one run_quantile_track_for_day() call (Sprint 7.1 Teil B
+    -> Probephase) -- the lighter, Challenge-8-only sibling of
+    SubmissionOutcome. No independent candidate selection, Check A/B, or
+    target-day-fill fields: Challenge 8 reuses Challenge 2's own already-
+    selected candidate/rank/median wholesale (spec section 1), it never
+    runs its own ladder evaluation.
+    """
+
+    candidate_selected: str | None = None
+    candidate_rank: int | None = None
+    skip_reason: str | None = None
+    payload: dict[str, Any] | None = None
+    submission_result: SubmissionResult | None = None
+    downgrade_blocked: bool = False
+    best_accepted_rank_before: int | None = None
+
+
+# A rank-lookup-only ladder (spec 6.9 section 2.9's name->rank mapping,
+# arena.candidates.best_accepted_rank) -- empty column sets are fine here,
+# since Challenge 8 never evaluates a row's own feature completeness
+# (that already happened for Challenge 2); only candidate.name/.rank are
+# ever read for this purpose.
+_RANK_LOOKUP_LADDER = three_row_ladder(
+    calendar_columns=frozenset(),
+    nwp_residual_columns=frozenset(),
+    load_forecast_columns=frozenset(),
+    price_lag_columns=frozenset(),
+    gas_columns=frozenset(),
+)
+
+
+def run_quantile_track_for_day(
+    point_outcome: SubmissionOutcome,
+    prices_qh: pd.DataFrame,
+    target_day: dt.date,
+    *,
+    live: bool = False,
+    now: Callable[[], pd.Timestamp] = _utcnow,
+    submitted_records: Iterable[dict[str, object]] = (),
+) -> QuantileSubmissionOutcome:
+    """Challenge 8 (quantile track), Sprint 7.1 Teil B -> Probephase.
+
+    Called strictly AFTER Challenge 2's own outcome is final (spec
+    section 3.5) -- never blocks or slows it, and the caller
+    (run_daily_submission) wraps this call in its own try/except so a
+    failure here can never affect an already-completed Challenge-2
+    outcome. Reuses Challenge 2's own already-built median
+    (point_outcome.payload["values"]) and selected candidate/rank
+    directly -- no independent ladder evaluation.
+
+    Skip conditions (each returns immediately, never raises for an
+    expected operating state): no point median at all (Challenge 2 was
+    silent -- spec section 3.4's own last row), the FHS pool/sigma
+    unusable for today (the Probephase's skip-this-day-only policy, owner
+    decision 2026-10-21), gate closure passed before the POST (same
+    second-check-before-sending discipline as Challenge 2's own), or a
+    better-or-equal Challenge-8 rank already accepted for target_day
+    (downgrade protection, independent of Challenge 2's own).
+    """
+    if point_outcome.candidate_selected is None or point_outcome.payload is None:
+        return QuantileSubmissionOutcome(skip_reason="no point median (Challenge 2 silent)")
+
+    quantiles = run_quantile_step(
+        point_outcome.candidate_selected,
+        point_outcome.payload["values"],
+        target_day,
+        prices_qh["day_ahead_price"],
+    )
+    if quantiles is None:
+        return QuantileSubmissionOutcome(
+            candidate_selected=point_outcome.candidate_selected,
+            candidate_rank=point_outcome.candidate_rank,
+            skip_reason="FHS pool/sigma unusable for this day",
+        )
+
+    challenge = get_quantile_challenge(ARENA_QUANTILE_CHALLENGE_ID)
+    target_start = pd.Timestamp(target_day, tz=challenge.timezone)
+    payload = quantile_build_payload(challenge, target_start, quantiles)
+    quantile_validate_payload(payload, challenge)
+
+    if is_past_gate_closure(target_day, now()):
+        return QuantileSubmissionOutcome(
+            candidate_selected=point_outcome.candidate_selected,
+            candidate_rank=point_outcome.candidate_rank,
+            payload=payload,
+            skip_reason="gate closure passed before POST",
+        )
+
+    best_rank = best_accepted_rank(
+        submitted_records,
+        target_day,
+        _RANK_LOOKUP_LADDER,
+        challenge_id=ARENA_QUANTILE_CHALLENGE_ID,
+    )
+    own_rank = point_outcome.candidate_rank
+    if own_rank is not None and not may_submit(own_rank, best_rank):
+        return QuantileSubmissionOutcome(
+            candidate_selected=point_outcome.candidate_selected,
+            candidate_rank=own_rank,
+            payload=payload,
+            skip_reason=(
+                f"KEPT -- rank {best_rank} already accepted (challenge 8), "
+                f"this run: rank {own_rank}"
+            ),
+            downgrade_blocked=True,
+            best_accepted_rank_before=best_rank,
+        )
+
+    submission_result = submit(challenge, payload, live=live, validate=quantile_validate_payload)
+    return QuantileSubmissionOutcome(
+        candidate_selected=point_outcome.candidate_selected,
+        candidate_rank=own_rank,
+        payload=payload,
+        submission_result=submission_result,
+        best_accepted_rank_before=best_rank,
+    )
+
+
+def _quantile_payload_stats(
+    payload: dict[str, Any] | None,
+) -> tuple[int | None, float | None, float | None, float | None]:
+    """Nested-values sibling of ``_payload_stats`` -- ``payload["values"]``
+    is a list of rows (one per timestep, each a list of quantile levels),
+    so the flat min/mean/max are computed over every value across every
+    row, not row-by-row.
+    """
+    if payload is None:
+        return None, None, None, None
+    rows: list[list[float]] = payload["values"]
+    if not rows:
+        return 0, None, None, None
+    flat = [v for row in rows for v in row]
+    return len(rows), min(flat), sum(flat) / len(flat), max(flat)
+
+
+def build_quantile_submission_record(
+    outcome: QuantileSubmissionOutcome,
+    *,
+    target_day: dt.date,
+    nominal_slot: str,
+    as_of: pd.Timestamp,
+) -> SubmissionRecord:
+    """Challenge 8's own sibling of ``build_submission_record`` -- lighter,
+    since ``QuantileSubmissionOutcome`` carries none of Challenge 2's
+    Check A/B/target-day-fill fields (those already ran for Challenge 2;
+    this run reuses its result). ``challenge_id="8"`` is the one field
+    that actually distinguishes this record from a Challenge-2 one in the
+    shared ``logs/submissions.jsonl`` (protocol_version 6).
+    """
+    n_values, payload_min, payload_mean, payload_max = _quantile_payload_stats(outcome.payload)
+    (
+        submitted,
+        api_status,
+        api_message,
+        submission_mode,
+        submission_id,
+        api_response_received_utc,
+        confirmed_via_query,
+    ) = _submission_fields(outcome.submission_result)
+    run_id, run_url = run_id_and_url()
+    return SubmissionRecord(
+        run_timestamp_utc=as_of.isoformat(),
+        run_id=run_id,
+        run_url=run_url,
+        code_sha=code_sha(),
+        target_day=target_day.isoformat(),
+        nominal_slot=nominal_slot,
+        gate_closure_ok=True,
+        candidate_selected=outcome.candidate_selected,
+        candidate_rank=outcome.candidate_rank,
+        skip_reason=outcome.skip_reason,
+        n_values=n_values,
+        payload_min=payload_min,
+        payload_mean=payload_mean,
+        payload_max=payload_max,
+        submitted=submitted,
+        api_status=api_status,
+        api_message=api_message,
+        submission_mode=submission_mode,
+        submission_id=submission_id,
+        api_response_received_utc=api_response_received_utc,
+        confirmed_via_query=confirmed_via_query,
+        downgrade_blocked=outcome.downgrade_blocked,
+        best_accepted_rank_before=outcome.best_accepted_rank_before,
+        challenge_id=ARENA_QUANTILE_CHALLENGE_ID,
+    )
+
+
 def _silence_turns_run_red(*, is_last_slot_of_day: bool) -> bool:
     """Whether a silent outcome should turn the whole workflow run red
     (spec section 2.7) -- reads SILENCE_STREAK_THRESHOLD rather than
@@ -1597,6 +1815,39 @@ def run_daily_submission(
 
     if outcome.payload is not None:
         write_payload_to_repo(outcome.payload, target_day)
+
+    # Sprint 7.1 Teil B -> Probephase: Challenge 8 (quantile track), run
+    # strictly AFTER Challenge 2's own record/payload are already
+    # written above -- a broad except here (matching Restarbeit Teil
+    # C.4's own precedent for the analogous training-label print below)
+    # guarantees a failure in the quantile track can never affect an
+    # already-finished Challenge-2 outcome, which is the one hard
+    # independence requirement spec section 3.4 names explicitly.
+    try:
+        quantile_outcome = run_quantile_track_for_day(
+            outcome,
+            prices_qh,
+            target_day,
+            live=is_quantile_live_enabled(os.environ),
+            submitted_records=submitted_records,
+        )
+        quantile_record = build_quantile_submission_record(
+            quantile_outcome, target_day=target_day, nominal_slot=nominal_slot, as_of=as_of
+        )
+        append_submission_record(SUBMISSIONS_LOG, quantile_record)
+        if quantile_outcome.payload is not None:
+            write_quantile_payload_to_repo(quantile_outcome.payload, target_day)
+        if quantile_outcome.skip_reason is not None:
+            print(f"QUANTILE SILENT — {quantile_outcome.skip_reason}")
+        else:
+            print(
+                f"QUANTILE submitted (dry-run): candidate={quantile_outcome.candidate_selected}, "
+                f"target_day={target_day}"
+            )
+    except Exception as exc:  # noqa: BLE001 -- deliberately broad, see comment above
+        logger.exception(
+            "Challenge 8 (quantile track) failed -- Challenge 2 is unaffected: %s", exc
+        )
 
     # Restarbeit Teil A.4: only surface this when it's actually nonzero -- a
     # "0 missing labels" line every single day is noise nobody reads after a
