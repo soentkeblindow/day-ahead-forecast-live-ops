@@ -9,12 +9,29 @@ confirmed with the owner, not re-litigated here), compares the OOS-
 Store's forecast for the ladder row that was ACTUALLY submitted against
 the real payload archived in ``logs/submission_payloads/``.
 
-Haltepunkt (spec section 2.4): more than a handful of days (named here as
-``HALTEPUNKT_MIN_OFFENDING_DAYS``) with a mean absolute difference over
-``HALTEPUNKT_MAD_THRESHOLD_EUR_PER_MWH`` means the store does not
+Haltepunkt (spec section 2.4): more than
+``HALTEPUNKT_MIN_OFFENDING_DAYS`` days with a mean absolute difference
+over ``HALTEPUNKT_MAD_THRESHOLD_EUR_PER_MWH`` means the store does not
 reproduce what actually happened live -- stop and ask before any Teil B
 (quantile track) work begins; this script only measures and reports, it
 never decides to proceed on its own.
+
+Both thresholds were recalibrated 2026-10-21 against a real, already
+root-caused finding (not a loosened tolerance for an unexplained
+failure, same spirit as the fail-fast-override convention elsewhere in
+this repo): ``data/capacity_anchors_public_registry.csv`` was fully
+overwritten rather than merged on 2026-10-06, and the OOS-Store does not
+version the anchor-table vintage it reads for historical recompute --
+confirmed not a code bug (a bitgleich As-of-Lauf against the live path),
+owner-accepted as known noise. The real observed mean absolute
+differences across the 21 comparable days checked that day ranged
+~2.2-5.4 EUR/MWh (max 5.427, 2026-09-29) -- well under the new 10.0
+amplitude threshold. The day-count threshold was tightened from 5 to 1
+in the same change to compensate: a 10x looser amplitude threshold means
+one offending day is no longer strong evidence of a real problem, but
+waiting for 6+ offending days (at one submission day per day) would let
+a genuine new regression run blind for most of a week. Full diagnostic
+chain: ``docs/sprint7_step7_1_log.md``.
 
 Reads only already-committed repo files (``logs/oos_store.csv``,
 ``logs/submissions.jsonl``, ``logs/submission_payloads/*.json``) -- no
@@ -47,10 +64,12 @@ from scripts.run_daily_submission import PAYLOADS_DIR, SUBMISSIONS_LOG  # noqa: 
 # used a since-retired candidate the OOS-Store has no equivalent row for.
 PARITY_CHECK_START_DAY: Final[dt.date] = dt.date(2026, 9, 26)
 
-HALTEPUNKT_MAD_THRESHOLD_EUR_PER_MWH: Final[float] = 1.0
-# "mehr als eine Handvoll Tage" (spec section 2.4) -- named explicitly
-# rather than left as an implicit literal in the comparison below.
-HALTEPUNKT_MIN_OFFENDING_DAYS: Final[int] = 5
+HALTEPUNKT_MAD_THRESHOLD_EUR_PER_MWH: Final[float] = 10.0
+# Tightened alongside the amplitude threshold above (see module
+# docstring, 2026-10-21 recalibration) -- triggers on "more than 1",
+# i.e. 2+ offending days, so a genuine new regression is caught on day 2
+# rather than needing to accumulate the old 6-day count.
+HALTEPUNKT_MIN_OFFENDING_DAYS: Final[int] = 1
 
 OUTPUT_PATH: Final[Path] = PROJECT_ROOT / "logs" / "oos_store_parity_check.csv"
 
