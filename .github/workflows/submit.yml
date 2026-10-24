@@ -78,12 +78,19 @@ jobs:
       # or anything other than the literal "true" keeps main() in dry-run
       # (arena/config.py::is_live_enabled(), fail-safe by design). mode=smoke
       # bypasses ARENA_LIVE entirely (scripts/run_daily_submission.py::main()).
+      # ARENA_QUANTILE_LIVE is Challenge 8's own, independent go-live switch
+      # (Sprint 7.1 Teil B/Probephase, spec 7.1 section 6 step 5) -- same
+      # fail-safe repository-variable semantics, same arena/config.py module
+      # (is_quantile_live_enabled()), but a genuinely separate decision from
+      # ARENA_LIVE. Never wired into this job's env before this line; without
+      # it the variable has no effect regardless of its GitHub-UI value.
       - name: Run the daily submission job
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ARENA_API_KEY: ${{ secrets.ARENA_API_KEY }}
           ARENA_API_BASE_URL: ${{ vars.ARENA_API_BASE_URL }}
           ARENA_LIVE: ${{ vars.ARENA_LIVE }}
+          ARENA_QUANTILE_LIVE: ${{ vars.ARENA_QUANTILE_LIVE }}
           # Decrypts the store this job reads (publication spec section 2.1)
           # -- this job never publishes, only load_store, but that still
           # needs the key.
