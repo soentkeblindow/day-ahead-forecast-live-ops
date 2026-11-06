@@ -30,7 +30,9 @@ def _patch_source(
     monkeypatch: pytest.MonkeyPatch, source: CapacitySource, anchors: pd.Series
 ) -> None:
     monkeypatch.setitem(
-        capacity_mod._ANCHOR_LOADERS, source, lambda production_type, anchors_path=None: anchors
+        capacity_mod._ANCHOR_LOADERS,
+        source,
+        lambda production_type, *, anchors_path=None: anchors,
     )
 
 
@@ -213,7 +215,7 @@ def test_non_monotonic_anchors_raise(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(
         capacity_mod._ANCHOR_LOADERS,
         CapacitySource.PUBLIC_REGISTRY,
-        lambda pt, anchors_path=None: bad,
+        lambda pt, *, anchors_path=None: bad,
     )
     with pytest.raises(ValueError):
         installed_capacity_at(ProductionType.SOLAR, pd.DatetimeIndex([bad.index[0]]))

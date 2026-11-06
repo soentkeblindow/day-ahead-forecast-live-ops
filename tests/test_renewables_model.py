@@ -42,7 +42,7 @@ def _patch_capacity_anchors(monkeypatch: pytest.MonkeyPatch, value: float = 1000
     monkeypatch.setitem(
         capacity_mod._ANCHOR_LOADERS,
         CapacitySource.PUBLIC_REGISTRY,
-        lambda pt, anchors_path=None: anchors,
+        lambda pt, *, anchors_path=None: anchors,
     )
 
 
