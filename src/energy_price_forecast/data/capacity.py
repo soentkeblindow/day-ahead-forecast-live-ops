@@ -64,6 +64,7 @@ from __future__ import annotations
 
 import logging
 from enum import StrEnum
+from pathlib import Path
 from typing import Final
 
 import numpy as np
@@ -136,8 +137,16 @@ def _validate_anchors(anchors: pd.Series) -> None:
         raise ValueError("capacity anchors are not monotonically increasing")
 
 
-def _load_public_registry_anchors(production_type: ProductionType) -> pd.Series:
-    table = pd.read_csv(PUBLIC_REGISTRY_ANCHORS_PATH, comment="#")
+def _load_public_registry_anchors(
+    production_type: ProductionType, *, anchors_path: Path | None = None
+) -> pd.Series:
+    """Spec 7.4.1 section 3.4: ``anchors_path`` is purely additive -- omitting
+    it (every caller before this step) reads ``PUBLIC_REGISTRY_ANCHORS_PATH``
+    exactly as before. Passing it selects a specific historical vintage file
+    instead (spec 7.4.1 section 3.2's one capacity-vintage-selection rule,
+    implemented in ``data/capacity_vintages.py``)."""
+    path = anchors_path if anchors_path is not None else PUBLIC_REGISTRY_ANCHORS_PATH
+    table = pd.read_csv(path, comment="#")
     subset = table.loc[table["production_type"] == production_type.value]
     if subset.empty:
         raise ValueError(
@@ -147,7 +156,10 @@ def _load_public_registry_anchors(production_type: ProductionType) -> pd.Series:
     return pd.Series(subset["capacity_mw"].to_numpy(dtype="float64"), index=index).sort_index()
 
 
-def _load_entsoe_anchors(production_type: ProductionType) -> pd.Series:
+def _load_entsoe_anchors(
+    production_type: ProductionType, *, anchors_path: Path | None = None
+) -> pd.Series:
+    del anchors_path  # unused -- rejected alternative, see below
     raise NotImplementedError(
         "CapacitySource.ENTSOE_14_1_A is a rejected alternative, not a pending one "
         "(spec 6.5.2a, section 5.5) -- CapacitySource.PUBLIC_REGISTRY is the fixed, "
@@ -209,12 +221,17 @@ def _extrapolation_rate_per_day(anchors: pd.Series, method: CapacityExtrapolatio
     raise ValueError(f"unknown extrapolation method: {method!r}")  # pragma: no cover
 
 
-def anchor_table_valid_until(source: CapacitySource) -> pd.Timestamp:
+def anchor_table_valid_until(
+    source: CapacitySource, *, anchors_path: Path | None = None
+) -> pd.Timestamp:
     """Last timestamp for which ``installed_capacity_at`` can return a value
     for ``source`` (spec 6.5.2a, section 5.3) -- the last retained anchor
     (after ``TRAILING_ANCHORS_DISCARDED``) plus ``MAX_EXTRAPOLATION_INTERVALS``
     times the last anchor interval. Computed in exactly this one place;
     ``installed_capacity_at`` calls it rather than recomputing the boundary.
+
+    ``anchors_path`` (spec 7.4.1 section 3.4): additive, see
+    ``_load_public_registry_anchors``.
 
     All three production types come from one registry pull (spec 6.5.2,
     section 2.11) and therefore share one anchor cadence and last anchor
@@ -227,7 +244,9 @@ def anchor_table_valid_until(source: CapacitySource) -> pd.Timestamp:
     """
     boundaries: set[pd.Timestamp] = set()
     for production_type in ProductionType:
-        anchors = _discard_trailing_anchors(_ANCHOR_LOADERS[source](production_type))
+        anchors = _discard_trailing_anchors(
+            _ANCHOR_LOADERS[source](production_type, anchors_path=anchors_path)
+        )
         anchor_days = _days_since_epoch(pd.DatetimeIndex(anchors.index))
         last_interval_days = anchor_days[-1] - anchor_days[-2]
         boundaries.add(
@@ -272,6 +291,7 @@ def installed_capacity_at(
     *,
     source: CapacitySource = CapacitySource.PUBLIC_REGISTRY,
     method: CapacityExtrapolation = CapacityExtrapolation.LAST_INCREMENT,
+    anchors_path: Path | None = None,
 ) -> pd.Series:
     """Installed capacity in MW at each timestamp.
 
@@ -289,6 +309,12 @@ def installed_capacity_at(
     The same function serves both the label denominator and the conversion
     of a predicted capacity factor back to MW. Two rules would not cancel;
     one rule largely does.
+
+    ``anchors_path`` (spec 7.4.1 section 3.4): optional, purely additive --
+    every existing caller that omits it keeps reading
+    ``PUBLIC_REGISTRY_ANCHORS_PATH`` exactly as before. Passing it selects a
+    specific historical vintage file (spec 7.4.1 section 3.2), e.g. via
+    ``data/capacity_vintages.py``.
     """
     if not isinstance(production_type, ProductionType):
         raise ValueError(f"unknown production_type: {production_type!r}")
@@ -299,14 +325,14 @@ def installed_capacity_at(
     if timestamps.tz is None:
         raise ValueError("timestamps must be tz-aware")
 
-    anchors = _ANCHOR_LOADERS[source](production_type)
+    anchors = _ANCHOR_LOADERS[source](production_type, anchors_path=anchors_path)
     _validate_anchors(anchors)
     anchors = _discard_trailing_anchors(anchors)
 
     anchor_days = _days_since_epoch(pd.DatetimeIndex(anchors.index))
     first_anchor = anchors.index[0]
     last_anchor = anchors.index[-1]
-    max_extrapolation = anchor_table_valid_until(source)
+    max_extrapolation = anchor_table_valid_until(source, anchors_path=anchors_path)
     _log_validity_once(source, max_extrapolation)
 
     ts_min, ts_max = timestamps.min(), timestamps.max()

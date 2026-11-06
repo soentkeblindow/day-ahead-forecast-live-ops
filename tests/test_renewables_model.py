@@ -40,7 +40,9 @@ def _patch_capacity_anchors(monkeypatch: pytest.MonkeyPatch, value: float = 1000
         [value, value], index=pd.DatetimeIndex(["2020-01-01", "2030-01-01"], tz="UTC")
     )
     monkeypatch.setitem(
-        capacity_mod._ANCHOR_LOADERS, CapacitySource.PUBLIC_REGISTRY, lambda pt: anchors
+        capacity_mod._ANCHOR_LOADERS,
+        CapacitySource.PUBLIC_REGISTRY,
+        lambda pt, anchors_path=None: anchors,
     )
 
 

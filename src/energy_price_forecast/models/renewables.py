@@ -24,6 +24,7 @@ would not cancel the way they do when both come from the same function.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import pandas as pd
 
@@ -57,6 +58,7 @@ def capacity_factor_label(
     *,
     source: CapacitySource = CapacitySource.PUBLIC_REGISTRY,
     method: CapacityExtrapolation = CapacityExtrapolation.LAST_INCREMENT,
+    anchors_path: Path | None = None,
 ) -> pd.Series:
     """capacity_factor(target, t) = forecast_14_1_D(target, t) / installed_capacity_at(target, t).
 
@@ -69,6 +71,9 @@ def capacity_factor_label(
     Raises if any target value is missing (no interpolation of the target
     series, plan section 8 rule 3). Capacity factors above 1 are counted
     and logged, never removed (spec 2.9).
+
+    ``anchors_path`` (spec 7.4.1 section 3.4): optional, purely additive --
+    see ``data/capacity.py::installed_capacity_at``.
     """
     if target_values.isna().any():
         missing = target_values[target_values.isna()]
@@ -79,7 +84,7 @@ def capacity_factor_label(
         raise ValueError("target_values and valid_time_utc must be the same length")
 
     capacity_mw = installed_capacity_at(
-        production_type, valid_time_utc, source=source, method=method
+        production_type, valid_time_utc, source=source, method=method, anchors_path=anchors_path
     )
     capacity_factor = target_values.to_numpy(dtype="float64") / capacity_mw.to_numpy()
 
@@ -103,17 +108,21 @@ def to_mw(
     *,
     source: CapacitySource = CapacitySource.PUBLIC_REGISTRY,
     method: CapacityExtrapolation = CapacityExtrapolation.LAST_INCREMENT,
+    anchors_path: Path | None = None,
 ) -> pd.Series:
     """prediction_mw = capacity_factor * installed_capacity_at(target, t).
 
     The same `installed_capacity_at` call as `capacity_factor_label` --
     same source, same method -- so a systematic capacity error cancels
     rather than compounding (spec 2.5, 2.11).
+
+    ``anchors_path`` (spec 7.4.1 section 3.4): optional, purely additive --
+    see ``data/capacity.py::installed_capacity_at``.
     """
     if len(capacity_factor) != len(valid_time_utc):
         raise ValueError("capacity_factor and valid_time_utc must be the same length")
     capacity_mw = installed_capacity_at(
-        production_type, valid_time_utc, source=source, method=method
+        production_type, valid_time_utc, source=source, method=method, anchors_path=anchors_path
     )
     return pd.Series(
         capacity_factor.to_numpy(dtype="float64") * capacity_mw.to_numpy(),

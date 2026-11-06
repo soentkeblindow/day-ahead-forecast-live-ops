@@ -1,40 +1,50 @@
 """Reproducible builder for the public-registry capacity anchor table
-(spec 6.5.2a, section 5.4, optional per section 2.1).
+(spec 6.5.2a, section 5.4, optional per section 2.1; vintage layout per
+spec 7.4.1 section 3.5).
 
 Calls the same Energy-Charts endpoint with the same parameters as the
 original 6.5.2 step 2 fetch and writes the same file structure (long form,
-MW, four ``#`` comment lines) to
-``data/capacity_anchors_public_registry.csv``. Only ``Solar DC``,
-``Wind onshore`` and ``Wind offshore`` are used -- ``Solar AC`` is
-deliberately not the target series (see ``data/capacity.py``'s module
-docstring for why). Anchors run from 2015-01 through the last calendar
-month strictly before the fetch date; the API includes the current
-in-progress month too, but it is never complete (observed live: it just
-repeats the prior month's value verbatim until the month closes).
+MW, four ``#`` comment lines) as a **new** vintage file
+``data/capacity_anchors/public_registry_<Abrufdatum>.csv`` -- an existing
+vintage file is never overwritten (spec 7.4.1 section 3.1); the builder
+aborts if the target filename already exists. ``SHA256SUMS`` in the same
+directory gets a new line appended. Only ``Solar DC``, ``Wind onshore`` and
+``Wind offshore`` are used -- ``Solar AC`` is deliberately not the target
+series (see ``data/capacity.py``'s module docstring for why). Anchors run
+from 2015-01 through the last calendar month strictly before the fetch
+date; the API includes the current in-progress month too, but it is never
+complete (observed live: it just repeats the prior month's value verbatim
+until the month closes).
 
 Fail-fast, not silent repair: a missing target series, a value gap inside
-the retained range, a non-monotonically-increasing series, a gap in the
-monthly cadence, or a value for an anchor older than
-``_REVISION_CHECK_MONTHS`` that differs from the currently committed file
-all abort with no write. The last one is the revision check from spec
-6.5.2a section 2.2: the registry revises its most recent one to two months
-upward as later reports arrive (this is exactly why
-``TRAILING_ANCHORS_DISCARDED`` exists), so a changed *older* value is a
-genuine event -- worth a deliberate look, not an unattended overwrite.
+the retained range, a non-monotonically-increasing series, or a gap in the
+monthly cadence all still abort with no write. A value for an anchor older
+than ``_REVISION_CHECK_MONTHS`` that differs from the latest already-committed
+vintage (spec 6.5.2a section 2.2's revision check) no longer aborts as of
+spec 7.4.1 section 3.5 -- it is only reported (which months, which series,
+old and new value), since every fetch now becomes its own permanent,
+never-overwritten vintage rather than replacing the one file every
+consumer reads live.
 """
 
 from __future__ import annotations
 
-import argparse
 import datetime as dt
+import hashlib
 import logging
+from pathlib import Path
 from typing import Final, cast
 
 import numpy as np
 import pandas as pd
 import requests
 
-from energy_price_forecast.data.capacity import PUBLIC_REGISTRY_ANCHORS_PATH, ProductionType
+from energy_price_forecast.data.capacity import ProductionType
+from energy_price_forecast.data.capacity_vintages import (
+    CAPACITY_ANCHORS_DIR,
+    SHA256SUMS_FILENAME,
+    available_vintages,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -158,25 +168,26 @@ def validate_monotonic_cadence(anchors: pd.DataFrame) -> None:
             )
 
 
-def validate_against_committed(
-    anchors: pd.DataFrame, *, as_of: pd.Timestamp, force: bool = False
-) -> None:
-    """Fail-fast if any anchor older than ``_REVISION_CHECK_MONTHS`` differs
-    from the currently committed file (spec 6.5.2a section 2.2's revision
+def validate_against_committed(anchors: pd.DataFrame, *, as_of: pd.Timestamp) -> None:
+    """Report (never raise, spec 7.4.1 section 3.5) any anchor older than
+    ``_REVISION_CHECK_MONTHS`` that differs from the latest already-committed
+    vintage in ``data/capacity_anchors/`` (spec 6.5.2a section 2.2's revision
     check) -- and log the new-vs-overlapping split either way, so the "does
     the new file only differ in newly added months" question (spec section
     5.4) is answered on every run, not assumed.
 
-    ``force=True`` downgrades the abort to a logged warning (full changed
-    table included) and lets the caller proceed to write anyway -- for a
-    deliberate, owner-reviewed refresh, not a routine one. The default stays
-    exact-equality fail-fast; ``force`` never silently loosens the check for
-    unattended runs, it only exists as an explicit, visible override."""
-    if not PUBLIC_REGISTRY_ANCHORS_PATH.exists():
-        logger.info("no committed anchor table yet -- skipping the revision check")
+    Before spec 7.4.1, a revision this old aborted the refresh outright
+    (``--force`` was the explicit override). Since every fetch is now its
+    own permanent vintage file rather than a replacement of the one file
+    every consumer reads live, there is nothing left to protect by
+    aborting -- the old vintage stays exactly as it was, unmodified."""
+    try:
+        _, latest_path = available_vintages()[-1]
+    except ValueError:
+        logger.info("no committed vintage yet -- skipping the revision check")
         return
 
-    old = pd.read_csv(PUBLIC_REGISTRY_ANCHORS_PATH, comment="#")
+    old = pd.read_csv(latest_path, comment="#")
     old["anchor_date"] = pd.to_datetime(old["anchor_date"], utc=True)
 
     merged = old.merge(
@@ -187,24 +198,25 @@ def validate_against_committed(
     changed = stable.loc[~np.isclose(stable["capacity_mw_old"], stable["capacity_mw_new"])]
     if not changed.empty:
         detail = changed[["anchor_date", "production_type", "capacity_mw_old", "capacity_mw_new"]]
-        message = (
-            "Energy-Charts revised anchor(s) older than the "
-            f"{_REVISION_CHECK_MONTHS}-month floor -- a revision event (spec 6.5.2a "
-            f"section 2.2), not routine refresh:\n{detail}"
+        logger.warning(
+            "Energy-Charts revised anchor(s) older than the %d-month floor relative to "
+            "vintage %s -- a revision event (spec 6.5.2a section 2.2), not routine "
+            "refresh, reported only (spec 7.4.1 section 3.5):\n%s",
+            _REVISION_CHECK_MONTHS,
+            latest_path.name,
+            detail,
         )
-        if not force:
-            raise ValueError(message + "\naborting without writing (pass --force to override)")
-        logger.warning("%s\nproceeding anyway: --force was passed", message)
 
     new_pairs = set(zip(anchors["anchor_date"], anchors["production_type"], strict=True))
     old_pairs = set(zip(old["anchor_date"], old["production_type"], strict=True))
     added = new_pairs - old_pairs
     logger.info(
-        "refresh check: %d (anchor_date, production_type) pairs are new relative to the "
-        "committed file, %d overlap and match within tolerance, 0 revisions beyond the "
-        "%d-month floor",
+        "refresh check vs. vintage %s: %d (anchor_date, production_type) pairs are new, "
+        "%d overlap and match within tolerance, %d revision(s) beyond the %d-month floor",
+        latest_path.name,
         len(added),
         len(merged) - len(changed),
+        len(changed),
         _REVISION_CHECK_MONTHS,
     )
 
@@ -227,31 +239,52 @@ def build_csv_text(
     return header + "\n" + body.to_csv(index=False)
 
 
-def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument(
-        "--force",
-        action="store_true",
-        help="proceed past a failed revision check (spec 6.5.2a section 2.2) after a "
-        "deliberate, owner-reviewed look at the logged diff -- not for unattended use",
+def new_vintage_path(as_of: pd.Timestamp, *, anchors_dir: Path = CAPACITY_ANCHORS_DIR) -> Path:
+    """The vintage path this run would write to -- raises if it already
+    exists (spec 7.4.1 section 3.5: a vintage file is never overwritten)."""
+    path = anchors_dir / f"public_registry_{as_of.date().isoformat()}.csv"
+    if path.exists():
+        raise ValueError(
+            f"{path} already exists -- a vintage file is never overwritten "
+            "(spec 7.4.1 section 3.1); re-run on a later Abrufdatum instead"
+        )
+    return path
+
+
+def _append_checksum(
+    path: Path, sums_path: Path = CAPACITY_ANCHORS_DIR / SHA256SUMS_FILENAME
+) -> None:
+    """Append ``path``'s sha256 to ``sums_path`` (``sha256sum``-compatible
+    format), sorted by filename for a deterministic, reviewable diff."""
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    entries: dict[str, str] = {}
+    if sums_path.exists():
+        for line in sums_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            existing_digest, _, name = line.partition(" *")
+            entries[name] = existing_digest
+    entries[path.name] = digest
+    sums_path.write_text(
+        "".join(f"{entries[name]} *{name}\n" for name in sorted(entries)), encoding="utf-8"
     )
-    return p.parse_args()
 
 
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    args = _parse_args()
     as_of = pd.Timestamp.now(tz="UTC")
+    new_path = new_vintage_path(as_of)
 
     response = fetch_response()
     anchors = parse_anchors(response, as_of=as_of)
     validate_monotonic_cadence(anchors)
-    validate_against_committed(anchors, as_of=as_of, force=args.force)
+    validate_against_committed(anchors, as_of=as_of)
 
     csv_text = build_csv_text(anchors, response, fetched_at=as_of)
-    PUBLIC_REGISTRY_ANCHORS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    PUBLIC_REGISTRY_ANCHORS_PATH.write_text(csv_text, encoding="utf-8", newline="\n")
-    logger.info("wrote %d rows to %s", len(anchors), PUBLIC_REGISTRY_ANCHORS_PATH)
+    new_path.parent.mkdir(parents=True, exist_ok=True)
+    new_path.write_text(csv_text, encoding="utf-8", newline="\n")
+    _append_checksum(new_path)
+    logger.info("wrote %d rows to %s", len(anchors), new_path)
     return 0
 
 

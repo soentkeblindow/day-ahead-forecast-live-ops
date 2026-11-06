@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import json
 from pathlib import Path
 from typing import cast
@@ -28,7 +29,9 @@ def _synthetic_anchors(dates: list[str], values: list[float]) -> pd.Series:
 def _patch_source(
     monkeypatch: pytest.MonkeyPatch, source: CapacitySource, anchors: pd.Series
 ) -> None:
-    monkeypatch.setitem(capacity_mod._ANCHOR_LOADERS, source, lambda production_type: anchors)
+    monkeypatch.setitem(
+        capacity_mod._ANCHOR_LOADERS, source, lambda production_type, anchors_path=None: anchors
+    )
 
 
 def _monthly_anchors(
@@ -208,7 +211,9 @@ def test_non_monotonic_anchors_raise(monkeypatch: pytest.MonkeyPatch) -> None:
     # Bypass _validate_anchors (only run inside the real loader) to simulate a
     # source that returns anchors out of order.
     monkeypatch.setitem(
-        capacity_mod._ANCHOR_LOADERS, CapacitySource.PUBLIC_REGISTRY, lambda pt: bad
+        capacity_mod._ANCHOR_LOADERS,
+        CapacitySource.PUBLIC_REGISTRY,
+        lambda pt, anchors_path=None: bad,
     )
     with pytest.raises(ValueError):
         installed_capacity_at(ProductionType.SOLAR, pd.DatetimeIndex([bad.index[0]]))
@@ -377,23 +382,94 @@ def test_build_capacity_anchors_raises_on_missing_target_series() -> None:
         build_capacity_anchors.parse_anchors(response, as_of=_AS_OF)
 
 
-def test_build_capacity_anchors_raises_on_revision_beyond_three_months(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_build_capacity_anchors_reports_revision_beyond_three_months_without_raising(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
+    """Spec 7.4.1 section 3.5: a revision older than the floor is reported
+    (logged), never raised -- every fetch is its own permanent vintage now,
+    so there is nothing left to protect by aborting."""
     response = _load_fixture_response()
     anchors = build_capacity_anchors.parse_anchors(response, as_of=_AS_OF)
 
-    # An "old" committed file whose 2015-01-31 solar value deliberately
-    # disagrees with the freshly parsed one -- well outside the 3-month
-    # revision-check floor relative to _AS_OF.
-    old_path = tmp_path / "capacity_anchors_public_registry.csv"
+    # An "old" vintage whose 2015-01-31 solar value deliberately disagrees
+    # with the freshly parsed one -- well outside the 3-month revision-check
+    # floor relative to _AS_OF.
+    old_path = tmp_path / "public_registry_2026-08-01.csv"
     old_path.write_text(
-        "# fixture: pre-existing committed table for the revision-check test\n"
+        "# fixture: pre-existing vintage for the revision-check test\n"
         "anchor_date,production_type,capacity_mw\n"
         "2015-01-31,solar,999999.0\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr(build_capacity_anchors, "PUBLIC_REGISTRY_ANCHORS_PATH", old_path)
+    monkeypatch.setattr(
+        build_capacity_anchors,
+        "available_vintages",
+        lambda: [(pd.Timestamp("2026-08-01").date(), old_path)],
+    )
 
-    with pytest.raises(ValueError, match="revision event"):
-        build_capacity_anchors.validate_against_committed(anchors, as_of=_AS_OF)
+    with caplog.at_level("WARNING"):
+        build_capacity_anchors.validate_against_committed(anchors, as_of=_AS_OF)  # must not raise
+    assert "revision event" in caplog.text
+
+
+def test_build_capacity_anchors_skips_revision_check_with_no_committed_vintage(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    response = _load_fixture_response()
+    anchors = build_capacity_anchors.parse_anchors(response, as_of=_AS_OF)
+    monkeypatch.setattr(
+        build_capacity_anchors,
+        "available_vintages",
+        lambda: (_ for _ in ()).throw(ValueError("no capacity-anchor vintage files found")),
+    )
+    with caplog.at_level("INFO"):
+        build_capacity_anchors.validate_against_committed(anchors, as_of=_AS_OF)  # must not raise
+    assert "no committed vintage yet" in caplog.text
+
+
+def test_new_vintage_path_refuses_to_overwrite_an_existing_vintage(tmp_path: Path) -> None:
+    as_of = pd.Timestamp("2026-11-06", tz="UTC")
+    existing = tmp_path / "public_registry_2026-11-06.csv"
+    existing.write_text("already here\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="already exists"):
+        build_capacity_anchors.new_vintage_path(as_of, anchors_dir=tmp_path)
+
+    assert existing.read_text(encoding="utf-8") == "already here\n"  # untouched
+
+
+def test_new_vintage_path_returns_a_fresh_path_when_none_exists(tmp_path: Path) -> None:
+    as_of = pd.Timestamp("2026-11-06", tz="UTC")
+    path = build_capacity_anchors.new_vintage_path(as_of, anchors_dir=tmp_path)
+    assert path == tmp_path / "public_registry_2026-11-06.csv"
+    assert not path.exists()
+
+
+def test_append_checksum_adds_a_sorted_sha256sum_line(tmp_path: Path) -> None:
+    file_a = tmp_path / "public_registry_2026-09-01.csv"
+    file_a.write_text("a\n", encoding="utf-8")
+    file_b = tmp_path / "public_registry_2026-10-06.csv"
+    file_b.write_text("b\n", encoding="utf-8")
+    sums_path = tmp_path / "SHA256SUMS"
+
+    build_capacity_anchors._append_checksum(file_a, sums_path)
+    build_capacity_anchors._append_checksum(file_b, sums_path)
+
+    lines = sums_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2
+    # sorted by filename, so file_a's line (09-01) comes before file_b's (10-06)
+    assert lines[0].endswith("*public_registry_2026-09-01.csv")
+    assert lines[1].endswith("*public_registry_2026-10-06.csv")
+    assert lines[0].split(" *")[0] == hashlib.sha256(file_a.read_bytes()).hexdigest()
+
+
+def test_append_checksum_is_idempotent_for_an_unchanged_file(tmp_path: Path) -> None:
+    file_a = tmp_path / "public_registry_2026-09-01.csv"
+    file_a.write_text("a\n", encoding="utf-8")
+    sums_path = tmp_path / "SHA256SUMS"
+
+    build_capacity_anchors._append_checksum(file_a, sums_path)
+    first = sums_path.read_text(encoding="utf-8")
+    build_capacity_anchors._append_checksum(file_a, sums_path)
+    second = sums_path.read_text(encoding="utf-8")
+    assert first == second

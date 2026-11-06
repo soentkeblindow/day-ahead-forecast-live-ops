@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+from pathlib import Path
 from typing import Literal
 
 import numpy as np
@@ -89,6 +90,7 @@ def _build_target_table(
     source: CapacitySource,
     method: CapacityExtrapolation,
     keep_rows_for: dt.date | None = None,
+    anchors_path: Path | None = None,
 ) -> pd.DataFrame:
     """Feature columns for ``target`` plus its capacity-factor label, for
     exactly the rows where the raw ENTSO-E target value actually exists
@@ -126,6 +128,7 @@ def _build_target_table(
             target,
             source=source,
             method=method,
+            anchors_path=anchors_path,
         )
         label_values[has_label_within_kept] = real_label.to_numpy()
     table[f"{target.value}_cf_actual"] = label_values
@@ -144,6 +147,7 @@ def run_renewables_backtest(
     seed: int = 0,
     source: CapacitySource = CapacitySource.PUBLIC_REGISTRY,
     method: CapacityExtrapolation = CapacityExtrapolation.LAST_INCREMENT,
+    anchors_path: Path | None = None,
     keep_rows_for: dt.date | None = None,
     require_baseline: bool = True,
 ) -> pd.DataFrame:
@@ -183,6 +187,14 @@ def run_renewables_backtest(
     silently discarding a prediction that weather data alone could still
     produce (the real 2026-09-28 outage-drill finding, docs bug entry
     closed by this switch, not a patch on top of it).
+
+    ``anchors_path`` (spec 7.4.1 section 3.4): optional, purely additive --
+    omitting it reads the current ``PUBLIC_REGISTRY_ANCHORS_PATH`` exactly
+    as before this step. One table for the whole call, used for every
+    fold's training rows and test rows alike (spec 7.4.1 section 3.6) --
+    the caller picks which vintage that is, e.g. via
+    ``data/capacity_vintages.py`` for a single target day, or by grouping
+    several target days sharing one vintage (spec 7.4.1 section 4.4).
 
     Returns one tidy DataFrame indexed by (run_init_utc, valid_time_utc)
     with columns {target}_cf_pred, {target}_cf_actual, {target}_mw_pred,
@@ -251,6 +263,7 @@ def run_renewables_backtest(
             source=source,
             method=method,
             keep_rows_for=keep_rows_for,
+            anchors_path=anchors_path,
         )
         target_tables[target] = table
         vt = pd.DatetimeIndex(table.index.get_level_values("valid_time_utc"))
@@ -338,16 +351,24 @@ def run_renewables_backtest(
             if target == ProductionType.SOLAR:
                 cf_pred = apply_solar_night_zero(cf_pred, fold.test_index)
 
-            mw_pred = to_mw(cf_pred, fold.test_index, target, source=source, method=method)
+            mw_pred = to_mw(
+                cf_pred,
+                fold.test_index,
+                target,
+                source=source,
+                method=method,
+                anchors_path=anchors_path,
+            )
             mw_actual = to_mw(
                 pd.Series(y_test_actual.to_numpy(), index=fold.test_index),
                 fold.test_index,
                 target,
                 source=source,
                 method=method,
+                anchors_path=anchors_path,
             )
             capacity_mw_series = installed_capacity_at(
-                target, fold.test_index, source=source, method=method
+                target, fold.test_index, source=source, method=method, anchors_path=anchors_path
             ).to_numpy()
 
             row_columns[f"{target.value}_cf_pred"] = cf_pred.to_numpy()
