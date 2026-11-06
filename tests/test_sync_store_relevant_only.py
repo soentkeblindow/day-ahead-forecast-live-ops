@@ -92,6 +92,12 @@ def _patch_common(
     # leaves this unmocked too, but none of its assertions depend on the
     # warnings column being empty, so it never surfaced there).
     monkeypatch.setattr(sync_store, "ENERGY_CHARTS_SOURCES", ())
+    # Same bug class as the ENERGY_CHARTS_SOURCES finding above: check_deadlines
+    # reads the real wall clock via run_sync's own as_of, and a genuine deadline
+    # (trigger_pat_expiry, 2026-12-07) coming within its 30-day warn window made
+    # this test's strict warnings=="" assertion fail for real, unrelated to
+    # anything this test is actually about.
+    monkeypatch.setattr(store, "check_deadlines", lambda as_of: ())
     monkeypatch.setattr(store, "load_store", lambda workdir: store.StoreState(workdir, manifest))
 
     def fake_sync_weather(
