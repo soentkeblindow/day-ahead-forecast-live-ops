@@ -1,0 +1,49 @@
+target_day,ladder_row,n_matched_timestamps,mean_abs_diff,max_abs_diff,note
+2026-09-19,full_live_set,0,,,no OOS-store row for this ladder_row/day
+2026-09-20,full_live_set,0,,,no OOS-store row for this ladder_row/day
+2026-09-22,full_live_set,0,,,no OOS-store row for this ladder_row/day
+2026-09-23,full_live_set,0,,,no OOS-store row for this ladder_row/day
+2026-09-24,full_live_set,0,,,no OOS-store row for this ladder_row/day
+2026-09-25,full_live_set,0,,,no OOS-store row for this ladder_row/day
+2026-09-26,full_live_set,0,,,no OOS-store row for this ladder_row/day
+2026-09-27,full_live_set,0,,,no OOS-store row for this ladder_row/day
+2026-09-29,core_gas_loadpatch,96,1.6985245032379657,5.769975051259593,
+2026-09-30,core_gas,96,2.79782820031091,12.544694719582644,
+2026-10-01,core_gas,96,2.108938026579675,6.481824828894702,
+2026-10-02,core_gas,96,1.5197246495845986,6.200048069350146,
+2026-10-03,core_gas,96,1.6064834523900038,5.172866995606974,
+2026-10-04,core_gas,96,2.405864286546515,6.930802169846686,
+2026-10-05,core_gas,96,2.9635700056378766,7.9457100610226306,
+2026-10-06,core_gas,96,3.281698853030655,10.940126832426643,
+2026-10-07,core_gas,96,2.0528252354197454,6.062206576202229,
+2026-10-08,core_gas,96,1.536400858330986,4.375650842753473,
+2026-10-09,core_gas,96,4.724676068330558,10.188049266442363,
+2026-10-10,core_gas,96,1.4630550700391964,5.574214374641594,
+2026-10-11,core_gas,96,2.339404068678873,6.821620346840092,
+2026-10-12,core_gas,96,2.7236414854976427,6.564761852206857,
+2026-10-13,core_gas,96,1.661177471768889,4.833518803675531,
+2026-10-14,core_gas,96,1.3262378864492967,3.051370443754223,
+2026-10-15,core_gas,96,1.961547840445226,4.180479647795181,
+2026-10-16,core_gas,96,2.8472030710088205,8.664222572760877,
+2026-10-17,core_gas,96,1.8862927605825017,4.294569273855927,
+2026-10-18,core_gas,96,0.7834673081745503,1.6507956188317081,
+2026-10-19,core_gas,96,0.8794988072853259,3.1181886234690523,
+2026-10-20,core_gas,96,1.5986252387767783,6.09342062608664,
+2026-10-21,core_gas,96,1.8640896031286742,4.842986269874984,
+2026-10-22,core_gas,96,2.7365044793265114,11.439754273270609,
+2026-10-23,core_gas,0,,,no OOS-store row for this ladder_row/day
+2026-10-24,core_gas,0,,,no OOS-store row for this ladder_row/day
+2026-10-25,core_gas,0,,,no OOS-store row for this ladder_row/day
+2026-10-26,core_gas,0,,,no OOS-store row for this ladder_row/day
+2026-10-27,core_gas,0,,,no OOS-store row for this ladder_row/day
+2026-10-28,core_gas,0,,,no OOS-store row for this ladder_row/day
+2026-10-29,core_gas,0,,,no OOS-store row for this ladder_row/day
+2026-10-30,core_gas,0,,,no OOS-store row for this ladder_row/day
+2026-10-31,core_gas,0,,,no OOS-store row for this ladder_row/day
+2026-11-01,core_gas,0,,,no OOS-store row for this ladder_row/day
+2026-11-02,core_gas,0,,,no OOS-store row for this ladder_row/day
+2026-11-03,core_gas,0,,,no OOS-store row for this ladder_row/day
+2026-11-04,core_gas,0,,,no OOS-store row for this ladder_row/day
+2026-11-05,core_gas,0,,,no OOS-store row for this ladder_row/day
+2026-11-06,core_gas,0,,,no OOS-store row for this ladder_row/day
+2026-11-07,core_gas,0,,,no OOS-store row for this ladder_row/day
