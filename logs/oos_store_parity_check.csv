@@ -47,6 +47,7 @@ target_day,ladder_row,n_matched_timestamps,mean_abs_diff,max_abs_diff,note
 2026-11-11,core_gas,96,1.6055934441287176,6.346036779217798,
 2026-11-12,core_gas_loadpatch,96,3.3661884774728805,14.290421670897842,
 2026-11-13,core_gas,96,6.307330504545715,12.87434127673805,
-2026-11-14,core_gas,96,2.306745697032666,4.836307603287651,
-2026-11-15,core_gas,0,,,no OOS-store row for this ladder_row/day
+2026-11-14,core_gas,96,2.3067456970326656,4.836307603287651,
+2026-11-15,core_gas,96,2.421498417564172,9.196944380792871,
 2026-11-16,core_gas,0,,,no OOS-store row for this ladder_row/day
+2026-11-17,core_gas,0,,,no OOS-store row for this ladder_row/day
